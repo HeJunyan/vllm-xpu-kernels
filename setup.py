@@ -272,7 +272,7 @@ class cmake_build_ext(build_ext):
                 try:
                     subprocess.check_call(install_args,
                                           cwd=self.build_temp + file_path)
-                except subprocess.CalledProcessError as e:
+                except Exception as e:
                     logger.warning("Failed to install library %s: %s",
                                    lib_name, e)
                     # Continue with other libraries even if one fails
@@ -304,6 +304,8 @@ additional_libraries = {
     "attn_kernels_xe_2": "/csrc/xpu/attn/xe_2",
     "grouped_gemm_xe_default": "/csrc/xpu/grouped_gemm/xe_default",
     "grouped_gemm_xe_2": "/csrc/xpu/grouped_gemm/xe_2",
+    "attn_kernels_xe_3": "/csrc/xpu/attn/xe_3",
+    "grouped_gemm_xe_3": "/csrc/xpu/grouped_gemm/xe_3",
 }
 
 if _build_custom_ops():

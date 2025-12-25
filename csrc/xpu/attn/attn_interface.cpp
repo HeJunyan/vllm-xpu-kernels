@@ -4,6 +4,9 @@
 #ifdef VLLM_XPU_ENABLE_XE2
   #include "csrc/xpu/attn/xe_2/fmha_xe2.h"
 #endif
+#ifdef VLLM_XPU_ENABLE_XE3
+  #include "csrc/xpu/attn/xe_3/fmha_xe3.h"
+#endif
 
 void cutlass_chunk_prefill_interface(
     sycl::queue& queue,
@@ -50,6 +53,32 @@ void cutlass_chunk_prefill_interface(
         is_sink);
 #else
     TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
+#endif
+  } else if (vllm::xpu::is_xe3p_arch()) {
+#ifdef VLLM_XPU_ENABLE_XE3
+    // Use XE3 cutlass kernel
+    cutlass_chunk_prefill_xe3(
+        queue,
+        query,
+        key_cache,
+        value_cache,
+        out,
+        block_table,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        sm_scale,
+        sm_sink_,
+        window_size_left,
+        window_size_right,
+        is_varlen,
+        is_paged,
+        is_causal,
+        is_local,
+        is_sink);
+#else
+    TORCH_CHECK(false, "XE3 cutlass kernel is not enabled in this build.");
 #endif
   } else {
     TORCH_CHECK(false, "Only XE2 cutlass kernel is supported currently.");

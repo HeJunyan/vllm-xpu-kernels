@@ -1,4 +1,9 @@
 #pragma once
+
+#include <string>
+#include <unordered_set>
+#include <mutex>
+#include <iostream>
 #include <memory>
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
@@ -8,6 +13,21 @@
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
 #define CHECK_CONTIGUOUS(x) \
   TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+
+inline void
+warn_once_per_line(const char* file, int line, const std::string& msg) {
+  // 组合 key: "file:line"
+  static std::unordered_set<std::string> seen;
+  static std::mutex mx;
+  std::string key = std::string(file) + ":" + std::to_string(line);
+
+  std::lock_guard<std::mutex> lock(mx);
+  if (seen.insert(key).second)
+    std::cerr << "[WARN_ONCE] " << file << ":" << line << ": " << msg
+              << std::endl;
+}
+
+#define WARN_ONCE_LINE(msg) warn_once_per_line(__FILE__, __LINE__, msg)
 
 namespace vllm {
 namespace xpu {
@@ -56,6 +76,29 @@ static inline bool force_xe_default_kernel() {
            env_val.value() == "TRUE";
   }
   return false;
+}
+
+static inline bool is_xe3p_arch(at::DeviceIndex device_index = -1) {
+#ifdef VLLM_XPU_ENABLE_XE3
+  auto arch = get_device_architecture(device_index);
+  return arch == syclex::architecture::intel_gpu_cri;
+#else
+  WARN_ONCE_LINE(
+      "XE3 architecture is not build, check is_xe3p_arch always returns "
+      "false.");
+  return false;
+#endif
+}
+
+static inline bool is_xe4_arch(at::DeviceIndex device_index = -1) {
+#ifdef VLLM_XPU_ENABLE_XE4
+  auto arch = get_device_architecture(device_index);
+  return arch == syclex::architecture::intel_gpu_jgs;
+#else
+  WARN_ONCE_LINE(
+      "XE4 architecture is not build, check is_xe4_arch always returns false.");
+  return false;
+#endif
 }
 
 template <typename T>

@@ -50,12 +50,44 @@ set(TORCH_SUPPORTED_VERSION_XPU "2.9.0")
 set(BUILD_SYCL_TLA_KERNELS ON CACHE BOOL "Build SYCL-TLA based kernels for XPU")
 # ARCHITECTURE OPTIONS
 set(VLLM_XPU_ENABLE_XE2 ON)
+set(VLLM_XPU_ENABLE_XE3 OFF)
+set(VLLM_XPU_ENABLE_XE4 OFF)
 set(VLLM_XPU_ENABLE_XE_DEFAULT ON)
+
+set(BUILD_ON_SIMULATOR_CRI $ENV{BUILD_ON_SIMULATOR_CRI})
+message(STATUS "BUILD_ON_SIMULATOR_CRI: ${BUILD_ON_SIMULATOR_CRI}")
+set(BUILD_ON_SIMULATOR_JGS $ENV{BUILD_ON_SIMULATOR_JGS})
+message(STATUS "BUILD_ON_SIMULATOR_JGS: ${BUILD_ON_SIMULATOR_JGS}")
+if(BUILD_ON_SIMULATOR_CRI AND BUILD_ON_SIMULATOR_JGS)
+  message(FATAL_ERROR "Both BUILD_ON_SIMULATOR_CRI and BUILD_ON_SIMULATOR_JGS are set. Please set only one.")
+endif()
+
+
+
 
 set(BASIC_KERNELS_ENABLED ON)
 set(FA2_KERNELS_ENABLED ON)
 set(MOE_KERNELS_ENABLED ON)
 set(XPU_SPECIFIC_KERNELS_ENABLED ON)
+
+if(BUILD_ON_SIMULATOR_CRI)
+  message(STATUS "Building on CRI simulator, enable XE3 kernels only.")
+  set(VLLM_XPU_ENABLE_XE2 OFF) # actually we can enable XE2 as well on CRI simulator, but we will never test it there
+  set(VLLM_XPU_ENABLE_XE3 ON)
+  set(VLLM_XPU_ENABLE_XE4 OFF)
+  set(VLLM_XPU_ENABLE_XE_DEFAULT OFF)
+endif()
+
+if(BUILD_ON_SIMULATOR_JGS)
+  message(STATUS "Building on JGS simulator, enable XE4 kernels only.")
+  set(VLLM_XPU_ENABLE_XE2 OFF)
+  set(VLLM_XPU_ENABLE_XE3 OFF)
+  set(VLLM_XPU_ENABLE_XE4 ON)
+  set(VLLM_XPU_ENABLE_XE_DEFAULT OFF)
+  set(BUILD_SYCL_TLA_KERNELS OFF)
+  set(FA2_KERNELS_ENABLED OFF)
+  set(MOE_KERNELS_ENABLED OFF)
+endif()
 
 #
 # Try to find python package with an executable that exactly matches
@@ -174,8 +206,16 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} "-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate")
 
   # TODO: make AOT configurable
-  set(AOT_DEVICES "pvc,bmg-g21-a0")
+  set(AOT_DEVICES "pvc,bmg-g21-a0") # FIXME: we should cover all device for default build
   set(XE2_AOT_DEVICES "pvc,bmg-g21-a0")
+  set(XE3_AOT_DEVICES "cri-a0")
+  set(XE4_AOT_DEVICES "jgs-a0")
+  if(BUILD_ON_SIMULATOR_CRI)
+    set(AOT_DEVICES ${XE3_AOT_DEVICES})
+  endif()
+  if(BUILD_ON_SIMULATOR_JGS)
+    set(AOT_DEVICES ${XE4_AOT_DEVICES})
+  endif() 
 
   # Final link option be like:
   # icpx -fsycl -fsycl-target=spir64_gen ${SYCL_DEVICE_LINK_FLAGS} -Xsycl-target-backend=spir64_gen '${SYCL_OFFLINE_COMPILER_FLAGS}' kernel.o -o device-code.o
@@ -195,8 +235,17 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # add cutlass dependency
   set(CUTLASS_ENABLE_HEADERS_ONLY "ON" CACHE BOOL "Enable only the header library")
 
-  # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages when building.
-  set(CUTLASS_REVISION "3f2a337e885db0fb97b2a6ba514eb7a2a734ac4a" CACHE STRING "CUTLASS revision to use")
+  # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages when building.、
+  if(BUILD_ON_SIMULATOR_CRI)
+    # update on ww51.1 by Liangliang, this commit id is latest from v0.1.0_next branch
+    set(CUTLASS_REVISION "f811bbd2a502ff757d7a238fe516e8aeca2b872f" CACHE STRING "CUTLASS revision to use")
+  elseif(BUILD_ON_SIMULATOR_JGS)
+    # update on WW50 by Kunshang, this commit id is latest from master_next branch
+    set(CUTLASS_REVISION "cc272f2c9fb142cc929ee1607f4016ccf989ea26" CACHE STRING "CUTLASS revision to use")
+  else()
+    # update on WW50 by Kunshang, this commit id same to vllm-project/vllm-xpu-kernels
+    set(CUTLASS_REVISION "3f2a337e885db0fb97b2a6ba514eb7a2a734ac4a" CACHE STRING "CUTLASS revision to use")
+  endif()
 
   if (DEFINED ENV{VLLM_CUTLASS_SRC_DIR})
     set(VLLM_CUTLASS_SRC_DIR $ENV{VLLM_CUTLASS_SRC_DIR})
@@ -212,7 +261,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
     # Use the specified CUTLASS source directory for compilation if VLLM_CUTLASS_SRC_DIR  is provided
     FetchContent_Declare(
         cutlass-sycl
-        GIT_REPOSITORY https://github.com/intel/sycl-tla.git
+        GIT_REPOSITORY https://github.com/intel-innersource/libraries.ai.cutlass.internal
 
         # Please keep this in sync with CUTLASS_REVISION line above.
         GIT_TAG ${CUTLASS_REVISION}
@@ -227,8 +276,22 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   # cutlass compilation flags
   set(CUTLASS_ENABLE_SYCL "ON")
-  # TODO: make this a list 
-  set(DPCPP_SYCL_TARGET "intel_gpu_bmg_g21" CACHE STRING "DPC++ SYCL target architectures")
+  # TODO: make this a list
+  # TODO: this may be not needed anymore since we will add this in each cmake target
+  if(BUILD_ON_SIMULATOR_CRI)
+    set(DPCPP_SYCL_TARGET "intel_gpu_cri" CACHE STRING "DPC++ SYCL target architectures")
+    # FIXME: these are sycl-tla internal.
+    list(APPEND VLLM_CUTLASS_FLAGS "-DSYCL_INTEL_TARGET=35")
+  elseif(BUILD_ON_SIMULATOR_JGS)
+    set(DPCPP_SYCL_TARGET "intel_gpu_jgs" CACHE STRING "DPC++ SYCL target architectures")
+    # FIXME: these are sycl-tla internal.
+    list(APPEND VLLM_CUTLASS_FLAGS "-DSYCL_INTEL_TARGET=40")
+  else()
+    set(DPCPP_SYCL_TARGET "intel_gpu_bmg_g21" CACHE STRING "DPC++ SYCL target architectures")
+    # FIXME: these are sycl-tla internal.
+    list(APPEND VLLM_CUTLASS_FLAGS "-DSYCL_INTEL_TARGET=20")
+  endif()
+
   set(CMAKE_EXPORT_COMPILE_COMMANDS "ON")
   set(CUTLASS_ENABLE_BENCHMARKS "OFF")
   # disable cuda
@@ -243,7 +306,6 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # header only library
   list(APPEND VLLM_CUTLASS_FLAGS "-DCUTLASS_ENABLE_HEADERS_ONLY")
   list(APPEND VLLM_CUTLASS_FLAGS "-DCUTLASS_ENABLE_SYCL")
-  list(APPEND VLLM_CUTLASS_FLAGS "-DSYCL_INTEL_TARGET")
   list(APPEND VLLM_CUTLASS_FLAGS "-DCUTLASS_VERSIONS_GENERATED")
   list(APPEND VLLM_CUTLASS_FLAGS "-ftemplate-backtrace-limit=0")
   list(APPEND VLLM_CUTLASS_FLAGS "-fdiagnostics-color=always")
@@ -272,6 +334,13 @@ if(BUILD_SYCL_TLA_KERNELS)
     list(APPEND GROUPED_GEMM_LIB_NAME "grouped_gemm_xe_2")
     list(APPEND ATTN_KERNEL_LIB_NAME "attn_kernels_xe_2")
     list(APPEND SYCL_TLA_COMPILE_OPTIONS -DVLLM_XPU_ENABLE_XE2)
+  endif()
+  if(VLLM_XPU_ENABLE_XE3)
+    add_subdirectory(csrc/xpu/grouped_gemm/xe_3)  
+    add_subdirectory(csrc/xpu/attn/xe_3)
+    list(APPEND GROUPED_GEMM_LIB_NAME "grouped_gemm_xe_3")
+    list(APPEND ATTN_KERNEL_LIB_NAME "attn_kernels_xe_3")
+    list(APPEND SYCL_TLA_COMPILE_OPTIONS -DVLLM_XPU_ENABLE_XE3)
   endif()
   list(APPEND VLLM_GPU_COMPILE_FLAGS ${SYCL_TLA_COMPILE_OPTIONS})
 
