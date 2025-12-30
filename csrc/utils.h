@@ -78,28 +78,19 @@ static inline bool force_xe_default_kernel() {
   return false;
 }
 
-static inline bool is_xe3p_arch(at::DeviceIndex device_index = -1) {
 #ifdef VLLM_XPU_ENABLE_XE3
+static inline bool is_xe3p_arch(at::DeviceIndex device_index = -1) {
   auto arch = get_device_architecture(device_index);
   return arch == syclex::architecture::intel_gpu_cri;
-#else
-  WARN_ONCE_LINE(
-      "XE3 architecture is not build, check is_xe3p_arch always returns "
-      "false.");
-  return false;
-#endif
 }
+#endif
 
-static inline bool is_xe4_arch(at::DeviceIndex device_index = -1) {
 #ifdef VLLM_XPU_ENABLE_XE4
+static inline bool is_xe4_arch(at::DeviceIndex device_index = -1) {
   auto arch = get_device_architecture(device_index);
   return arch == syclex::architecture::intel_gpu_jgs;
-#else
-  WARN_ONCE_LINE(
-      "XE4 architecture is not build, check is_xe4_arch always returns false.");
-  return false;
-#endif
 }
+#endif
 
 template <typename T>
 struct SyclTypeTrait {

@@ -30,6 +30,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "bias) -> Tensor");
   xpu_ops.impl("int4_gemm_w4a8", torch::kXPU, &int4_gemm_w4a8);
 
+#ifdef BUILD_SYCL_TLA_KERNELS
   xpu_ops.def(
       "cutlass_grouped_gemm_interface(Tensor ptr_A, Tensor ptr_B, Tensor? "
       "ptr_scales, "
@@ -43,6 +44,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "cutlass_grouped_gemm_interface",
       torch::kXPU,
       &cutlass_grouped_gemm_interface);
+#endif
 
   xpu_ops.def(
       "deepseek_scaling_rope(Tensor! positions, Tensor! query, Tensor! key, "

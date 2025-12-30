@@ -8,6 +8,9 @@
 #ifdef VLLM_XPU_ENABLE_XE3
   #include "xe_3/grouped_gemm_xe3.h"
 #endif
+#ifdef VLLM_XPU_ENABLE_XE4
+  #include "xe_4/grouped_gemm_xe4.h"
+#endif
 #ifdef VLLM_XPU_ENABLE_XE_DEFAULT
   #include "xe_default/grouped_gemm_xe_default.h"
 #endif
@@ -53,8 +56,9 @@ torch::Tensor cutlass_grouped_gemm_interface(
 #else
     TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
 #endif
-  } else if (vllm::xpu::is_xe3p_arch()) {
+  }
 #ifdef VLLM_XPU_ENABLE_XE3
+  else if (vllm::xpu::is_xe3p_arch()) {
     // Use XE3 cutlass kernel
     return cutlass_grouped_gemm_xe3(
         ptr_A,
@@ -65,10 +69,23 @@ torch::Tensor cutlass_grouped_gemm_interface(
         N,
         K,
         num_experts);
-#else
-    TORCH_CHECK(false, "XE3 cutlass kernel is not enabled in this build.");
+  }
 #endif
-  } else {
+#ifdef VLLM_XPU_ENABLE_XE4
+  else if (vllm::xpu::is_xe4_arch()) {
+    // Use XE4 cutlass kernel
+    return cutlass_grouped_gemm_xe4(
+        ptr_A,
+        ptr_B,
+        ptr_bias,
+        ptr_D,
+        expert_first_token_offset,
+        N,
+        K,
+        num_experts);
+  }
+#endif
+  else {
 #ifdef VLLM_XPU_ENABLE_XE_DEFAULT
     int64_t groups = num_experts;
     return cutlass_grouped_gemm_xe_default(

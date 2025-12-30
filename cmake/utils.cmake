@@ -727,7 +727,8 @@ function(add_xe4_kernel_library LIBRARY_NAME)
   install(TARGETS ${LIBRARY_NAME} LIBRARY DESTINATION ${ARG_DESTINATION} COMPONENT ${LIBRARY_NAME})
 
   # Set link options for XE4 devices
-  set(XE4_GPU_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
+  set(XE4_GPU_LINK_FLAGS ${SYCL_LINK_FLAGS} ${SYCL_DEVICE_LINK_FLAGS} ${SYCL_TARGETS_OPTION})
+  list(APPEND XE4_GPU_LINK_FLAGS "-fsycl-max-parallel-link-jobs=16")
   list(APPEND XE4_GPU_LINK_FLAGS -Xsycl-target-backend=spir64_gen "-device ${XE4_AOT_DEVICES} -internal_options -cl-intel-256-GRF-per-thread")
   target_link_options(${LIBRARY_NAME} PRIVATE ${XE4_GPU_LINK_FLAGS})
 endfunction()

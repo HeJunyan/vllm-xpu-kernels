@@ -123,6 +123,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "VLLM_CONFIG_ROOT",
             os.path.join(get_default_config_root(), "vllm"),
         )),
+    "BUILD_ON_SIMULATOR_CRI":
+    lambda: bool(int(os.getenv("BUILD_ON_SIMULATOR_CRI", "0"))),
+    "BUILD_ON_SIMULATOR_JGS":
+    lambda: bool(int(os.getenv("BUILD_ON_SIMULATOR_JGS", "0"))),
 }
 
 # --8<-- [end:env-vars-definition]
