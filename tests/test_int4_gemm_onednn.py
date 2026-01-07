@@ -22,7 +22,10 @@ MINI_MNK_FACTORS = [
 ]
 
 MINI_PYTEST_PARAMS = {
-    "test_int4_gemm": {
+    "test_int4_gemm_w4a16": {
+        "mnk_factors": MINI_MNK_FACTORS,
+    },
+    "test_int4_gemm_w4a8": {
         "mnk_factors": MINI_MNK_FACTORS,
     },
 }
