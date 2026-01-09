@@ -11,13 +11,8 @@ except ImportError as e:
     FUSEDMOE_AVAILABLE = False
 
 
-def cutlass_grouped_gemm(input_A, input_B, bias, output, expert_token_count, n,
-                         k, num_experts):
-    # expert_token_count_ = torch.tensor(expert_token_count,
-    #                                    dtype=torch.int64,
-    #                                    device=input_A.device)
-    # if bias is not None:
-    #     bias = bias.repeat_interleave(expert_token_count_, dim=0).float()
+def cutlass_grouped_gemm(input_A, input_A_scale, input_B, input_B_scale, bias,
+                         output, expert_token_count, n, k, num_experts):
 
     def exclusive_prefix_sum(arr):
         prefix = [0]
@@ -28,10 +23,12 @@ def cutlass_grouped_gemm(input_A, input_B, bias, output, expert_token_count, n,
     expert_offset = torch.tensor(exclusive_prefix_sum(expert_token_count),
                                  dtype=torch.int64,
                                  device="xpu")
+
     torch.ops._xpu_C.cutlass_grouped_gemm_interface(
         ptr_A=input_A,
+        ptr_A_scale=input_A_scale,
         ptr_B=input_B,
-        ptr_scales=None,
+        ptr_B_scale=input_B_scale,
         ptr_bias=bias,
         ptr_D=output,
         expert_first_token_offset=expert_offset,
@@ -53,8 +50,9 @@ def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
     ]).to(torch.int64)
     torch.ops._xpu_C.cutlass_grouped_gemm_interface(
         ptr_A=input_A,
+        ptr_A_scale=None,
         ptr_B=input_B,
-        ptr_scales=scales,
+        ptr_B_scale=scales,
         ptr_bias=bias,
         ptr_D=output,
         expert_first_token_offset=expert_first_token_offset,
@@ -128,15 +126,15 @@ def xpu_fused_moe(hidden_states,
     '''
     hidden_states: [num_rows, hidden_size]
     w13: [num_experts, 2*inter_size, hidden_size]
-    w13_scales: 
-        None for bf16/fp16 
-        or [num_experts] for fp8 
+    w13_scales:
+        None for bf16/fp16
+        or [num_experts] for fp8
         or [num_experts, 2*inter_size, hidden_size // group_size] for 4bits
     w13_bias: [num_experts, 2*inter_size] or None
     w2: [num_experts, hidden_size, inter_size]
     w2_scales:
-        None for bf16/fp16 
-        or [num_experts] for fp8 
+        None for bf16/fp16
+        or [num_experts] for fp8
         or [num_experts, hidden_size, inter_size // group_size] for 4bits
     w2_bias: [num_experts, hidden_size] or None
     topk_weights: [num_rows, topk]
@@ -268,8 +266,9 @@ def xpu_fused_moe(hidden_states,
 
     torch.ops._xpu_C.cutlass_grouped_gemm_interface(
         ptr_A=gemm1_input,
+        ptr_A_scale=None,
         ptr_B=input_B,
-        ptr_scales=gemm1_scales,
+        ptr_B_scale=gemm1_scales,
         ptr_bias=w13_bias,
         ptr_D=gemm1_output,
         expert_first_token_offset=expert_first_token_offset,
@@ -301,8 +300,9 @@ def xpu_fused_moe(hidden_states,
 
     torch.ops._xpu_C.cutlass_grouped_gemm_interface(
         ptr_A=input_A,
+        ptr_A_scale=None,
         ptr_B=input_B,
-        ptr_scales=gemm2_scales,
+        ptr_B_scale=gemm2_scales,
         ptr_bias=w2_bias,
         ptr_D=gemm2_output,
         expert_first_token_offset=expert_first_token_offset,

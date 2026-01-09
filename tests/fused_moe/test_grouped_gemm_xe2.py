@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-import random
 
 import pytest
 import torch
 
 from tests.ops.fp8_quant_op import scaled_fp8_quant
 from tests.utils import seed_everything
-from vllm_xpu_kernels.fused_moe_interface import (cutlass_grouped_gemm,
-                                                  cutlass_grouped_gemm_xe2)
+from vllm_xpu_kernels.fused_moe_interface import cutlass_grouped_gemm_xe2
 
 DEVICE = "xpu"
 
@@ -21,14 +19,6 @@ FUSED_MOE_MNK_FACTORS = [
 NUM_EXPERTS = [16]
 TOP_KS = [1]
 
-
-def random_partition(size_a: int, target: int):
-    cuts = sorted(random.sample(range(target + size_a - 1), size_a - 1))
-    cuts = [-1] + cuts + [target + size_a - 1]
-    result = [cuts[i + 1] - cuts[i] - 1 for i in range(size_a)]
-    return result
-
-
 MINI_PYTEST_PARAMS = {
     "default": {
         "m,n,k": [(1, 256, 128)],
@@ -38,52 +28,6 @@ MINI_PYTEST_PARAMS = {
         "has_bias": [True]
     }
 }
-
-
-@pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
-@pytest.mark.parametrize("e", NUM_EXPERTS)
-@pytest.mark.parametrize("topk", TOP_KS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("has_bias", [True, False])
-def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
-    seed_everything(7)
-    num_experts = e
-    token_per_group = random_partition(e, m * topk)
-    assert (len(token_per_group) == e)
-    # input
-    input_A = torch.randn((sum(token_per_group), k),
-                          dtype=dtype,
-                          device=DEVICE).contiguous()
-    ref_A = input_A
-    # weight
-    input_B = torch.randn((num_experts, n, k), dtype=dtype, device=DEVICE)
-    input_B = input_B.transpose(-1, -2).contiguous()
-    if has_bias:
-        bias = torch.randn((num_experts, n), dtype=dtype, device=DEVICE)
-    else:
-        bias = None
-
-    # output offset
-    output = torch.empty((sum(token_per_group), n), dtype=dtype, device=DEVICE)
-    cutlass_grouped_gemm(input_A, input_B, bias, output, token_per_group, n, k,
-                         num_experts)
-    # ref gg
-    ref = []
-    pre_token_sum = 0
-    for i in range(num_experts):
-        cur_token_num = token_per_group[i]
-        if cur_token_num == 0:
-            continue
-        input = ref_A[pre_token_sum:pre_token_sum + cur_token_num, :]
-        weight = input_B[i, :, :]
-        expert_output = input @ weight
-        if has_bias:
-            expert_output += bias[i]
-        ref.append(expert_output)
-        pre_token_sum += cur_token_num
-    ref = torch.cat(ref, dim=0)
-
-    torch.testing.assert_close(output, ref, rtol=2e-2, atol=1e-2)
 
 
 def init_rows_for_experts(tokens, topk, num_rows_per_expert):

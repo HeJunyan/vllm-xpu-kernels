@@ -113,7 +113,6 @@ class GemmUniversal<
   using MmaAtomShape = typename CollectiveMainloop::MmaAtomShape;
   using SubgroupTileShape = typename CollectiveMainloop::SubgroupTileShape;
 
-  using MainloopTensors = typename CollectiveMainloop::MainloopTensors;
   using EpilogueTensors = typename CollectiveEpilogue::EpilogueTensors;
 
   // Kernel level shared memory storage
@@ -305,7 +304,7 @@ class GemmUniversal<
     int32_t curr_group = -1;
     using ProblemShapeMNKL = Shape<int, int, int, int>;
     ProblemShapeMNKL problem_shape_MNKL;
-    MainloopTensors AB_tensors;
+    typename CollectiveMainloop::Base::Params base_params;
     EpilogueTensors CD_tensors;
 
     if (work_tile_info.is_valid()) {
@@ -335,11 +334,14 @@ class GemmUniversal<
 
       CollectiveMainloop collective_mma;
       if (did_group_change) {
-        AB_tensors = collective_mma.update_tensor_shape_stride(
-            params.mainloop,
-            curr_group,
+        base_params = CollectiveMainloop::Base::to_underlying_arguments(
             problem_shape_MNKL,
-            params.expert_first_token_offset);
+            CollectiveMainloop::to_base_arguments(
+                params.mainloop,
+                curr_group,
+                problem_shape_MNKL,
+                params.expert_first_token_offset),
+            params.workspace);
       }
       auto tile_coord = make_coord(m_coord, n_coord, _, 0);
 
@@ -367,8 +369,7 @@ class GemmUniversal<
           tile_coord,
           K,
           thread_idx,
-          params.mainloop,
-          AB_tensors);
+          base_params);
 
       TileScheduler::fixup(
           params.scheduler, work_tile_info, accumulators, -1, -1);

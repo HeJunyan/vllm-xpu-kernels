@@ -17,15 +17,129 @@
 #include <cfloat>
 
 #include "moe_array_mma.hpp"
+#include "moe_array_mma_mxfp.hpp"
 #include "moe_array_epilogue.hpp"
 #include "moe_callbacks.hpp"
 #include "moe_dtype_policy.hpp"
 #include "moe_gemm_array_cooperative.hpp"
 #include "moe_tile_scheduler.hpp"
+
 using namespace cute;
+using ProblemShape =
+    cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per
+                                                             // group
 
 namespace gpu::cutlass_kernel {
 namespace grouped_gemm {
+
+template <
+    class ElementA,
+    class ElementScaleA,
+    class ElementB,
+    class ElementScaleB,
+    class ElementAccumulator,
+    class ElementOutput,
+    class LayoutA,
+    class LayoutB,
+    class LayoutC,
+    class LayoutD,
+    class StrideScale,
+    class TiledMma,
+    class TileShape,
+    class GEMMDispatchPolicy,
+    class EpilogueDispatchPolicy,
+    class EpilogueOp,
+    class GmemTiledCopyA,
+    class GmemTiledCopyScaleA,
+    class GmemTiledCopyB,
+    class GmemTiledCopyScaleB,
+    bool NeedScale>
+class GenerateGemm {
+  using FusionCallBacks = cutlass::epilogue::fusion::FusionCallbacks<
+      EpilogueDispatchPolicy,
+      EpilogueOp,
+      TileShape,
+      decltype(tile_shape(TiledMma()))>;
+  using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
+      EpilogueDispatchPolicy,
+      TileShape,
+      void,
+      ElementAccumulator,
+      cutlass::gemm::TagToStrideC_t<LayoutC>,
+      ElementOutput,
+      cutlass::gemm::TagToStrideC_t<LayoutD>,
+      FusionCallBacks,
+      void,
+      void>;
+
+  using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+      GEMMDispatchPolicy,
+      TileShape,
+      std::conditional_t<
+          NeedScale,
+          cute::tuple<ElementA, ElementScaleA>,
+          ElementA>,
+      std::conditional_t<
+          NeedScale,
+          cute::tuple<cutlass::gemm::TagToStrideA_t<LayoutA>, StrideScale>,
+          cutlass::gemm::TagToStrideA_t<LayoutA>>,
+      std::conditional_t<
+          NeedScale,
+          cute::tuple<ElementB, ElementScaleB>,
+          ElementB>,
+      std::conditional_t<
+          NeedScale,
+          cute::tuple<cutlass::gemm::TagToStrideB_t<LayoutB>, StrideScale>,
+          cutlass::gemm::TagToStrideB_t<LayoutB>>,
+      TiledMma,
+      std::conditional_t<
+          NeedScale,
+          cute::tuple<GmemTiledCopyA, GmemTiledCopyScaleA>,
+          GmemTiledCopyA>,
+      void,
+      void,
+      cute::identity,  // A
+      std::conditional_t<
+          NeedScale,
+          cute::tuple<GmemTiledCopyB, GmemTiledCopyScaleB>,
+          GmemTiledCopyB>,
+      void,
+      void,
+      cute::identity  // B
+      >;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      ProblemShape,
+      CollectiveMainloop,
+      CollectiveEpilogue,
+      cutlass::gemm::GroupScheduler>;
+
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+#define CALL_GENERATE_GEMM()  \
+  using Gemm = GenerateGemm<  \
+      ElementA,               \
+      ElementScaleA,          \
+      ElementB,               \
+      ElementScaleB,          \
+      ElementAccumulator,     \
+      ElementOutput,          \
+      LayoutA,                \
+      LayoutB,                \
+      LayoutC,                \
+      LayoutD,                \
+      StrideScale,            \
+      TiledMma,               \
+      TileShape,              \
+      GEMMDispatchPolicy,     \
+      EpilogueDispatchPolicy, \
+      EpilogueOp,             \
+      GmemTiledCopyA,         \
+      GmemTiledCopyScaleA,    \
+      GmemTiledCopyB,         \
+      GmemTiledCopyScaleB,    \
+      NeedScale>::Gemm;
 
 class moe_policy_base {
  public:
@@ -34,9 +148,29 @@ class moe_policy_base {
   using ElementA = float;
   using ElementB = float;
   using ElementOutput = float;
-  using ElementScale = float;
-  using TileShape = Shape<_256, _256, _32>;
-  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+  using ElementScaleA = void;
+  using ElementScaleB = void;
+  using StrideScale = void;
+
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::RowMajor;
+  using LayoutC = cutlass::layout::RowMajor;
+  using LayoutD = cutlass::layout::RowMajor;
+
+  using GmemTiledCopyA = void;
+  using GmemTiledCopyB = void;
+  using GmemTiledCopyScaleA = void;
+  using GmemTiledCopyScaleB = void;
+
+  static constexpr int PipelineStages = 2;
+  using EpilogueDispatchPolicy = cutlass::epilogue::MoE16Group;
+  using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
+      float_t,
+      ElementComputeEpilogue,
+      ElementAccumulator,
+      ElementAccumulator,
+      cutlass::FloatRoundStyle::round_to_nearest>;
+  static constexpr bool NeedScale = false;
 };
 
 class moe_bf16_policy : public moe_policy_base {
@@ -44,13 +178,15 @@ class moe_bf16_policy : public moe_policy_base {
   using ElementA = cutlass::bfloat16_t;
   using ElementB = cutlass::bfloat16_t;
   using ElementOutput = cutlass::bfloat16_t;
-  using ElementScale = cutlass::bfloat16_t;
-};
 
-class moe_bf16_decode_policy : public moe_bf16_policy {
- public:
-  using TileShape = Shape<_16, _64, _32>;
-  using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
+  using TileShape = Shape<_256, _256, _32>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopMoE16Group<PipelineStages>;
+  CALL_GENERATE_GEMM();
 };
 
 class moe_fp16_policy : public moe_policy_base {
@@ -58,13 +194,87 @@ class moe_fp16_policy : public moe_policy_base {
   using ElementA = cutlass::half_t;
   using ElementB = cutlass::half_t;
   using ElementOutput = cutlass::half_t;
-  using ElementScale = cutlass::half_t;
+
+  using TileShape = Shape<_256, _256, _32>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopMoE16Group<PipelineStages>;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_bf16_decode_policy : public moe_bf16_policy {
+ public:
+  using TileShape = Shape<_16, _64, _32>;
+  using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
 };
 
 class moe_fp16_decode_policy : public moe_fp16_policy {
  public:
   using TileShape = Shape<_16, _64, _32>;
   using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_mxfp8_policy : public moe_policy_base {
+ public:
+  static constexpr bool NeedScale = true;
+  using ElementType = cutlass::mx_float8_t<float_e4m3_t>;
+  using MmaType = typename ElementType::DataType;
+
+  using ElementA = typename ElementType::DataType;
+  using ElementB = typename ElementType::DataType;
+  using ElementOutput = float;
+  using ElementScaleA = typename ElementType::ScaleFactorType;
+  using ElementScaleB = typename ElementType::ScaleFactorType;
+  using StrideScale = cute::Stride<_1, int64_t, int64_t>;
+  using TileShape = Shape<_256, _256, _32>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopMXFPXGroup<PipelineStages>;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_mxfp4_policy : public moe_policy_base {
+ public:
+  static constexpr bool NeedScale = true;
+  using ElementType = cutlass::mx_float4_t<float_e2m1_t>;
+  using MmaType = typename ElementType::DataType;
+
+  using ElementA = typename ElementType::DataType;
+  using ElementB = typename ElementType::DataType;
+  using ElementOutput = float;
+  using ElementScaleA = typename ElementType::ScaleFactorType;
+  using ElementScaleB = typename ElementType::ScaleFactorType;
+  using LayoutB = cutlass::layout::ColumnMajor;
+
+  using StrideScale = cute::Stride<_1, int64_t, int64_t>;
+
+  using TileShape = Shape<_512, _512, _64>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopMXFPXGroup<PipelineStages>;
+  CALL_GENERATE_GEMM();
 };
 
 }  // namespace grouped_gemm
