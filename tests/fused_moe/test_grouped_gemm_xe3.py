@@ -34,6 +34,13 @@ MINI_PYTEST_PARAMS = {
         "recipe": ["mxfp8", "mxfp4"],
         "has_bias": [True]
     },
+    "test_grouped_gemm_fp8block": {
+        "m,n,k": [(256, 128, 128)],
+        "e": [2],
+        "topk": [1],
+        "recipe": ["128x128"],
+        "has_bias": [True]
+    }
 }
 
 
@@ -248,6 +255,96 @@ def test_grouped_gemm_mxfp(m, n, k, e, topk, recipe, has_bias):
             continue
         input = A_dq[pre_token_sum:pre_token_sum + cur_token_num, :]
         weight = B_dq[i, :, :]
+        expert_output = input @ weight.T
+        if has_bias:
+            expert_output += bias[i]
+        ref.append(expert_output)
+        pre_token_sum += cur_token_num
+    ref = torch.cat(ref, dim=0)
+
+    print("ref: ", ref, ref.shape)
+    print("ker: ", output, output.shape)
+    torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
+
+
+def hp_from_128x128(x_lp, x_scale):
+    orig_shape = x_lp.shape
+    M, K = orig_shape
+    x_lp = x_lp.view(M // 128, 128, K // 128, 128)
+    x_scale = x_scale.unsqueeze(1).unsqueeze(-1)
+    x_hp = x_lp.to(torch.float32)
+    x_hp = x_hp / x_scale
+    return x_hp.reshape(orig_shape).to(torch.float32)
+
+
+def hp_from_1x128(x_lp, x_scale):
+    orig_shape = x_lp.shape
+    x_lp = x_lp.reshape(x_lp.shape[0], x_lp.shape[-1] // 128, 128)
+    x_hp = x_lp.to(torch.float32)
+    x_hp = x_hp / x_scale.unsqueeze(-1)
+    return x_hp.reshape(orig_shape).to(torch.float32)
+
+
+def fill_zero(x_fp8):
+    mask = (x_fp8.float() == 0)
+    x_fp8[mask] = torch.randn_like(x_fp8.float())[mask].to(x_fp8.dtype)
+
+
+@pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
+@pytest.mark.parametrize("e", NUM_EXPERTS)
+@pytest.mark.parametrize("topk", TOP_KS)
+@pytest.mark.parametrize("recipe", ["128x128"])
+@pytest.mark.parametrize("has_bias", [True, False])
+def test_grouped_gemm_fp8block(m, n, k, e, topk, recipe, has_bias):
+    assert (recipe == "128x128")
+    seed_everything(8)
+    num_experts = e
+    token_per_group = random_partition(e, m * topk)
+    assert (len(token_per_group) == e)
+
+    m = sum(token_per_group)
+
+    A_fp32 = torch.randn((m, k), device=DEVICE, dtype=torch.float32)
+    a_fp8 = A_fp32.to(torch.float8_e4m3fn)
+    a_scales = torch.randn(m * k // 128, device=DEVICE,
+                           dtype=torch.float32).reshape(m, k // 128)
+    fill_zero(a_scales)
+    assert (not (a_scales == 0).any())
+
+    B_fp32 = torch.randn((num_experts, n, k),
+                         device=DEVICE,
+                         dtype=torch.float32)
+    b_fp8 = B_fp32.to(torch.float8_e4m3fn).transpose(
+        -1, -2).contiguous().transpose(-1, -2)
+    b_scales = torch.randn(num_experts * (n // 128) * (k // 128),
+                           device=DEVICE,
+                           dtype=torch.float32).reshape(
+                               num_experts, n // 128, k // 128)
+    fill_zero(b_scales)
+    assert (not (b_scales == 0).any())
+
+    if has_bias:
+        bias = torch.randn((num_experts, n),
+                           dtype=torch.float32,
+                           device=DEVICE)
+    else:
+        bias = None
+
+    output = torch.empty((m, n), dtype=torch.float32, device=DEVICE)
+    cutlass_grouped_gemm(a_fp8, a_scales, b_fp8, b_scales, bias, output,
+                         token_per_group, n, k, num_experts)
+
+    # ref gg
+    ref = []
+    pre_token_sum = 0
+    a_ref = hp_from_1x128(a_fp8, a_scales)
+    for i in range(num_experts):
+        cur_token_num = token_per_group[i]
+        if cur_token_num == 0:
+            continue
+        input = a_ref[pre_token_sum:pre_token_sum + cur_token_num, :]
+        weight = hp_from_128x128(b_fp8[i, :, :], b_scales[i, :, :])
+
         expert_output = input @ weight.T
         if has_bias:
             expert_output += bias[i]

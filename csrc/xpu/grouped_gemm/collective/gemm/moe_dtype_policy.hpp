@@ -18,6 +18,7 @@
 
 #include "moe_array_mma.hpp"
 #include "moe_array_mma_mxfp.hpp"
+#include "moe_array_mma_fp8block.hpp"
 #include "moe_array_epilogue.hpp"
 #include "moe_callbacks.hpp"
 #include "moe_dtype_policy.hpp"
@@ -171,6 +172,7 @@ class moe_policy_base {
       ElementAccumulator,
       cutlass::FloatRoundStyle::round_to_nearest>;
   static constexpr bool NeedScale = false;
+  static constexpr int BlockSize = -1;
 };
 
 class moe_bf16_policy : public moe_policy_base {
@@ -179,7 +181,7 @@ class moe_bf16_policy : public moe_policy_base {
   using ElementB = cutlass::bfloat16_t;
   using ElementOutput = cutlass::bfloat16_t;
 
-  using TileShape = Shape<_256, _256, _32>;
+  using TileShape = Shape<_128, _128, _32>;
   using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
@@ -195,7 +197,7 @@ class moe_fp16_policy : public moe_policy_base {
   using ElementB = cutlass::half_t;
   using ElementOutput = cutlass::half_t;
 
-  using TileShape = Shape<_256, _256, _32>;
+  using TileShape = Shape<_128, _128, _32>;
   using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
@@ -230,6 +232,7 @@ class moe_fp16_decode_policy : public moe_fp16_policy {
 class moe_mxfp8_policy : public moe_policy_base {
  public:
   static constexpr bool NeedScale = true;
+  static constexpr int BlockSize = 32;
   using ElementType = cutlass::mx_float8_t<float_e4m3_t>;
   using MmaType = typename ElementType::DataType;
 
@@ -254,6 +257,7 @@ class moe_mxfp8_policy : public moe_policy_base {
 class moe_mxfp4_policy : public moe_policy_base {
  public:
   static constexpr bool NeedScale = true;
+  static constexpr int BlockSize = 32;
   using ElementType = cutlass::mx_float4_t<float_e2m1_t>;
   using MmaType = typename ElementType::DataType;
 
@@ -266,7 +270,7 @@ class moe_mxfp4_policy : public moe_policy_base {
 
   using StrideScale = cute::Stride<_1, int64_t, int64_t>;
 
-  using TileShape = Shape<_512, _512, _64>;
+  using TileShape = Shape<_256, _256, _64>;
   using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
@@ -274,6 +278,32 @@ class moe_mxfp4_policy : public moe_policy_base {
       SGLayout>::TiledMMA;
 
   using GEMMDispatchPolicy = cutlass::gemm::MainloopMXFPXGroup<PipelineStages>;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_fp8block_policy : public moe_policy_base {
+ public:
+  static constexpr bool NeedScale = true;
+  static constexpr int BlockSize = 128;
+  using ElementType = cutlass::float_e4m3_t;
+
+  using ElementA = ElementType;
+  using ElementB = ElementType;
+  using ElementOutput = float;
+  using ElementScaleA = float;
+  using ElementScaleB = float;
+
+  using StrideScale = cute::Stride<_1, int64_t, int64_t>;
+
+  using TileShape = Shape<_128, _128, _32>;
+  using SGLayout = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+
+  using GEMMDispatchPolicy =
+      cutlass::gemm::MainloopFP8BlockGroup<PipelineStages>;
   CALL_GENERATE_GEMM();
 };
 

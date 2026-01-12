@@ -80,6 +80,11 @@ at::Tensor grouped_gemm_func(
       ptr_A_scale->dtype() == at::kFloat8_e8m0fnu) {
     using moe_policy = grouped_gemm::moe_mxfp4_policy;
     CALL_KERNEL_WITH_POLICY(moe_policy);
+  } else if (
+      A_dtype == at::kFloat8_e4m3fn && ptr_A_scale &&
+      ptr_A_scale->dtype() == at::kFloat) {
+    using moe_policy = grouped_gemm::moe_fp8block_policy;
+    CALL_KERNEL_WITH_POLICY(moe_policy);
   } else {
     TORCH_CHECK(
         false,

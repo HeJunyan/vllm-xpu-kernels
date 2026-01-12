@@ -127,7 +127,8 @@ struct GroupedGemmRunner {
       ElementOutput* ptr_D,
       int64_t N,
       int64_t K,
-      int64_t groups) {
+      int64_t groups,
+      int block_size) {
     typename Gemm::Arguments arguments;
     decltype(arguments.epilogue.thread) fusion_args;
 
@@ -158,10 +159,9 @@ struct GroupedGemmRunner {
           hw_info,
           {1, RasterOrderOptions::AlongN}};
     } else {
-      static constexpr int GROUP_K = 32;
       arguments = typename Gemm::Arguments{
           cutlass::gemm::GemmUniversalMode::kGrouped,
-          {ptr_A, ptr_B, ptr_A_scale, ptr_B_scale, GROUP_K},
+          {ptr_A, ptr_B, ptr_A_scale, ptr_B_scale, block_size},
           {fusion_args, ptr_C, ptr_D},
           expert_first_token_offset,
           N,
@@ -186,7 +186,8 @@ struct GroupedGemmRunner {
       ElementOutput* ptr_D,
       int64_t N,
       int64_t K,
-      int64_t groups) {
+      int64_t groups,
+      int block_size) {
     Gemm gemm_op;
 
     auto arguments = args_from_options(
@@ -200,7 +201,8 @@ struct GroupedGemmRunner {
         ptr_D,
         N,
         K,
-        groups);
+        groups,
+        block_size);
 
     size_t workspace_size = Gemm::get_workspace_size(arguments);
     cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
@@ -260,7 +262,8 @@ void kernel_functor(
       reinterpret_cast<typename moe_policy::ElementOutput*>(ptr_D),
       N,
       K,
-      groups);
+      groups,
+      moe_policy::BlockSize);
 }
 
 #define INSTANTIATE_KERNEL(POLICY)      \
@@ -283,6 +286,7 @@ INSTANTIATE_KERNEL(moe_fp16_policy)
 INSTANTIATE_KERNEL(moe_fp16_decode_policy)
 INSTANTIATE_KERNEL(moe_mxfp4_policy)
 INSTANTIATE_KERNEL(moe_mxfp8_policy)
+INSTANTIATE_KERNEL(moe_fp8block_policy)
 
 }  // namespace grouped_gemm
 }  // namespace gpu::cutlass_kernel
