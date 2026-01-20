@@ -94,7 +94,8 @@ def _floatx_unpacked_to_f32(x: Tensor, ebits: int, mbits: int) -> Tensor:
                                   left_shift) << MBITS_F32
 
                 # we can update this in-place since the values won't overlap
-                # torch.compile() may complain unsupported operand type(s) for |: 'SymInt' and 'int'
+                # torch.compile() may complain unsupported operand type(s)
+                # for |: 'SymInt' and 'int'
                 # thus we use + instead of | here
                 mantissa_lp_int32[mantissa_lp_int32 == mantissa_cmp] = (
                     exp_biased_f32 + mantissa_f32)

@@ -77,7 +77,7 @@
 
 #pragma once
 #include "csrc/xpu/grouped_gemm/xe_default/helper.h"
-#include "csrc/xpu/grouped_gemm/collective/gemm/moe_dtype_policy.hpp"
+#include "collective/moe_dtype_policy.hpp"
 
 using namespace cute;
 using ProblemShape =

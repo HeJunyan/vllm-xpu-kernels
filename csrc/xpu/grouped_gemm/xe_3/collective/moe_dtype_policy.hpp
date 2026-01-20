@@ -21,7 +21,6 @@
 #include "moe_array_mma_fp8block.hpp"
 #include "moe_array_epilogue.hpp"
 #include "moe_callbacks.hpp"
-#include "moe_dtype_policy.hpp"
 #include "moe_gemm_array_cooperative.hpp"
 #include "moe_tile_scheduler.hpp"
 
