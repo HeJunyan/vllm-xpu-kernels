@@ -225,11 +225,13 @@ def xpu_fused_moe(hidden_states,
         topk_ids = topk_ids.to(torch.int64)
     torch.ops._moe_C.fused_moe_prologue(
         input=hidden_states,
+        input_scales=None,
         token_selected_experts=topk_ids,
         token_final_scales=topk_weights,
         workspace=workspace,
         hidden_size=hidden_size,
         inter_size=inter_size,
+        block_k=1,
         ep_rank=ep_rank,
         ep_size=ep_size,
         num_experts_on_rank=num_experts_per_node)
