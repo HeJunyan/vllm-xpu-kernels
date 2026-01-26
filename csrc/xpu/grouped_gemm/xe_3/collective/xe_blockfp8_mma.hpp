@@ -497,7 +497,7 @@ struct CollectiveMma<
                            int(k_tile * SG_K / GROUP_K);
             float scaleA = mainloop.ptr_SA[index_SA];
             accum[make_coord(i0, i1, i2)] +=
-                scaler[make_coord(i0, i1, i2)] / scaleA / scaleB;
+                scaler[make_coord(i0, i1, i2)] * scaleA * scaleB;
           }
         }
       }

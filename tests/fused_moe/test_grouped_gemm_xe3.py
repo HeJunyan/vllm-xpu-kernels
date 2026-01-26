@@ -273,7 +273,7 @@ def hp_from_128x128(x_lp, x_scale):
     x_lp = x_lp.view(M // 128, 128, K // 128, 128)
     x_scale = x_scale.unsqueeze(1).unsqueeze(-1)
     x_hp = x_lp.to(torch.float32)
-    x_hp = x_hp / x_scale
+    x_hp = x_hp * x_scale
     return x_hp.reshape(orig_shape).to(torch.float32)
 
 
@@ -281,7 +281,7 @@ def hp_from_1x128(x_lp, x_scale):
     orig_shape = x_lp.shape
     x_lp = x_lp.reshape(x_lp.shape[0], x_lp.shape[-1] // 128, 128)
     x_hp = x_lp.to(torch.float32)
-    x_hp = x_hp / x_scale.unsqueeze(-1)
+    x_hp = x_hp * x_scale.unsqueeze(-1)
     return x_hp.reshape(orig_shape).to(torch.float32)
 
 

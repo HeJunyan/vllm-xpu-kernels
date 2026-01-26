@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import gc
+import os
 
 import pytest
 import torch
@@ -7,6 +8,10 @@ import torch
 from tests.ops.fp8_quant_op import scaled_fp8_quant
 from tests.utils import seed_everything
 from vllm_xpu_kernels.fused_moe_interface import xpu_fused_moe
+
+pytestmark = pytest.mark.skipif(os.getenv("BUILD_ON_SIMULATOR_CRI") == "1"
+                                or os.getenv("BUILD_ON_SIMULATOR_JGS") == "1",
+                                reason="disable XE2 CUTLASS tests on XE3/4.")
 
 DEVICE = "xpu"
 

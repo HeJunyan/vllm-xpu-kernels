@@ -88,8 +88,8 @@ at::Tensor grouped_gemm_func(
   } else {
     TORCH_CHECK(
         false,
-        "grouped_gemm_func only supports BF16/FP16/MXFP8/MXFP4 dtypes, but "
-        "got: ",
+        "grouped_gemm_func only supports BF16/FP16/MXFP8/MXFP4/FP8(block) "
+        "dtypes, but got: ",
         A_dtype);
   }
   return ptr_D;

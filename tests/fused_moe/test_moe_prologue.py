@@ -20,11 +20,10 @@ TOP_KS = [1, 2]
 
 MINI_PYTEST_PARAMS = {
     "default": {
-        "m,n,k": [(1, 256, 128)],
+        "m,n,k": [(4, 256, 128)],
         "e": [2],
         "topk": [1],
-        "dtype": [torch.bfloat16],
-        "has_bias": [True]
+        "recipe": ["bf16", "fp16", "mxfp8", "mxfp4", "fp8block"]
     }
 }
 
