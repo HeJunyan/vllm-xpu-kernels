@@ -250,7 +250,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages when building.、
   if(BUILD_ON_SIMULATOR_CRI)
     # update on ww51.1 by Liangliang, this commit id is latest from v0.1.0_next branch
-    set(CUTLASS_REVISION "f811bbd2a502ff757d7a238fe516e8aeca2b872f" CACHE STRING "CUTLASS revision to use")
+    set(CUTLASS_REVISION "55069a2bfec4c651e0856f83990bb8e0d04e0fb6" CACHE STRING "CUTLASS revision to use")
   elseif(BUILD_ON_SIMULATOR_JGS)
     # update on WW50 by Kunshang, this commit id is latest from master_next branch
     set(CUTLASS_REVISION "cc272f2c9fb142cc929ee1607f4016ccf989ea26" CACHE STRING "CUTLASS revision to use")
