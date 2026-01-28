@@ -1,14 +1,19 @@
-#include "fmha_xe3.h"
-// FIXME: reuse chunk_prefill from xe2 now
-#include "csrc/xpu/attn/xe_2/chunk_prefill_utils.hpp"
-#include "csrc/xpu/attn/xe_2/chunk_prefill_extern.hpp"
+#include "paged_decode_xe3.h"
+#include "csrc/xpu/attn/xe_2/paged_decode_utils.hpp"
+#include "csrc/xpu/attn/xe_2/paged_decode_extern.hpp"
 
-void cutlass_chunk_prefill_xe3(
+using namespace cute;
+
+void cutlass_paged_decode_xe3(
     sycl::queue& queue,
     const at::Tensor& query,      // [seq_q, heads, head_size]
     const at::Tensor& key_cache,  // [num_block, block_size, heads, head_size]
     const at::Tensor& value_cache,
     at::Tensor& out,
+    at::Tensor&
+        temp_out,  // [batch, num_head_q, seq_q, head_size, num_kv_splits]
+    at::Tensor& exp_sums,    // [batch, num_head_q, seq_q, num_kv_splits]
+    at::Tensor& max_logits,  // [batch, num_head_q, seq_q, num_kv_splits]
     const at::Tensor& block_table,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& cu_seqlens_k,
@@ -22,13 +27,17 @@ void cutlass_chunk_prefill_xe3(
     bool is_paged,
     bool is_causal,
     bool is_local,
-    bool is_sink) {
-  cutlass_chunk_prefill_impl(
+    bool is_sink,
+    int num_kv_splits) {
+  cutlass_paged_decode_impl(
       queue,
       query,
       key_cache,
       value_cache,
       out,
+      temp_out,
+      exp_sums,
+      max_logits,
       block_table,
       cu_seqlens_q,
       cu_seqlens_k,
@@ -42,15 +51,20 @@ void cutlass_chunk_prefill_xe3(
       is_paged,
       is_causal,
       is_local,
-      is_sink);
+      is_sink,
+      num_kv_splits);
 }
 
-void cutlass_chunk_prefill_impl(
+void cutlass_paged_decode_impl(
     sycl::queue& queue,
     const at::Tensor& query,      // [seq_q, heads, head_size]
     const at::Tensor& key_cache,  // [num_block, block_size, heads, head_size]
     const at::Tensor& value_cache,
     at::Tensor& out,
+    at::Tensor&
+        temp_out,  // [batch, num_head_q, seq_q, head_size, num_kv_splits]
+    at::Tensor& exp_sums,    // [batch, num_head_q, seq_q, num_kv_splits]
+    at::Tensor& max_logits,  // [batch, num_head_q, seq_q, num_kv_splits]
     const at::Tensor& block_table,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& cu_seqlens_k,
@@ -64,7 +78,8 @@ void cutlass_chunk_prefill_impl(
     bool is_paged,
     bool is_causal,
     bool is_local,
-    bool is_sink) {
+    bool is_sink,
+    int num_kv_splits) {
   // general params
   int batch_size, num_heads_q, num_heads_kv, head_size;
   // additional params
@@ -88,6 +103,8 @@ void cutlass_chunk_prefill_impl(
     max_seqlen_k = key_cache.size(2);
   }
   if (is_paged) {
+    // num_blocks is used to build total_seqlen_k for shape_K in kernels
+    // it is not just the meaning of used blocks for kv.
     num_blocks = key_cache.size(0);
     block_size = key_cache.size(1);
     num_heads_kv = key_cache.size(2);
@@ -99,18 +116,17 @@ void cutlass_chunk_prefill_impl(
     window_size_left = window_size_left == -1 ? max_seqlen_k : window_size_left;
     window_size_right =
         window_size_right == -1 ? max_seqlen_k : window_size_right;
-    if (is_causal) {
-      window_size_right = 0;
-      is_causal = false;
-    }
   }
 
-  chunk_prefill_args_t args = {
+  paged_decode_args_t args = {
       query.data_ptr(),
       key_cache.data_ptr(),
       value_cache.data_ptr(),
       out.data_ptr(),
-      is_paged ? block_table.data_ptr() : nullptr,
+      temp_out.data_ptr(),
+      exp_sums.data_ptr(),
+      max_logits.data_ptr(),
+      block_table.data_ptr(),
       cu_seqlens_q.data_ptr(),
       cu_seqlens_k.data_ptr(),
       max_seqlen_q,
@@ -131,7 +147,8 @@ void cutlass_chunk_prefill_impl(
       is_paged,   // paged
       is_causal,
       is_local,
-      is_sink};
+      is_sink,
+      num_kv_splits};
 
   CutlassType cuType = aten_to_Cutlass_dtype(query);
 
@@ -141,22 +158,23 @@ void cutlass_chunk_prefill_impl(
       "FMHA forward only supports head dimension at most " +
           std::to_string(max_head_size));
 
-  if (args.head_size <= HEAD_SIZE_LIMIT_0) {
-    policy_dispatch_func<chunk_policy_head64>(
-        queue, cuType, args, is_paged, is_causal, is_local, is_sink);
-  } else if (args.head_size <= HEAD_SIZE_LIMIT_1) {
-    policy_dispatch_func<chunk_policy_head96>(
-        queue, cuType, args, is_paged, is_causal, is_local, is_sink);
-  } else if (args.head_size <= HEAD_SIZE_LIMIT_2) {
-    policy_dispatch_func<chunk_policy_head128>(
-        queue, cuType, args, is_paged, is_causal, is_local, is_sink);
-  } else if (args.head_size <= HEAD_SIZE_LIMIT_3) {
-    policy_dispatch_func<chunk_policy_head192>(
-        queue, cuType, args, is_paged, is_causal, is_local, is_sink);
-  } else if (args.head_size <= HEAD_SIZE_LIMIT_4) {
-    policy_dispatch_func<chunk_policy_head256>(
-        queue, cuType, args, is_paged, is_causal, is_local, is_sink);
+  auto get_head_size_case = [](int head_size) -> int {
+    if (head_size <= HEAD_SIZE_LIMIT_0) return 0;
+    if (head_size <= HEAD_SIZE_LIMIT_1) return 1;
+    if (head_size <= HEAD_SIZE_LIMIT_2) return 2;
+    if (head_size <= HEAD_SIZE_LIMIT_3) return 3;
+    if (head_size <= HEAD_SIZE_LIMIT_4) return 4;
+    return -1;
+  };
+
+  int head_case = get_head_size_case(args.head_size);
+  int num_q_group_size = num_heads_q / num_heads_kv;
+
+  if (num_q_group_size <= 8) {
+    dispatch_by_head_size<_8>(head_case, queue, cuType, args);
+  } else if (num_q_group_size <= 16) {
+    dispatch_by_head_size<_16>(head_case, queue, cuType, args);
   } else {
-    TORCH_CHECK(false, "Unsupported head size for fmha");
+    TORCH_CHECK(false, "Unsupported num_heads_q / num_heads_kv for fmha");
   }
 }
