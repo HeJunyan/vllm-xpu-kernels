@@ -1,6 +1,8 @@
 #include "fmha_xe3.h"
 // FIXME: reuse chunk_prefill from xe2 now
 #include "csrc/xpu/attn/xe_2/chunk_prefill.hpp"
+#include "csrc/xpu/attn/xe_2/chunk_prefill_utils.hpp"
+#include "csrc/xpu/attn/xe_2/chunk_prefill_extern.hpp"
 
 void cutlass_chunk_prefill_xe3(
     sycl::queue& queue,
