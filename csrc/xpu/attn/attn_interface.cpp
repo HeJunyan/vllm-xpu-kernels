@@ -77,6 +77,8 @@ void cutlass_chunk_prefill_interface(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        k_scale,
+        v_scale,
         sm_scale,
         sm_sink_,
         window_size_left,
