@@ -215,6 +215,7 @@ def xpu_fused_moe(hidden_states,
                   act_quant=False,
                   ep_rank=0,
                   ep_size=1,
+                  output=None,
                   is_fp8=False,
                   is_int4=False,
                   is_mxfp4=False):
@@ -246,7 +247,11 @@ def xpu_fused_moe(hidden_states,
     input_scales = None
     scale_dtype = None
     block_k = 1
-    output = torch.empty_like(hidden_states)
+    if output is None:
+        output = torch.empty_like(hidden_states)
+    else:
+        assert output.shape == hidden_states.shape, \
+            "output shape must be the same as hidden_states shape"
 
     if act_quant:
         assert(w13_scales is not None)
