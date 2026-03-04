@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-import gc
 import math
+
 import pytest
 import torch
 
+from tests.fused_moe.test_grouped_gemm_xe3 import (data_to_mx_scale,
+                                                   fp4_e2m1fn_x2_to_float,
+                                                   hp_from_1x128,
+                                                   hp_from_128x128)
 from tests.utils import seed_everything
-from tests.fused_moe.test_grouped_gemm_xe3 import hp_from_128x128, hp_from_1x128, data_to_mx_scale, fp4_e2m1fn_x2_to_float
-from vllm_xpu_kernels.fused_moe_interface import xpu_fused_moe, quant_fp8_act, quant_mxfp_act
+from vllm_xpu_kernels.fused_moe_interface import (quant_fp8_act,
+                                                  quant_mxfp_act,
+                                                  xpu_fused_moe)
 
 DEVICE = "xpu"
 
@@ -40,17 +45,10 @@ RECIPE_TO_DTYPE = {
     "mxfp4": (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu),
 }
 
+
 def quant_mxfp_weight(w, recipe):
-    # largest power of 2 representable in `torch.float8_e4m3fn`
-    F8E4M3_LARGEST_POW2 = 8
-    # largest power of 2 representable in `torch.float4_e2m1fn_x2`
-    FP4E2M1FN_LARGEST_POW2 = 2.0
     # max value of `torch.float8_e4m3fn` (448)
     F8E4M3_MAX_VAL = torch.finfo(torch.float8_e4m3fn).max
-    # exponent bias of `torch.float8_e8m0fnu`
-    F8E8M0_EXP_BIAS = 127
-    # exponent and mantissa bits of `torch.float4_e2m1fn_x2`
-    FP4_EBITS, FP4_MBITS = 2, 1
     FP4_MAX_VAL = 6.0
 
     BLOCK_SIZE = 32
@@ -65,15 +63,19 @@ def quant_mxfp_weight(w, recipe):
     w_scales = data_to_mx_scale(w.to(torch.bfloat16), BLOCK_SIZE, recipe)
     w_scales = w_scales.transpose(-1, -2).contiguous().transpose(-1, -2)
     if recipe == "mxfp8":
-        w = (w.to(torch.bfloat16).reshape(-1, BLOCK_SIZE) / w_scales.reshape(-1, 1).float()).reshape(orig_shape)
-        w = w.clamp(min=min_val, max=max_val).to(torch.float8_e4m3fn)  # (e, n, k)
+        w = (w.to(torch.bfloat16).reshape(-1, BLOCK_SIZE) /
+             w_scales.reshape(-1, 1).float()).reshape(orig_shape)
+        w = w.clamp(min=min_val,
+                    max=max_val).to(torch.float8_e4m3fn)  # (e, n, k)
     elif recipe == "mxfp4":
-        w = (w.to(torch.bfloat16).reshape(-1, BLOCK_SIZE) / w_scales.reshape(-1, 1).bfloat16()).reshape(orig_shape)
+        w = (w.to(torch.bfloat16).reshape(-1, BLOCK_SIZE) /
+             w_scales.reshape(-1, 1).bfloat16()).reshape(orig_shape)
         w = w.clamp(min=min_val, max=max_val)
         from torch.testing._internal.common_quantized import (
             _bfloat16_to_float4_e2m1fn_x2)
         w = _bfloat16_to_float4_e2m1fn_x2(w)
     return w, w_scales
+
 
 def ref_fused_moe(recipe,
                   x,
@@ -119,14 +121,17 @@ def ref_fused_moe(recipe,
     elif recipe == "mxfp4":
         act_ori_shape = x.shape
         _q, _scale = quant_mxfp_act(x, "mxfp4")
-        x = fp4_e2m1fn_x2_to_float(_q).reshape(-1, 32) * (_scale.reshape(-1, 1).float())
+        x = fp4_e2m1fn_x2_to_float(_q).reshape(-1, 32) * (_scale.reshape(
+            -1, 1).float())
         x = x.reshape(act_ori_shape)
         w13_ori_shape = w13.shape
         w2_ori_shape = w2.shape
-        w13 = fp4_e2m1fn_x2_to_float(w13).reshape(-1, 32) * (w13_scales.reshape(-1, 1).float())
-        w2 = fp4_e2m1fn_x2_to_float(w2).reshape(-1, 32) * (w2_scales.reshape(-1, 1).float())
-        w13 = w13.reshape(w13_ori_shape[:-1] + (w13_ori_shape[-1] * 2,))
-        w2 = w2.reshape(w2_ori_shape[:-1] + (w2_ori_shape[-1] * 2,))
+        w13 = fp4_e2m1fn_x2_to_float(w13).reshape(
+            -1, 32) * (w13_scales.reshape(-1, 1).float())
+        w2 = fp4_e2m1fn_x2_to_float(w2).reshape(-1, 32) * (w2_scales.reshape(
+            -1, 1).float())
+        w13 = w13.reshape(w13_ori_shape[:-1] + (w13_ori_shape[-1] * 2, ))
+        w2 = w2.reshape(w2_ori_shape[:-1] + (w2_ori_shape[-1] * 2, ))
 
     for expert_id, end_idx in enumerate(tokens_per_expert):
         start_idx = 0 if expert_id == 0 else tokens_per_expert[expert_id - 1]
@@ -140,7 +145,8 @@ def ref_fused_moe(recipe,
         ### dequant weight13
         expert_w13 = w13[expert_id, :, :]
         if recipe == "fp8block":
-            expert_w13 = hp_from_128x128(w13[expert_id, :, :], w13_scales[expert_id, :, :])
+            expert_w13 = hp_from_128x128(w13[expert_id, :, :],
+                                         w13_scales[expert_id, :, :])
         ###
 
         w1, w3 = torch.split(expert_w13,
@@ -162,19 +168,22 @@ def ref_fused_moe(recipe,
         gemm2_input = gate * up
         expert_w2 = w2[expert_id, :, :]
         if recipe == "fp8block":
-            expert_w2 = hp_from_128x128(w2[expert_id, :, :], w2_scales[expert_id, :, :])
+            expert_w2 = hp_from_128x128(w2[expert_id, :, :],
+                                        w2_scales[expert_id, :, :])
             _q, _scale = quant_fp8_act(gemm2_input)
             gemm2_input = hp_from_1x128(_q, _scale)
         elif recipe == "mxfp8":
             _q, _scale = quant_mxfp_act(gemm2_input, "mxfp8")
-            gemm2_input = _q.float().reshape(-1, 32) * (_scale.reshape(-1, 1).float())
+            gemm2_input = _q.float().reshape(-1, 32) * (_scale.reshape(
+                -1, 1).float())
             gemm2_input = gemm2_input.reshape(_q.shape)
         elif recipe == "mxfp4":
             _q, _scale = quant_mxfp_act(gemm2_input, "mxfp4")
-            gemm2_input = fp4_e2m1fn_x2_to_float(_q).reshape(-1, 32) * (_scale.reshape(-1, 1).float())
-            gemm2_input = gemm2_input.reshape(_q.shape[:-1] + (_q.shape[-1]*2, ))
+            gemm2_input = fp4_e2m1fn_x2_to_float(_q).reshape(
+                -1, 32) * (_scale.reshape(-1, 1).float())
+            gemm2_input = gemm2_input.reshape(_q.shape[:-1] +
+                                              (_q.shape[-1] * 2, ))
         ###
-
 
         expert_out = ((gemm2_input) @ expert_w2.T.to(torch.float32))
 
@@ -195,7 +204,8 @@ def ref_fused_moe(recipe,
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
-@pytest.mark.parametrize("recipe", ["bf16", "fp16", "mxfp8", "mxfp4", "fp8block"])
+@pytest.mark.parametrize("recipe",
+                         ["bf16", "fp16", "mxfp8", "mxfp4", "fp8block"])
 @pytest.mark.parametrize("has_bias", [True, False])
 def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
     seed_everything(7)
@@ -209,13 +219,14 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
     data_factor = 1.0 / math.sqrt(hidden_size)
 
     hidden_states = torch.randn(
-            (input_len, hidden_size), device=DEVICE, dtype=torch.float32) * data_factor
+        (input_len, hidden_size), device=DEVICE,
+        dtype=torch.float32) * data_factor
     w13 = torch.randn((num_experts, 2 * intermediate_size, hidden_size),
-                    device=DEVICE,
-                    dtype=torch.float32) * data_factor
+                      device=DEVICE,
+                      dtype=torch.float32) * data_factor
     w2 = torch.randn((num_experts, hidden_size, intermediate_size),
-                    device=DEVICE,
-                    dtype=torch.float32) * data_factor
+                     device=DEVICE,
+                     dtype=torch.float32) * data_factor
     w13_scales = None
     w2_scales = None
 
@@ -227,14 +238,20 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
         w13 = w13.to(data_dtype)
         w2 = w2.to(data_dtype)
         block_k = 128
-        w13_scales = torch.rand(num_experts * (2*intermediate_size // block_k) * (hidden_size // block_k),
-                       device=DEVICE,
-                       dtype=torch.float32).reshape(
-                       num_experts, 2*intermediate_size // block_k, hidden_size // block_k) * 0.01 + 0.01  # [0.01,0.02]
-        w2_scales = torch.rand(num_experts * (hidden_size // block_k) * (intermediate_size // block_k),
-                       device=DEVICE,
-                       dtype=torch.float32).reshape(
-                       num_experts, hidden_size // block_k, intermediate_size // block_k)* 0.005 + 0.005  # [0.005,0.01]
+        w13_scales = torch.rand(
+            num_experts * (2 * intermediate_size // block_k) *
+            (hidden_size // block_k),
+            device=DEVICE,
+            dtype=torch.float32).reshape(
+                num_experts, 2 * intermediate_size // block_k,
+                hidden_size // block_k) * 0.01 + 0.01  # [0.01,0.02]
+        w2_scales = torch.rand(
+            num_experts * (hidden_size // block_k) *
+            (intermediate_size // block_k),
+            device=DEVICE,
+            dtype=torch.float32).reshape(
+                num_experts, hidden_size // block_k,
+                intermediate_size // block_k) * 0.005 + 0.005  # [0.005,0.01]
     elif recipe == "mxfp8":
         block_k = 32
         w13, w13_scales = quant_mxfp_weight(w13, "mxfp8")
@@ -245,11 +262,12 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
         w2, w2_scales = quant_mxfp_weight(w2, "mxfp4")
 
     if has_bias:
-        w13_bias = torch.randn(
-            (num_experts, 2 * intermediate_size), device=DEVICE,
-            dtype=torch.float32) / 16
+        w13_bias = torch.randn((num_experts, 2 * intermediate_size),
+                               device=DEVICE,
+                               dtype=torch.float32) / 16
         w2_bias = torch.randn(
-            (num_experts, hidden_size), device=DEVICE, dtype=torch.float32) / 16
+            (num_experts, hidden_size), device=DEVICE,
+            dtype=torch.float32) / 16
         if data_dtype in [torch.float16, torch.bfloat16]:
             w13_bias = w13_bias.to(data_dtype)
             w2_bias = w2_bias.to(data_dtype)
@@ -265,19 +283,9 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
                                                dim=-1,
                                                sorted=False)
 
-    ref_out = ref_fused_moe(recipe,
-                            hidden_states,
-                            w13,
-                            w13_scales,
-                            w13_bias,
-                            w2,
-                            w2_scales,
-                            w2_bias,
-                            expert_scores,
-                            expert_indices,
-                            topk,
-                            "silu",
-                            e)
+    ref_out = ref_fused_moe(recipe, hidden_states, w13, w13_scales, w13_bias,
+                            w2, w2_scales, w2_bias, expert_scores,
+                            expert_indices, topk, "silu", e)
 
     output = xpu_fused_moe(hidden_states=hidden_states,
                            w13=w13,
@@ -291,7 +299,7 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
                            n_experts_per_token=topk,
                            activation="silu",
                            num_experts=e,
-                           act_quant=True if recipe not in ["bf16", "fp16"] else False)
+                           act_quant=recipe not in ["bf16", "fp16"])
 
     if data_dtype == torch.float16:
         rtol = 1e-2
@@ -300,4 +308,3 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
         rtol = 2e-2
         atol = 2e-2
     torch.testing.assert_close(output, ref_out, rtol=rtol, atol=atol)
-

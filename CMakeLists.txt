@@ -61,11 +61,11 @@ message(STATUS "BUILD_ON_SIMULATOR_CRI: ${BUILD_ON_SIMULATOR_CRI}")
 set(BUILD_ON_SIMULATOR_JGS $ENV{BUILD_ON_SIMULATOR_JGS})
 message(STATUS "BUILD_ON_SIMULATOR_JGS: ${BUILD_ON_SIMULATOR_JGS}")
 if(BUILD_ON_SIMULATOR_CRI AND BUILD_ON_SIMULATOR_JGS)
-  message(FATAL_ERROR "Both BUILD_ON_SIMULATOR_CRI and BUILD_ON_SIMULATOR_JGS are set. Please set only one.")
+  message(
+    FATAL_ERROR
+      "Both BUILD_ON_SIMULATOR_CRI and BUILD_ON_SIMULATOR_JGS are set. Please set only one."
+  )
 endif()
-
-
-
 
 set(BASIC_KERNELS_ENABLED ON)
 set(FA2_KERNELS_ENABLED ON)
@@ -75,11 +75,14 @@ set(XPU_SPECIFIC_KERNELS_ENABLED ON)
 
 if(BUILD_ON_SIMULATOR_CRI)
   message(STATUS "Building on CRI simulator, enable XE3 kernels only.")
-  set(VLLM_XPU_ENABLE_XE2 OFF) # actually we can enable XE2 as well on CRI simulator, but we will never test it there
+  set(VLLM_XPU_ENABLE_XE2 OFF) # actually we can enable XE2 as well on CRI
+                               # simulator, but we will never test it there
   set(VLLM_XPU_ENABLE_XE3 ON)
   set(VLLM_XPU_ENABLE_XE4 OFF)
   set(VLLM_XPU_ENABLE_XE_DEFAULT OFF)
-  SET(ONEDNN_BRANCH "prv-gpu" CACHE STRING "Specific prv-gpu for oneDNN on CRI")
+  set(ONEDNN_BRANCH
+      "prv-gpu"
+      CACHE STRING "Specific prv-gpu for oneDNN on CRI")
 endif()
 
 if(BUILD_ON_SIMULATOR_JGS)
@@ -91,7 +94,9 @@ if(BUILD_ON_SIMULATOR_JGS)
   set(BUILD_SYCL_TLA_KERNELS OFF)
   set(FA2_KERNELS_ENABLED OFF)
   set(MOE_KERNELS_ENABLED ON)
-  SET(ONEDNN_BRANCH "prv-xe4" CACHE STRING "Specific prv-xe4 for oneDNN on JGS")
+  set(ONEDNN_BRANCH
+      "prv-xe4"
+      CACHE STRING "Specific prv-xe4 for oneDNN on JGS")
 endif()
 
 #
@@ -215,7 +220,8 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   )
 
   # TODO: make AOT configurable
-  set(AOT_DEVICES "pvc,bmg-g21-a0") # FIXME: we should cover all device for default build
+  set(AOT_DEVICES "pvc,bmg-g21-a0") # FIXME: we should cover all device for
+                                    # default build
   set(XE2_AOT_DEVICES "pvc,bmg-g21-a0")
   set(XE3_AOT_DEVICES "cri-a0")
   set(XE4_AOT_DEVICES "jgs-a0")
@@ -248,16 +254,26 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
       "ON"
       CACHE BOOL "Enable only the header library")
 
-  # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages when building.、
+  # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
+  # when building.、
   if(BUILD_ON_SIMULATOR_CRI)
-    # update on ww51.1 by Liangliang, this commit id is latest from v0.1.0_next branch
-    set(CUTLASS_REVISION "55069a2bfec4c651e0856f83990bb8e0d04e0fb6" CACHE STRING "CUTLASS revision to use")
+    # update on ww51.1 by Liangliang, this commit id is latest from v0.1.0_next
+    # branch
+    set(CUTLASS_REVISION
+        "55069a2bfec4c651e0856f83990bb8e0d04e0fb6"
+        CACHE STRING "CUTLASS revision to use")
   elseif(BUILD_ON_SIMULATOR_JGS)
-    # update on WW50 by Kunshang, this commit id is latest from master_next branch
-    set(CUTLASS_REVISION "cc272f2c9fb142cc929ee1607f4016ccf989ea26" CACHE STRING "CUTLASS revision to use")
+    # update on WW50 by Kunshang, this commit id is latest from master_next
+    # branch
+    set(CUTLASS_REVISION
+        "cc272f2c9fb142cc929ee1607f4016ccf989ea26"
+        CACHE STRING "CUTLASS revision to use")
   else()
-    # update on WW50 by Kunshang, this commit id same to vllm-project/vllm-xpu-kernels
-    set(CUTLASS_REVISION "3f2a337e885db0fb97b2a6ba514eb7a2a734ac4a" CACHE STRING "CUTLASS revision to use")
+    # update on WW50 by Kunshang, this commit id same to
+    # vllm-project/vllm-xpu-kernels
+    set(CUTLASS_REVISION
+        "3f2a337e885db0fb97b2a6ba514eb7a2a734ac4a"
+        CACHE STRING "CUTLASS revision to use")
   endif()
 
   if(DEFINED ENV{VLLM_CUTLASS_SRC_DIR})
@@ -278,34 +294,39 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
     # Use the specified CUTLASS source directory for compilation if
     # VLLM_CUTLASS_SRC_DIR  is provided
     FetchContent_Declare(
-        cutlass-sycl
-        GIT_REPOSITORY https://github.com/intel-innersource/libraries.ai.cutlass.internal
-
-        # Please keep this in sync with CUTLASS_REVISION line above.
-        GIT_TAG ${CUTLASS_REVISION}
-        GIT_PROGRESS TRUE
-
-        # Speed up CUTLASS download by retrieving only the specified GIT_TAG instead of   the history.
-        # Important: If GIT_SHALLOW is enabled then GIT_TAG works only with branch names  and tags.
-        # So if the GIT_TAG above is updated to a commit hash, GIT_SHALLOW must be set to   FALSE
-        GIT_SHALLOW FALSE
-    )
+      cutlass-sycl
+      GIT_REPOSITORY
+        https://github.com/intel-innersource/libraries.ai.cutlass.internal
+      # Please keep this in sync with CUTLASS_REVISION line above.
+      GIT_TAG ${CUTLASS_REVISION}
+      GIT_PROGRESS TRUE
+      # Speed up CUTLASS download by retrieving only the specified GIT_TAG
+      # instead of   the history. Important: If GIT_SHALLOW is enabled then
+      # GIT_TAG works only with branch names  and tags. So if the GIT_TAG above
+      # is updated to a commit hash, GIT_SHALLOW must be set to   FALSE
+      GIT_SHALLOW FALSE)
   endif()
 
   # cutlass compilation flags
   set(CUTLASS_ENABLE_SYCL "ON")
-  # TODO: make this a list
-  # TODO: this may be not needed anymore since we will add this in each cmake target
+  # TODO: make this a list TODO: this may be not needed anymore since we will
+  # add this in each cmake target
   if(BUILD_ON_SIMULATOR_CRI)
-    set(DPCPP_SYCL_TARGET "intel_gpu_cri" CACHE STRING "DPC++ SYCL target architectures")
+    set(DPCPP_SYCL_TARGET
+        "intel_gpu_cri"
+        CACHE STRING "DPC++ SYCL target architectures")
     # FIXME: these are sycl-tla internal.
     list(APPEND VLLM_CUTLASS_FLAGS "-DSYCL_INTEL_TARGET=35")
   elseif(BUILD_ON_SIMULATOR_JGS)
-    set(DPCPP_SYCL_TARGET "intel_gpu_jgs" CACHE STRING "DPC++ SYCL target architectures")
+    set(DPCPP_SYCL_TARGET
+        "intel_gpu_jgs"
+        CACHE STRING "DPC++ SYCL target architectures")
     # FIXME: these are sycl-tla internal.
     list(APPEND VLLM_CUTLASS_FLAGS "-DSYCL_INTEL_TARGET=40")
   else()
-    set(DPCPP_SYCL_TARGET "intel_gpu_bmg_g21" CACHE STRING "DPC++ SYCL target architectures")
+    set(DPCPP_SYCL_TARGET
+        "intel_gpu_bmg_g21"
+        CACHE STRING "DPC++ SYCL target architectures")
     # FIXME: these are sycl-tla internal.
     list(APPEND VLLM_CUTLASS_FLAGS "-DSYCL_INTEL_TARGET=20")
   endif()
@@ -381,9 +402,8 @@ if(BUILD_SYCL_TLA_KERNELS)
   if(VLLM_XPU_ENABLE_XE4)
     # FIXME: we disabled xe4 sycl-tla kernel.
     # add_subdirectory(csrc/xpu/grouped_gemm/xe_4)
-    # add_subdirectory(csrc/xpu/attn/xe_4)
-    # list(APPEND GROUPED_GEMM_LIB_NAME "grouped_gemm_xe_4")
-    # list(APPEND ATTN_KERNEL_LIB_NAME "attn_kernels_xe_4")
+    # add_subdirectory(csrc/xpu/attn/xe_4) list(APPEND GROUPED_GEMM_LIB_NAME
+    # "grouped_gemm_xe_4") list(APPEND ATTN_KERNEL_LIB_NAME "attn_kernels_xe_4")
     list(APPEND SYCL_TLA_COMPILE_OPTIONS -DVLLM_XPU_ENABLE_XE4)
   endif()
   list(APPEND VLLM_GPU_COMPILE_FLAGS ${SYCL_TLA_COMPILE_OPTIONS})
