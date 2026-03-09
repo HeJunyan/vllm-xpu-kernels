@@ -105,7 +105,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
   bool is_local = (window_size_left != -1) | (window_size_right != -1);
   bool is_sink = softmax_sink_.has_value();
 
-  if (max_seqlen_q > 1 || is_local || !is_paged || is_fp8kv) {
+  if (max_seqlen_q > 1 || !is_paged || is_fp8kv) {
     at::Tensor seqlens_k = is_paged ? *seqused_k : cu_seqlens_k;
 
     cutlass_chunk_prefill_interface(
@@ -131,18 +131,30 @@ std::vector<at::Tensor> mha_varlen_fwd(
         is_local,
         is_sink);
   } else {
-    constexpr int partition_size = 512;
-    int num_kv_splits = (max_seqlen_k + partition_size - 1) / partition_size;
-    if (num_kv_splits > 20) num_kv_splits = 20;
+    // Normalize -1 (unbounded) to max_seqlen_k for kernel masking logic
+    // In decode phase the window_size_right doesn't have effect
+    int eff_window_left =
+        window_size_left == -1 ? max_seqlen_k : window_size_left;
+    int eff_window_right =
+        window_size_right == -1 ? max_seqlen_k : window_size_right;
+    int effective_seqlen_k =
+        is_local ? std::min(max_seqlen_k, eff_window_left + 1) : max_seqlen_k;
 
     int num_tokens = q.size(0);
     int num_heads_q = q.size(1);
     int head_dim = q.size(2);
     int num_heads_kv = k.size(2);
     int block_size = k.size(1);
-    at::Tensor tmp_out = at::empty(
-        {num_tokens, num_heads_q * num_kv_splits, head_dim},
-        q.options().device(q.device()));
+
+    int num_kv_splits = num_splits.value_or(get_num_splits(
+        queue, batch_size, num_heads_kv, effective_seqlen_k, block_size));
+
+    at::Tensor tmp_out =
+        num_kv_splits == 1
+            ? out
+            : at::empty(
+                  {num_tokens, num_heads_q * num_kv_splits, head_dim},
+                  q.options().device(q.device()));
     at::Tensor max_logits = at::empty(
         {num_tokens, num_heads_q, num_kv_splits},
         q.options().dtype(at::kFloat).device(q.device()));
@@ -173,8 +185,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         max_seqlen_k,
         softmax_scale,
         softmax_sink_,
-        window_size_left,
-        window_size_right,
+        eff_window_left,
+        eff_window_right,
         is_varlen,
         is_paged,
         false,  // is_causal: always false for decode; see comment above
