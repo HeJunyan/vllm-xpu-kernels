@@ -79,7 +79,9 @@ torch::Tensor cutlass_grouped_gemm_interface(
     // Use XE4 cutlass kernel
     return cutlass_grouped_gemm_xe4(
         ptr_A,
+        ptr_A_scale,
         ptr_B,
+        ptr_B_scale,
         ptr_bias,
         ptr_D,
         expert_first_token_offset,

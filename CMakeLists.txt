@@ -91,7 +91,7 @@ if(BUILD_ON_SIMULATOR_JGS)
   set(VLLM_XPU_ENABLE_XE3 OFF)
   set(VLLM_XPU_ENABLE_XE4 ON)
   set(VLLM_XPU_ENABLE_XE_DEFAULT OFF)
-  set(BUILD_SYCL_TLA_KERNELS OFF)
+  set(BUILD_SYCL_TLA_KERNELS ON)
   set(FA2_KERNELS_ENABLED OFF)
   set(MOE_KERNELS_ENABLED ON)
   set(ONEDNN_BRANCH
@@ -263,10 +263,10 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
         "55069a2bfec4c651e0856f83990bb8e0d04e0fb6"
         CACHE STRING "CUTLASS revision to use")
   elseif(BUILD_ON_SIMULATOR_JGS)
-    # update on WW50 by Kunshang, this commit id is latest from master_next
+    # update on WW09.4 by Liangliang, this commit id is latest from master_next
     # branch
     set(CUTLASS_REVISION
-        "cc272f2c9fb142cc929ee1607f4016ccf989ea26"
+        "9f065abb5ce03c5ccdc52aa4757f6a644c234367"
         CACHE STRING "CUTLASS revision to use")
   else()
     # update on WW50 by Kunshang, this commit id same to
@@ -401,9 +401,10 @@ if(BUILD_SYCL_TLA_KERNELS)
   endif()
   if(VLLM_XPU_ENABLE_XE4)
     # FIXME: we disabled xe4 sycl-tla kernel.
-    # add_subdirectory(csrc/xpu/grouped_gemm/xe_4)
-    # add_subdirectory(csrc/xpu/attn/xe_4) list(APPEND GROUPED_GEMM_LIB_NAME
-    # "grouped_gemm_xe_4") list(APPEND ATTN_KERNEL_LIB_NAME "attn_kernels_xe_4")
+    add_subdirectory(csrc/xpu/grouped_gemm/xe_4)
+    # add_subdirectory(csrc/xpu/attn/xe_4)
+    list(APPEND GROUPED_GEMM_LIB_NAME "grouped_gemm_xe_4")
+    # list(APPEND ATTN_KERNEL_LIB_NAME "attn_kernels_xe_4")
     list(APPEND SYCL_TLA_COMPILE_OPTIONS -DVLLM_XPU_ENABLE_XE4)
   endif()
   list(APPEND VLLM_GPU_COMPILE_FLAGS ${SYCL_TLA_COMPILE_OPTIONS})

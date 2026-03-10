@@ -304,6 +304,7 @@ additional_libraries = {
     "grouped_gemm_xe_2": "/csrc/xpu/grouped_gemm/xe_2",
     "attn_kernels_xe_3": "/csrc/xpu/attn/xe_3",
     "grouped_gemm_xe_3": "/csrc/xpu/grouped_gemm/xe_3",
+    "grouped_gemm_xe_4": "/csrc/xpu/grouped_gemm/xe_4",
 }
 
 if _build_custom_ops():

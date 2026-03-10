@@ -1,12 +1,13 @@
 #include <torch/all.h>
 #include "cute/arch/xe4_util.hpp"
 #include "grouped_gemm_xe4.h"
-#include "csrc/xpu/grouped_gemm/xe_default/grouped_gemm_xe_default.h"
-#include "csrc/xpu/grouped_gemm/xe_default/grouped_gemm.hpp"
+#include "csrc/xpu/grouped_gemm/xe_4/grouped_gemm.hpp"
 
 torch::Tensor cutlass_grouped_gemm_xe4(
     torch::Tensor ptr_A,
+    const c10::optional<at::Tensor>& ptr_A_scale,
     torch::Tensor ptr_B,
+    const c10::optional<at::Tensor>& ptr_B_scale,
     const c10::optional<at::Tensor>& ptr_bias,
     torch::Tensor ptr_D,
     torch::Tensor expert_first_token_offset,
@@ -24,7 +25,9 @@ torch::Tensor cutlass_grouped_gemm_xe4(
   }
   return gpu::cutlass_kernel::grouped_gemm_func(
       ptr_A,
+      ptr_A_scale,
       ptr_B,
+      ptr_B_scale,
       ptr_bias_,
       ptr_D,
       expert_first_token_offset,

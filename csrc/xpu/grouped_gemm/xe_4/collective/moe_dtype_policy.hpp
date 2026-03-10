@@ -181,8 +181,8 @@ class moe_fp16_policy : public moe_policy_base {
   using ClusterShape = Shape<_1, _1, _1>;
   using TileShape_MNK = TileShape;  // 128, 128, 128
 
-  using ElementInputA = fp16;  // dtype of A
-  using ElementInputB = fp16;  // dtype of B
+  using ElementA = fp16;       // dtype of A
+  using ElementB = fp16;       // dtype of B
   using ElementOutput = fp16;  // dtype of C/D
 
   static constexpr auto majorA = cute::AMMA::Major::K;
@@ -227,8 +227,8 @@ class moe_fp16_policy : public moe_policy_base {
   using TiledMma = decltype(cute::make_tiled_mma(
       cute::AMMA::ss_op_selector<
           ElementOutput /*D dtype*/,
-          ElementInputA,
-          ElementInputB,
+          ElementA,
+          ElementB,
           ElementOutput /*C dtype*/,
           TileShape_MNK,
           ClusterShape,
@@ -243,8 +243,8 @@ class moe_fp16_policy : public moe_policy_base {
       cutlass::xe4_grouped_gemm::collective::XE4CollectiveMma<
           ProblemShape,
           TileShape,
-          ElementInputA,
-          ElementInputB,
+          ElementA,
+          ElementB,
           cutlass::gemm::TagToStrideA_t<LayoutA*>,
           cutlass::gemm::TagToStrideB_t<LayoutB*>,
           TiledMma,
