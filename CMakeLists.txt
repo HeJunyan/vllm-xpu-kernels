@@ -189,6 +189,22 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   set(SYCL_FIRST_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/csrc/sycl_first.h")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -include ${SYCL_FIRST_HEADER}")
 
+  # AOT devices can be overridden via environment variables:
+  # VLLM_XPU_AOT_DEVICES and VLLM_XPU_XE2_AOT_DEVICES Example: export
+  # VLLM_XPU_AOT_DEVICES="pvc,bmg-g21-a0" export
+  # VLLM_XPU_XE2_AOT_DEVICES="pvc,bmg-g31-a0"
+  set(AOT_DEVICES "pvc,bmg,bmg-g21-a0,bmg-g31-a0")
+  set(XE2_AOT_DEVICES "pvc,bmg,bmg-g21-a0,bmg-g31-a0")
+
+  # Allow overriding via env, including explicitly disabling AOT by setting an
+  # empty env var (e.g. export VLLM_XPU_AOT_DEVICES="").
+  if(DEFINED ENV{VLLM_XPU_AOT_DEVICES})
+    set(AOT_DEVICES $ENV{VLLM_XPU_AOT_DEVICES})
+  endif()
+  if(DEFINED ENV{VLLM_XPU_XE2_AOT_DEVICES})
+    set(XE2_AOT_DEVICES $ENV{VLLM_XPU_XE2_AOT_DEVICES})
+  endif()
+
   # ============= COMPILE OPTIONS ==================
   set(SYCL_FLAGS "")
   set(SYCL_KERNEL_OPTIONS)
@@ -196,18 +212,14 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   list(APPEND SYCL_FLAGS "-fsycl")
 
   set(SYCL_COMPILE_FLAGS ${SYCL_FLAGS})
-
-  if(BUILD_ON_SIMULATOR_CRI)
-    set(SYCL_TARGETS_OPTION -fsycl-targets=intel_gpu_cri)
-  elseif(BUILD_ON_SIMULATOR_JGS)
-    set(SYCL_TARGETS_OPTION -fsycl-targets=intel_gpu_jgs)
-  else()
-    set(SYCL_TARGETS_OPTION -fsycl-targets=spir64_gen)
-  endif()
-  set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} ${SYCL_TARGETS_OPTION})
-  set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} ${SYCL_KERNEL_OPTIONS})
-
   set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} "-O3" "-DNDEBUG")
+  if(BUILD_ON_SIMULATOR_CRI)
+    set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=intel_gpu_cri)
+  elseif(BUILD_ON_SIMULATOR_JGS)
+    set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=intel_gpu_jgs)
+  elseif(AOT_DEVICES)
+    set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=spir64_gen)
+  endif()
   # Final build option be like: icpx -fsycl -fsycl-target=spir64_gen
   # ${SYCL_KERNEL_OPTIONS} -fsycl-host-compiler=gcc
   # -fsycl-host-compiler-options='${CMAKE_HOST_FLAGS}' kernel.cpp -o kernel.o
@@ -218,18 +230,12 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   list(APPEND SYCL_LINK_FLAGS "-fsycl")
 
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_LINK_FLAGS})
-  set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} ${SYCL_TARGETS_OPTION})
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS}
                              -fsycl-max-parallel-link-jobs=16)
   set(SYCL_DEVICE_LINK_FLAGS
       ${SYCL_DEVICE_LINK_FLAGS}
       "-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"
   )
-
-  # TODO: make AOT configurable
-  set(AOT_DEVICES "pvc,bmg-g21-a0") # FIXME: we should cover all device for
-                                    # default build
-  set(XE2_AOT_DEVICES "pvc,bmg-g21-a0")
   set(XE3_AOT_DEVICES "cri-a0")
   set(XE4_AOT_DEVICES "xe4")
   if(BUILD_ON_SIMULATOR_CRI)
@@ -237,6 +243,10 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   endif()
   if(BUILD_ON_SIMULATOR_JGS)
     set(AOT_DEVICES ${XE4_AOT_DEVICES})
+  endif()
+  if(AOT_DEVICES)
+    list(APPEND SYCL_DEVICE_LINK_FLAGS -fsycl-targets=spir64_gen
+         -Xsycl-target-backend=spir64_gen)
   endif()
 
   # Final link option be like: icpx -fsycl -fsycl-target=spir64_gen
