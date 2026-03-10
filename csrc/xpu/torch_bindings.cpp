@@ -93,6 +93,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
 
   xpu_ops.def("is_pvc(int device_index) -> bool");
   xpu_ops.impl("is_pvc", &is_pvc);
+
+  xpu_ops.def("is_cri(int device_index) -> bool");
+  xpu_ops.impl("is_cri", &is_cri);
+
+  xpu_ops.def("is_jgs(int device_index) -> bool");
+  xpu_ops.impl("is_jgs", &is_jgs);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

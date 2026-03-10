@@ -102,3 +102,7 @@ void gdn_attention(
 bool is_bmg(int64_t device_index);
 
 bool is_pvc(int64_t device_index);
+
+bool is_cri(int64_t device_index);
+
+bool is_jgs(int64_t device_index);

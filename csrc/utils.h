@@ -58,6 +58,16 @@ static inline bool is_pvc(at::DeviceIndex device_index = -1) {
          syclex::architecture::intel_gpu_pvc;
 }
 
+static inline bool is_cri(at::DeviceIndex device_index = -1) {
+  return get_device_architecture(device_index) ==
+         syclex::architecture::intel_gpu_cri;
+}
+
+static inline bool is_jgs(at::DeviceIndex device_index = -1) {
+  return get_device_architecture(device_index) ==
+         syclex::architecture::intel_gpu_jgs;
+}
+
 static inline bool is_xe2_arch(at::DeviceIndex device_index = -1) {
   auto arch = get_device_architecture(device_index);
   return arch == syclex::architecture::intel_gpu_bmg_g21 ||

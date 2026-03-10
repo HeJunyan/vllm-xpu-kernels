@@ -4,6 +4,7 @@ import math
 import pytest
 import torch
 
+import vllm_xpu_kernels._xpu_C  # noqa: F401
 from tests.fused_moe.test_grouped_gemm_xe3 import (data_to_mx_scale,
                                                    fp4_e2m1fn_x2_to_float,
                                                    hp_from_1x128,
@@ -12,6 +13,10 @@ from tests.utils import seed_everything
 from vllm_xpu_kernels.fused_moe_interface import (quant_fp8_act,
                                                   quant_mxfp_act,
                                                   xpu_fused_moe)
+
+pytestmark = pytest.mark.skipif(
+    not torch.ops._xpu_C.is_cri(0),
+    reason="XE3 tests only run on CRI.")
 
 DEVICE = "xpu"
 

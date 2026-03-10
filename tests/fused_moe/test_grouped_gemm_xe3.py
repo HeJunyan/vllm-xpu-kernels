@@ -4,8 +4,13 @@ import random
 import pytest
 import torch
 
+import vllm_xpu_kernels._xpu_C  # noqa: F401
 from tests.utils import seed_everything
 from vllm_xpu_kernels.fused_moe_interface import cutlass_grouped_gemm
+
+pytestmark = pytest.mark.skipif(
+    not torch.ops._xpu_C.is_cri(0),
+    reason="XE3 tests only run on CRI.")
 
 DEVICE = "xpu"
 
