@@ -273,5 +273,103 @@ class moe_fp16_policy : public moe_policy_base {
       TileScheduler>;
 };
 
+class moe_bf16_policy : public moe_policy_base {
+ public:
+  using TileShape = Shape<_128, _128, _128>;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using TileShape_MNK = TileShape;  // 128, 128, 128
+
+  using ElementA = bf16;       // dtype of A
+  using ElementB = bf16;       // dtype of B
+  using ElementOutput = float;  // dtype of C/D
+
+  static constexpr auto majorA = cute::AMMA::Major::K;
+  static constexpr auto majorB = cute::AMMA::Major::K;
+
+  static constexpr int PipelineStages = 2;
+
+  using SmemLayoutAtomA =
+      decltype(make_layout(cute::select<0, 2>(TileShape_MNK{}), GenRowMajor{}));
+
+  using SmemLayoutA = decltype(tile_to_shape(
+      SmemLayoutAtomA{},
+      make_shape(
+          shape<0>(TileShape_MNK{}),
+          shape<2>(TileShape_MNK{}),
+          Int<PipelineStages>{})));
+
+  using SmemLayoutAtomB =
+      decltype(make_layout(cute::select<1, 2>(TileShape_MNK{}), GenRowMajor{}));
+
+  using SmemLayoutB = decltype(tile_to_shape(
+      SmemLayoutAtomB{},
+      make_shape(
+          shape<1>(TileShape_MNK{}),
+          shape<2>(TileShape_MNK{}),
+          Int<PipelineStages>{})));
+
+  using SmemLayoutOutput =
+      decltype(make_layout(cute::select<0, 1>(TileShape_MNK{}), GenRowMajor{}));
+
+  // Copy from GMEM to SMEM
+  using TMACopyAtomA = cute::xe4::ASYNC_TENSOR_LOAD<
+      slm_matrix_type::type1,
+      size<2>(TileShape_MNK{}) /*stride=K*/>;
+  using TMACopyAtomB = cute::xe4::ASYNC_TENSOR_LOAD<
+      slm_matrix_type::type1,
+      size<2>(TileShape_MNK{}) /*stride=K*/>;
+  using TMACopyAtomD = cute::xe4::ASYNC_TENSOR_STORE<
+      slm_matrix_type::type1,
+      size<1>(TileShape_MNK{}) /*stride=N*/>;
+
+  using TiledMma = decltype(cute::make_tiled_mma(
+      cute::AMMA::ss_op_selector<
+          ElementOutput /*D dtype*/,
+          ElementA,
+          ElementB,
+          ElementOutput /*C dtype*/,
+          TileShape_MNK,
+          ClusterShape,
+          majorA,
+          majorB>()));
+
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutD = cutlass::layout::RowMajor;
+
+  using CollectiveMainloop =
+      cutlass::xe4_grouped_gemm::collective::XE4CollectiveMma<
+          ProblemShape,
+          TileShape,
+          ElementA,
+          ElementB,
+          cutlass::gemm::TagToStrideA_t<LayoutA*>,
+          cutlass::gemm::TagToStrideB_t<LayoutB*>,
+          TiledMma,
+          SmemLayoutA,
+          SmemLayoutB,
+          SmemLayoutOutput,
+          TMACopyAtomA,
+          TMACopyAtomB>;
+
+  using CollectiveEpilogue =
+      cutlass::xe4_grouped_gemm::collective::XE4CollectiveEpilogue<
+          ProblemShape,
+          TileShape,
+          ElementOutput,
+          cutlass::gemm::TagToStrideC_t<LayoutD*>,
+          SmemLayoutOutput,
+          TMACopyAtomD>;
+
+  using TileScheduler =
+      cutlass::xe4_grouped_gemm::kernel::PersistentTileSchedulerXe4Group;
+
+  using GemmKernel = cutlass::xe4_grouped_gemm::kernel::XE4GemmUniversal<
+      ProblemShape,
+      CollectiveMainloop,
+      CollectiveEpilogue,
+      TileScheduler>;
+};
+
 }  // namespace grouped_gemm
 }  // namespace gpu::cutlass_kernel

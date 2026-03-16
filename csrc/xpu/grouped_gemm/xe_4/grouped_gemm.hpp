@@ -57,11 +57,14 @@ inline at::Tensor grouped_gemm_func(
   if (A_dtype == at::kHalf) {
     using moe_policy = grouped_gemm::moe_fp16_policy;
     CALL_KERNEL_WITH_POLICY(moe_policy);
+  } else if (A_dtype == at::kBFloat16) {
+    using moe_policy = grouped_gemm::moe_bf16_policy;
+    CALL_KERNEL_WITH_POLICY(moe_policy);
   } else {
     TORCH_CHECK(
         false,
-        "grouped_gemm_func only supports FP16"
-        "dtypes, but got: ",
+        "grouped_gemm_func only supports FP16/BF16"
+        " dtypes, but got: ",
         A_dtype);
   }
   return ptr_D;

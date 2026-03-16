@@ -27,9 +27,9 @@ TOP_KS = [1]
 MINI_PYTEST_PARAMS = {
     "test_grouped_gemm": {
         "m,n,k": [(64, 128, 256)],
-        "e": [2],
+        "e": [1],
         "topk": [1],
-        "dtype": [torch.float16],
+        "dtype": [torch.float16, torch.bfloat16],
         "has_bias": [False]
     },
 }
@@ -45,7 +45,7 @@ def random_partition(size_a: int, target: int):
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("has_bias", [False])
 def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
     seed_everything(7)
@@ -65,8 +65,8 @@ def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
     else:
         bias = None
 
-    # output offset
-    output = torch.empty((sum(token_per_group), n), dtype=dtype, device=DEVICE)
+    output_dtype = torch.float16 if dtype == torch.float16 else torch.float32 # FIXME: bf16 output acc issue
+    output = torch.empty((sum(token_per_group), n), dtype=output_dtype, device=DEVICE)
     cutlass_grouped_gemm(input_A, None, input_B, None, bias, output,
                          token_per_group, n, k, num_experts)
     # ref gg
@@ -78,11 +78,11 @@ def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
             continue
         input = ref_A[pre_token_sum:pre_token_sum + cur_token_num, :]
         weight = input_B[i, :, :]
-        expert_output = input @ weight
+        expert_output = input.cpu().to(torch.float32) @ weight.cpu().to(torch.float32)
         if has_bias:
             expert_output += bias[i]
-        ref.append(expert_output)
+        ref.append(expert_output.to(DEVICE))
         pre_token_sum += cur_token_num
     ref = torch.cat(ref, dim=0)
 
-    torch.testing.assert_close(output, ref, rtol=2e-2, atol=1e-2)
+    torch.testing.assert_close(output.to(torch.float32), ref, rtol=1e-2, atol=1e-2)

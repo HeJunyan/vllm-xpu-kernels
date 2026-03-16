@@ -90,6 +90,9 @@ namespace grouped_gemm {
 
 class Xe4GroupGemmKernel;
 
+template <class moe_policy>
+class Xe4GroupGemmKernelTag;
+
 template <typename Gemm, bool NeedScale>
 struct ElementScaleSelector {
   using A = void;
@@ -102,7 +105,7 @@ struct ElementScaleSelector<Gemm, true> {
   using B = typename Gemm::CollectiveMainloop::ElementScaleB;
 };
 
-template <class Gemm, bool NeedScale>
+template <class Gemm, bool NeedScale, class KernelTag = Xe4GroupGemmKernel>
 struct GroupedGemmRunner {
   using ElementA = typename Gemm::ElementA;
   using ElementB = typename Gemm::ElementB;
@@ -188,7 +191,7 @@ struct GroupedGemmRunner {
 
     stream
         .submit([&](sycl::handler& h) {
-          h.parallel_for<Xe4GroupGemmKernel>(
+          h.parallel_for<KernelTag>(
               sycl::nd_range<3>{sycl_grid * sycl_block, sycl_block},
               [=](sycl::nd_item<3> item) { kernel(params); });
         })
@@ -227,7 +230,8 @@ void kernel_functor(
           hw_info.device_id);
 
   using GemmKernel = typename moe_policy::GemmKernel;
-  GroupedGemmRunner<GemmKernel, moe_policy::NeedScale> runner;
+  GroupedGemmRunner<GemmKernel, moe_policy::NeedScale,
+                    Xe4GroupGemmKernelTag<moe_policy>> runner;
 
   runner.run(
       stream,
@@ -260,7 +264,7 @@ void kernel_functor(
       int64_t K,                        \
       int64_t groups);
 
-/* INSTANTIATE_KERNEL(moe_bf16_policy) */
+INSTANTIATE_KERNEL(moe_bf16_policy)
 /* INSTANTIATE_KERNEL(moe_bf16_decode_policy) */
 INSTANTIATE_KERNEL(moe_fp16_policy)
 /* INSTANTIATE_KERNEL(moe_fp16_decode_policy) */
