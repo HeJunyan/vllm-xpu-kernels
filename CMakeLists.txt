@@ -91,8 +91,6 @@ if(BUILD_ON_SIMULATOR_JGS)
   set(VLLM_XPU_ENABLE_XE3 OFF)
   set(VLLM_XPU_ENABLE_XE4 ON)
   set(VLLM_XPU_ENABLE_XE_DEFAULT OFF)
-  set(BUILD_SYCL_TLA_KERNELS ON)
-  set(FA2_KERNELS_ENABLED OFF)
   set(MOE_KERNELS_ENABLED ON)
   set(ONEDNN_BRANCH
       "prv-xe4"
@@ -210,6 +208,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # ============= LINK OPTIONS ==================
   set(SYCL_LINK_FLAGS "")
   list(APPEND SYCL_LINK_FLAGS "-fsycl")
+
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_LINK_FLAGS})
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} ${SYCL_TARGETS_OPTION})
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS}
@@ -224,7 +223,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
                                     # default build
   set(XE2_AOT_DEVICES "pvc,bmg-g21-a0")
   set(XE3_AOT_DEVICES "cri-a0")
-  set(XE4_AOT_DEVICES "jgs-a0")
+  set(XE4_AOT_DEVICES "xe4")
   if(BUILD_ON_SIMULATOR_CRI)
     set(AOT_DEVICES ${XE3_AOT_DEVICES})
   endif()
@@ -263,11 +262,9 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
         "55069a2bfec4c651e0856f83990bb8e0d04e0fb6"
         CACHE STRING "CUTLASS revision to use")
   elseif(BUILD_ON_SIMULATOR_JGS)
-    # update on WW09.4 by Liangliang, this commit id is latest from master_next
-    # branch
-    set(CUTLASS_REVISION
-        "9f065abb5ce03c5ccdc52aa4757f6a644c234367"
-        CACHE STRING "CUTLASS revision to use")
+    # update on WW11 by Yizhou, this commit id is latest from master_next branch
+    # TODO: switch to a release tag/version in future
+    set(CUTLASS_REVISION "ed1502f86b8baa7a84275c85597d06ecf5254d84" CACHE STRING "CUTLASS revision to use")
   else()
     # update on WW50 by Kunshang, this commit id same to
     # vllm-project/vllm-xpu-kernels
@@ -323,6 +320,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
         CACHE STRING "DPC++ SYCL target architectures")
     # FIXME: these are sycl-tla internal.
     list(APPEND VLLM_CUTLASS_FLAGS "-DSYCL_INTEL_TARGET=40")
+    list(APPEND VLLM_CUTLASS_FLAGS "-DSYCL_INTEL_XE4_TARGET")
   else()
     set(DPCPP_SYCL_TARGET
         "intel_gpu_bmg_g21"
@@ -368,8 +366,7 @@ set(GDN_ATTN_LIB_NAME "")
 if(BUILD_SYCL_TLA_KERNELS)
 
   set(SYCL_TLA_INCLUDE_DIRS
-      ${CUTLASS_INCLUDE_DIR} ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
-      ${CUTLASS_APP_INCLUDE_DIR})
+      ${CUTLASS_INCLUDE_DIR} ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR})
 
   set(SYCL_TLA_KERNELS_COMPILE_FLAGS ${VLLM_GPU_COMPILE_FLAGS})
   list(APPEND SYCL_TLA_KERNELS_COMPILE_FLAGS ${VLLM_CUTLASS_FLAGS})
@@ -401,10 +398,10 @@ if(BUILD_SYCL_TLA_KERNELS)
   endif()
   if(VLLM_XPU_ENABLE_XE4)
     # FIXME: we disabled xe4 sycl-tla kernel.
+    add_subdirectory(csrc/xpu/attn/xe_4)
     add_subdirectory(csrc/xpu/grouped_gemm/xe_4)
-    # add_subdirectory(csrc/xpu/attn/xe_4)
+    list(APPEND ATTN_KERNEL_LIB_NAME "attn_kernels_xe_4")
     list(APPEND GROUPED_GEMM_LIB_NAME "grouped_gemm_xe_4")
-    # list(APPEND ATTN_KERNEL_LIB_NAME "attn_kernels_xe_4")
     list(APPEND SYCL_TLA_COMPILE_OPTIONS -DVLLM_XPU_ENABLE_XE4)
   endif()
   list(APPEND VLLM_GPU_COMPILE_FLAGS ${SYCL_TLA_COMPILE_OPTIONS})

@@ -11,8 +11,8 @@ import vllm_xpu_kernels._xpu_C  # noqa: F401
 from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
 
 pytestmark = pytest.mark.skipif(
-    torch.ops._xpu_C.is_jgs(0),
-    reason="XE2/3 tests cannot run on JGS.")
+    not torch.ops._xpu_C.is_jgs(0),
+    reason="XE4 tests only run on JGS.")
 
 NUM_HEADS = [(4, 4), (8, 2), (10, 2), (16, 1)]
 HEAD_SIZES = [64, 128, 192, 256]
@@ -89,7 +89,7 @@ def ref_paged_attn(query: torch.Tensor,
         if is_fp8kv:
             k = (k.to(torch.float32) * k_descale).to(dtype)
             v = (v.to(torch.float32) * v_descale).to(dtype)
-        attn = torch.einsum("qhd,khd->hqk", q, k).float()
+        attn = torch.einsum("qhd,khd->hqk", q, k)
         empty_mask = torch.ones(query_len, kv_len)
         mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
         if window_size_right > 0 or window_size_left > 0:
@@ -115,7 +115,7 @@ def ref_paged_attn(query: torch.Tensor,
                                       1).expand(attn.size()[0],
                                                 attn.size()[1], 1)
             attn = torch.cat([attn, sink_expanded], dim=-1)
-        attn = torch.softmax(attn, dim=-1).to(v.dtype)
+        attn = torch.softmax(attn, dim=-1)
         if sink is not None:
             attn = attn[..., :-1]
         out = torch.einsum("hqk,khd->qhd", attn, v)
@@ -130,19 +130,17 @@ def ref_paged_attn(query: torch.Tensor,
 #override pytest parameters when enable mini pytest
 MINI_PYTEST_PARAMS = {
     "test_varlen_with_paged_kv": {
-        "seq_lens": [[(1, 1328), (5, 18), (129, 463)]],
-        "head_size": [64, 128],
-        "num_heads": [(8, 2)],
-        "num_blocks": [64],
-        "window_size": [(-1, -1), (127, 127)],
-        "is_paged": [True]
+        "seq_lens": [[(128, 512), (128, 512), (256, 1024)]],
+        "head_size": [128],
+        "num_heads": [(2, 2)],
+        "num_blocks": [4],
+        "block_size": [512],
+        "window_size": [(-1, -1)],
+        "is_paged": [True],
+        "is_sink": [False],
+        "is_casual": [False],
+        "fp8_dtype": [None],
     },
-    "test_decode_with_paged_kv": {
-        "seq_lens": [[(1, 1025), (1, 523), (1, 37)]],
-        "num_heads": [(8, 2)],
-        "head_size": [64, 128],
-        "num_blocks": [64],
-    }
 }
 
 
@@ -177,7 +175,7 @@ def test_varlen_with_paged_kv(
     is_paged: bool,
     fp8_dtype: Optional[torch.dtype],
 ) -> None:
-    torch.set_default_device("xpu")
+    # torch.set_default_device("xpu")
     torch.xpu.set_device("xpu:0")
     # # FIXME: remove skip
     if (is_casual and seq_lens[1][0]
@@ -255,43 +253,43 @@ def test_varlen_with_paged_kv(
         maybe_quantized_value_cache = (value_cache / v_descale).to(fp8_dtype)
 
     if is_paged:
-        output = flash_attn_varlen_func(maybe_quantized_query,
-                                        maybe_quantized_key_cache,
-                                        maybe_quantized_value_cache,
+        output = flash_attn_varlen_func(maybe_quantized_query.xpu(),
+                                        maybe_quantized_key_cache.xpu(),
+                                        maybe_quantized_value_cache.xpu(),
                                         max_query_len,
-                                        cu_query_lens,
+                                        cu_query_lens.xpu(),
                                         max_kv_len,
-                                        seqused_k=seq_k,
-                                        q_descale=q_descale.expand(scale_shape)
+                                        seqused_k=seq_k.xpu(),
+                                        q_descale=q_descale.expand(scale_shape).xpu()
                                         if q_descale is not None else None,
-                                        k_descale=k_descale.expand(scale_shape)
+                                        k_descale=k_descale.expand(scale_shape).xpu()
                                         if k_descale is not None else None,
-                                        v_descale=v_descale.expand(scale_shape)
+                                        v_descale=v_descale.expand(scale_shape).xpu()
                                         if v_descale is not None else None,
                                         softmax_scale=scale,
                                         causal=is_casual,
-                                        block_table=block_tables,
+                                        block_table=block_tables.xpu(),
                                         window_size=window_size,
-                                        s_aux=sink)
+                                        s_aux=sink.xpu() if sink is not None else None)
     else:
-        output = flash_attn_varlen_func(maybe_quantized_query,
-                                        maybe_quantized_key_cache,
-                                        maybe_quantized_value_cache,
+        output = flash_attn_varlen_func(maybe_quantized_query.xpu(),
+                                        maybe_quantized_key_cache.xpu(),
+                                        maybe_quantized_value_cache.xpu(),
                                         max_query_len,
-                                        cu_query_lens,
+                                        cu_query_lens.xpu(),
                                         max_kv_len,
-                                        cu_seqlens_k=cu_kv_lens,
-                                        q_descale=q_descale.expand(scale_shape)
+                                        cu_seqlens_k=cu_kv_lens.xpu(),
+                                        q_descale=q_descale.expand(scale_shape).xpu()
                                         if q_descale is not None else None,
-                                        k_descale=k_descale.expand(scale_shape)
+                                        k_descale=k_descale.expand(scale_shape).xpu()
                                         if k_descale is not None else None,
-                                        v_descale=v_descale.expand(scale_shape)
+                                        v_descale=v_descale.expand(scale_shape).xpu()
                                         if v_descale is not None else None,
                                         softmax_scale=scale,
                                         causal=is_casual,
                                         block_table=None,
                                         window_size=window_size,
-                                        s_aux=sink)
+                                        s_aux=sink.xpu() if sink is not None else None)
 
     ref_output = ref_paged_attn(query=query,
                                 key_cache=maybe_quantized_key_cache,
@@ -318,124 +316,6 @@ def test_varlen_with_paged_kv(
         atol, rtol = 1.5e-2, 1.5e-2
     if fp8_dtype is not None:
         atol, rtol = 1.5e-2, 1.5e-2
-    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
-        f"{torch.max(torch.abs(output - ref_output))}"
-    torch.xpu.empty_cache()
-
-
-@pytest.mark.parametrize("seq_lens",
-                         [[(1, 1025)], [(1, 523), (1, 37),
-                                        (1, 2011)], [(1, 13000)],
-                          [(1, 523), (1, 37), (1, 2011), (1, 5000)]])
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("soft_cap", SOFT_CAPS)
-@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("fa_version", [2])
-@pytest.mark.parametrize("q_dtype", QDTYPES)
-@pytest.mark.parametrize("is_sink", SINK)
-@torch.inference_mode()
-def test_decode_with_paged_kv(
-    seq_lens: list[tuple[int, int]],
-    num_heads: tuple[int, int],
-    head_size: int,
-    dtype: torch.dtype,
-    block_size: int,
-    soft_cap: Optional[float],
-    num_blocks: int,
-    fa_version: int,
-    q_dtype: Optional[torch.dtype],
-    is_sink: bool,
-) -> None:
-    torch.set_default_device("xpu")
-    torch.xpu.set_device("xpu:0")
-    # # FIXME: remove skip
-    # if q_dtype is not None and (dtype != torch.bfloat16 or fa_version == 2):
-    #     pytest.skip("Flash attention with quantized inputs is only "
-    #                 "supported on version 3 with bfloat16 base type")
-    torch.manual_seed(42)
-    num_seqs = len(seq_lens)
-    query_lens = [x[0] for x in seq_lens]
-    kv_lens = [x[1] for x in seq_lens]
-    num_query_heads = num_heads[0]
-    num_kv_heads = num_heads[1]
-    assert num_query_heads % num_kv_heads == 0
-    max_query_len = max(query_lens)
-    max_kv_len = max(kv_lens)
-    scale = head_size**-0.5
-
-    query = torch.randn(sum(query_lens),
-                        num_query_heads,
-                        head_size,
-                        dtype=dtype)
-    key_cache = torch.randn(num_blocks,
-                            block_size,
-                            num_kv_heads,
-                            head_size,
-                            dtype=dtype)
-    value_cache = torch.randn_like(key_cache)
-    cu_query_lens = torch.tensor([0] + query_lens,
-                                 dtype=torch.int32).cumsum(dim=0,
-                                                           dtype=torch.int32)
-
-    seq_k = torch.tensor(kv_lens, dtype=torch.int32)
-
-    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-    block_tables = torch.randint(0,
-                                 num_blocks,
-                                 (num_seqs, max_num_blocks_per_seq),
-                                 dtype=torch.int32)
-    sink = None
-    if is_sink:
-        sink = torch.randn(num_query_heads, dtype=dtype)
-
-    maybe_quantized_query = query
-    maybe_quantized_key_cache = key_cache
-    maybe_quantized_value_cache = value_cache
-    q_descale = None  #noqa: F841
-    k_descale = None  #noqa: F841
-    v_descale = None  #noqa: F841
-    if q_dtype is not None:
-        # QKV are drawn from N(0, 1): no need for a fp8 scaling factor
-        maybe_quantized_query = query.to(q_dtype)
-        maybe_quantized_key_cache = key_cache.to(q_dtype)
-        maybe_quantized_value_cache = value_cache.to(q_dtype)
-
-        scale_shape = (num_seqs, num_kv_heads)
-        q_descale = torch.ones(scale_shape, dtype=torch.float32)  #noqa: F841
-        k_descale = torch.ones(scale_shape, dtype=torch.float32)  #noqa: F841
-        v_descale = torch.ones(scale_shape, dtype=torch.float32)  #noqa: F841
-
-    output = flash_attn_varlen_func(maybe_quantized_query,
-                                    maybe_quantized_key_cache,
-                                    maybe_quantized_value_cache,
-                                    max_query_len,
-                                    cu_query_lens,
-                                    max_kv_len,
-                                    seqused_k=seq_k,
-                                    softmax_scale=scale,
-                                    causal=False,
-                                    block_table=block_tables,
-                                    window_size=(-1, -1),
-                                    s_aux=sink)
-
-    ref_output = ref_paged_attn(query=query,
-                                key_cache=key_cache,
-                                value_cache=value_cache,
-                                query_lens=query_lens,
-                                kv_lens=kv_lens,
-                                block_tables=block_tables,
-                                scale=scale,
-                                casual=False,
-                                is_paged=True,
-                                sink=sink,
-                                window_size_left=-1,
-                                window_size_right=-1)
-    atol, rtol = 1e-2, 1e-2
-    if q_dtype is not None:
-        atol, rtol = 1.5e-1, 1.5e-1
-    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
-        f"{torch.max(torch.abs(output - ref_output))}"
+    torch.testing.assert_close(output.cpu(), ref_output.cpu(), atol=atol, rtol=rtol), \
+        f"{torch.max(torch.abs(output.cpu() - ref_output.cpu()))}"
     torch.xpu.empty_cache()

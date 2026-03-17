@@ -1,7 +1,6 @@
 #include "cute/arch/xe4_util.hpp"
 #include "fmha_xe4.h"
-#include "csrc/xpu/attn/xe_2/fmha_xe2.h"
-#include "csrc/xpu/attn/xe_2/fmha_xe2.hpp"
+#include "csrc/xpu/attn/xe_4/fmha_impl.hpp"
 
 void cutlass_chunk_prefill_xe4(
     sycl::queue& queue,
@@ -24,9 +23,7 @@ void cutlass_chunk_prefill_xe4(
     bool is_local,
     bool is_sink) {
   // FIXME
-  TORCH_CHECK_FALSE(
-      true, "XE4 sycl-tla chunk prefill kernel is not implemented yet.");
-  cutlass_chunk_prefill_impl(
+  fmha_xe4_impl(
       queue,
       query,
       key_cache,

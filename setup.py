@@ -304,13 +304,13 @@ additional_libraries = {
     "grouped_gemm_xe_2": "/csrc/xpu/grouped_gemm/xe_2",
     "attn_kernels_xe_3": "/csrc/xpu/attn/xe_3",
     "grouped_gemm_xe_3": "/csrc/xpu/grouped_gemm/xe_3",
+    "attn_kernels_xe_4": "/csrc/xpu/attn/xe_4",
     "grouped_gemm_xe_4": "/csrc/xpu/grouped_gemm/xe_4",
 }
 
 if _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._C"))
-    if not envs.BUILD_ON_SIMULATOR_JGS:
-        ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._vllm_fa2_C"))
+    ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._vllm_fa2_C"))
     ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._moe_C"))
     ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._xpu_C"))
 

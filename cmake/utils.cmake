@@ -736,7 +736,7 @@ function(add_xe4_kernel_library LIBRARY_NAME)
   set(XE4_GPU_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
   list(
     APPEND XE4_GPU_LINK_FLAGS -Xsycl-target-backend=spir64_gen
-    "-device ${XE4_AOT_DEVICES} -internal_options -cl-intel-256-GRF-per-thread")
+    "-device ${XE4_AOT_DEVICES} -options -ze-intel-xe-features=+set-abarrier-arrive-lmc,+disable-misched,+total-grf-num-96,+null-dst")
   target_link_options(${LIBRARY_NAME} PRIVATE ${XE4_GPU_LINK_FLAGS})
 endfunction()
 

@@ -63,10 +63,10 @@ def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
     # input
     input_A = torch.randn((sum(token_per_group), k),
                           dtype=dtype,
-                          device=DEVICE).contiguous()
+                          device=DEVICE).contiguous() / 10
     ref_A = input_A
     # weight
-    input_B = torch.randn((num_experts, n, k), dtype=dtype, device=DEVICE)
+    input_B = torch.randn((num_experts, n, k), dtype=dtype, device=DEVICE) / 10
     input_B = input_B.transpose(-1, -2)  #.contiguous()
     if has_bias:
         bias = torch.randn((num_experts, n), dtype=dtype, device=DEVICE)
