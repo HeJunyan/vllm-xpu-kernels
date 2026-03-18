@@ -24,24 +24,37 @@ FUSED_MOE_MNK_FACTORS = [
 NUM_EXPERTS = [16]
 TOP_KS = [1]
 
+MINI_MNK_SHAPES = [
+    (16, 128, 128),
+    (16, 128, 256),
+    (16, 256, 128),
+    (16, 256, 256),
+    (32, 128, 128),
+    (32, 128, 256),
+    (32, 256, 256),
+    (64, 128, 128),
+    (64, 256, 128),
+    (64, 256, 256),
+]
+
 MINI_PYTEST_PARAMS = {
     "test_grouped_gemm": {
-        "m,n,k": [(1, 256, 128)],
-        "e": [2],
+        "m,n,k": MINI_MNK_SHAPES,
+        "e": [1, 2],
         "topk": [1],
         "dtype": [torch.bfloat16],
         "has_bias": [True]
     },
     "test_grouped_gemm_mxfp": {
-        "m,n,k": [(256, 128, 128)],
-        "e": [2],
+        "m,n,k": MINI_MNK_SHAPES,
+        "e": [1, 2],
         "topk": [1],
         "recipe": ["mxfp8", "mxfp4"],
         "has_bias": [True]
     },
     "test_grouped_gemm_fp8block": {
-        "m,n,k": [(256, 128, 128)],
-        "e": [2],
+        "m,n,k": MINI_MNK_SHAPES,
+        "e": [1, 2],
         "topk": [1],
         "recipe": ["128x128"],
         "has_bias": [True]
