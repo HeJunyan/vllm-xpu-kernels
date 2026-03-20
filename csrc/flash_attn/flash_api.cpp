@@ -7,6 +7,54 @@
 
 namespace FLASH_NAMESPACE {
 
+inline int get_num_splits(
+    const sycl::queue& queue,
+    const int& batch_size,
+    const int& num_heads_kv,
+    const int& max_seqlen_k,
+    const int& block_size) {
+  auto device = queue.get_device();
+  int num_xe_cores =
+      device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
+      device
+          .get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
+
+  int cur_parallel = batch_size * num_heads_kv;
+  int kv_blocks = (max_seqlen_k + block_size - 1) / block_size;
+
+  // Below 128 KV blocks the per-split FMHA compute is too small relative
+  // to the ReduceSplitK overhead, regardless of block size.
+  if (kv_blocks < 128) return 1;
+
+  int target_splits;
+  if (cur_parallel < num_xe_cores) {
+    // Under-utilized: fill GPU cores.
+    // Scale by block_size since larger blocks mean more compute per WG.
+    int eff_parallel = cur_parallel * block_size / 64;
+    eff_parallel = std::max(1, eff_parallel);
+    target_splits = (num_xe_cores + eff_parallel - 1) / eff_parallel;
+  } else if (cur_parallel <= num_xe_cores * 2) {
+    // Well-utilized zone (1x-2x oversubscription):
+    // GPU is busy, splitting adds overhead without benefit.
+    return 1;
+  } else {
+    // Heavily oversubscribed (>2x): shorter WGs help.
+    // But gate out when compute is already saturated.
+    int eff_parallel = cur_parallel * block_size / 64;
+    if (eff_parallel >= num_xe_cores * 8) return 1;
+    target_splits = std::max(1, kv_blocks / 64);
+    int par_cap = std::max(1, num_xe_cores * 8 / cur_parallel);
+    target_splits = std::min(target_splits, par_cap);
+  }
+
+  // Each split must process at least 32 KV blocks.
+  int max_splits_blocks = std::max(1, kv_blocks / 32);
+  // Hard cap: more splits give diminishing returns and increase
+  // ReduceSplitK overhead and temporary buffer memory.
+  int num_splits = std::min({target_splits, max_splits_blocks, 8});
+  return std::max(1, num_splits);
+}
+
 std::vector<at::Tensor> mha_varlen_fwd(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -152,10 +200,11 @@ std::vector<at::Tensor> mha_varlen_fwd(
             : at::empty(
                   {num_tokens, num_heads_q * num_kv_splits, head_dim},
                   q.options().device(q.device()));
-    at::Tensor max_logits = at::empty(
+    at::Tensor max_logits = at::full(
         {num_tokens, num_heads_q, num_kv_splits},
+        -std::numeric_limits<float>::infinity(),
         q.options().dtype(at::kFloat).device(q.device()));
-    at::Tensor exp_sums = at::empty(
+    at::Tensor exp_sums = at::zeros(
         {num_tokens, num_heads_q, num_kv_splits},
         q.options().dtype(at::kFloat).device(q.device()));
 
