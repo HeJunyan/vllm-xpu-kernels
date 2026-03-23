@@ -5,8 +5,9 @@ import torch
 
 import vllm_xpu_kernels._xpu_C  # noqa: F401
 from tests.ops.fp8_quant_op import scaled_fp8_quant
-from tests.utils import seed_everything
-from vllm_xpu_kernels.fused_moe_interface import cutlass_grouped_gemm_xe2
+from tests.utils import format_tc, seed_everything
+from vllm_xpu_kernels.fused_moe_interface import (cutlass_grouped_gemm,
+                                                  cutlass_grouped_gemm_xe2)
 
 pytestmark = pytest.mark.skipif(
     not torch.ops._xpu_C.is_bmg(0) and not torch.ops._xpu_C.is_pvc(0),
@@ -35,6 +36,52 @@ MINI_PYTEST_PARAMS = {
 }
 
 
+@pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
+@pytest.mark.parametrize("e", NUM_EXPERTS)
+@pytest.mark.parametrize("topk", TOP_KS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16],
+                         ids=format_tc)
+@pytest.mark.parametrize("has_bias", [True, False])
+def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
+    seed_everything(7)
+    num_experts = e
+    token_per_group = random_partition(e, m * topk)
+    assert (len(token_per_group) == e)
+    # input
+    input_A = torch.randn((sum(token_per_group), k),
+                          dtype=dtype,
+                          device=DEVICE).contiguous()
+    ref_A = input_A
+    # weight
+    input_B = torch.randn((num_experts, n, k), dtype=dtype, device=DEVICE)
+    input_B = input_B.transpose(-1, -2).contiguous()
+    if has_bias:
+        bias = torch.randn((num_experts, n), dtype=dtype, device=DEVICE)
+    else:
+        bias = None
+
+    # output offset
+    output = torch.empty((sum(token_per_group), n), dtype=dtype, device=DEVICE)
+    cutlass_grouped_gemm(input_A, input_B, bias, output, token_per_group, n, k,
+                         num_experts)
+    # ref gg
+    ref = []
+    pre_token_sum = 0
+    for i in range(num_experts):
+        cur_token_num = token_per_group[i]
+        if cur_token_num == 0:
+            continue
+        input = ref_A[pre_token_sum:pre_token_sum + cur_token_num, :]
+        weight = input_B[i, :, :]
+        expert_output = input @ weight
+        if has_bias:
+            expert_output += bias[i]
+        ref.append(expert_output)
+        pre_token_sum += cur_token_num
+    ref = torch.cat(ref, dim=0)
+
+    torch.testing.assert_close(output, ref, rtol=2e-2, atol=1e-2)
+
 def init_rows_for_experts(tokens, topk, num_rows_per_expert):
     if num_rows_per_expert.shape[0] == 1:
         num_rows_per_expert[0] = tokens * topk
@@ -49,7 +96,8 @@ def init_rows_for_experts(tokens, topk, num_rows_per_expert):
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16],
+                         ids=format_tc)
 @pytest.mark.parametrize("has_bias", [True, False])
 def test_xe_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
     seed_everything(7)
@@ -100,8 +148,10 @@ def test_xe_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("fp8_dtype", [torch.float8_e5m2, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16],
+                         ids=format_tc)
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e5m2, torch.float8_e4m3fn],
+                         ids=format_tc)
 @pytest.mark.parametrize("has_bias", [False, True])
 def test_xe_grouped_gemm_fp8(m, n, k, e, topk, dtype, fp8_dtype, has_bias):
     seed_everything(7)
@@ -214,7 +264,8 @@ def implement_zp(qweight, zp=None):
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16],
+                         ids=format_tc)
 @pytest.mark.parametrize("has_bias", [False, True])
 def test_xe_grouped_gemm_int4(m, n, k, e, topk, dtype, has_bias):
     seed_everything(7)
@@ -325,7 +376,8 @@ def dequantize_mxfp4(qweight, scales, group_size, dtype):
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16],
+                         ids=format_tc)
 @pytest.mark.parametrize("has_bias", [False, True])
 def test_xe_grouped_gemm_mxfp4(m, n, k, e, topk, dtype, has_bias):
     seed_everything(7)
