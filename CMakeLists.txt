@@ -272,7 +272,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
       CACHE BOOL "Enable only the header library")
 
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
-  # when building.、
+  # when building.
   if(BUILD_ON_SIMULATOR_CRI)
     # update on WW12 for CRI, this commit id is latest from v0.1.0_next branch
     set(CUTLASS_REVISION
@@ -283,10 +283,8 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
     # TODO: switch to a release tag/version in future
     set(CUTLASS_REVISION "ed1502f86b8baa7a84275c85597d06ecf5254d84" CACHE STRING "CUTLASS revision to use")
   else()
-    # update on WW50 by Kunshang, this commit id same to
-    # vllm-project/vllm-xpu-kernels
     set(CUTLASS_REVISION
-        "3f2a337e885db0fb97b2a6ba514eb7a2a734ac4a"
+        "cd763790ad2f74d7294435ecf77682bac0062c3a"
         CACHE STRING "CUTLASS revision to use")
   endif()
 
