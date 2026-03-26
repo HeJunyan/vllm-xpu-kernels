@@ -247,7 +247,7 @@ def xpu_fused_moe(hidden_states,
     scale_dtype = None
     block_k = 1
     if output is None:
-        output = torch.empty_like(hidden_states)
+        output = torch.zeros_like(hidden_states)
     else:
         assert output.shape == hidden_states.shape, \
             "output shape must be the same as hidden_states shape"
@@ -390,7 +390,7 @@ def xpu_fused_moe(hidden_states,
         permuted_act_scales_size].view(
             scale_dtype) if input_scales is not None else None
 
-    gemm1_output = torch.empty((num_moe_inputs, 2 * inter_size),
+    gemm1_output = torch.zeros((num_moe_inputs, 2 * inter_size),
                                dtype=torch.float32,
                                device=hidden_states.device)
     if data_dtype in [torch.float16, torch.bfloat16]:
@@ -419,7 +419,7 @@ def xpu_fused_moe(hidden_states,
         is_B_mxfp4=is_mxfp4)
 
     # act
-    act_output = torch.empty((num_moe_inputs, inter_size),
+    act_output = torch.zeros((num_moe_inputs, inter_size),
                              dtype=gemm1_output.dtype,
                              device=gemm1_output.device)
     if activation == "silu":
@@ -434,7 +434,7 @@ def xpu_fused_moe(hidden_states,
     ########### gemm2 ##################
     input_A = act_output.contiguous()
     input_B = w2
-    gemm2_output = torch.empty((num_moe_inputs, ori_hidden_size),
+    gemm2_output = torch.zeros((num_moe_inputs, ori_hidden_size),
                                dtype=gemm1_output.dtype,
                                device=gemm1_output.device)
 

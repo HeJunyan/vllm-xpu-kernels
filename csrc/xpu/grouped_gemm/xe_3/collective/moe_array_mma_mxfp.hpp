@@ -39,7 +39,7 @@
 #include "cute/algorithm/functional.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/algorithm/gemm.hpp"
-#include "cutlass/gemm/collective/xe_blockscaled_mma.hpp"
+#include "cutlass/gemm/collective/xe_mma_blockscaled_mxfp.hpp"
 /////////////////////////////////////////////////////////////////////////////////////////////////
 namespace cutlass::gemm {
 
@@ -168,7 +168,7 @@ struct CollectiveMma<
   using MainloopTensors =
       cute::tuple<TensorMKL, TensorNKL, TensorScaleA, TensorScaleB>;
 
-  static constexpr auto GROUP_K = Base::GROUP_K;
+  static constexpr auto GROUP_K = Base::GroupK;
 
   // Host side kernel arguments
   struct Arguments {
@@ -234,8 +234,7 @@ struct CollectiveMma<
           ptr_SFA_curr_batch,
           dSA,
           ptr_SFB_curr_batch,
-          dSB,
-          GROUP_K};
+          dSB};
     } else if (cute::is_same_v<ElementA, cutlass::float_e2m1_t>) {
       ElementA const* ptr_A_curr_batch =
           static_cast<ElementA const*>(mainloop_params.ptr_A) +
@@ -266,8 +265,7 @@ struct CollectiveMma<
           ptr_SFA_curr_batch,
           dSA,
           ptr_SFB_curr_batch,
-          dSB,
-          GROUP_K};
+          dSB};
     }
   }
 

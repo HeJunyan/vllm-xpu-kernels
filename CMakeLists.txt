@@ -195,7 +195,13 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   set(SYCL_COMPILE_FLAGS ${SYCL_FLAGS})
 
-  set(SYCL_TARGETS_OPTION -fsycl-targets=spir64_gen)
+  if(BUILD_ON_SIMULATOR_CRI)
+    set(SYCL_TARGETS_OPTION -fsycl-targets=intel_gpu_cri)
+  elseif(BUILD_ON_SIMULATOR_JGS)
+    set(SYCL_TARGETS_OPTION -fsycl-targets=intel_gpu_jgs)
+  else()
+    set(SYCL_TARGETS_OPTION -fsycl-targets=spir64_gen)
+  endif()
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} ${SYCL_TARGETS_OPTION})
   set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} ${SYCL_KERNEL_OPTIONS})
 
@@ -236,8 +242,9 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # '${SYCL_OFFLINE_COMPILER_FLAGS}' kernel.o -o device-code.o
   set(FINAL_LINK_OPTIONS "")
   list(APPEND FINAL_LINK_OPTIONS ${SYCL_DEVICE_LINK_FLAGS})
-  list(APPEND FINAL_LINK_OPTIONS -Xsycl-target-backend=spir64_gen
-       "-device ${AOT_DEVICES} -internal_options -cl-intel-256-GRF-per-thread")
+  if(AOT_DEVICES)
+    list(APPEND FINAL_LINK_OPTIONS "-device ${AOT_DEVICES}")
+  endif()
 
   set(VLLM_GPU_LINK_FLAGS ${FINAL_LINK_OPTIONS})
 
@@ -256,10 +263,9 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
   # when building.、
   if(BUILD_ON_SIMULATOR_CRI)
-    # update on ww51.1 by Liangliang, this commit id is latest from v0.1.0_next
-    # branch
+    # update on WW12 for CRI, this commit id is latest from v0.1.0_next branch
     set(CUTLASS_REVISION
-        "55069a2bfec4c651e0856f83990bb8e0d04e0fb6"
+        "41d3a5eeee5a699c78e465fb0b57a463ebedc6b4"
         CACHE STRING "CUTLASS revision to use")
   elseif(BUILD_ON_SIMULATOR_JGS)
     # update on WW11 by Yizhou, this commit id is latest from master_next branch

@@ -39,17 +39,23 @@
 #include "cute/algorithm/functional.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/algorithm/gemm.hpp"
-#include "xe_blockfp8_mma.hpp"
+#include "cutlass/gemm/collective/xe_mma_blockscaled_fp8.hpp"
 /////////////////////////////////////////////////////////////////////////////////////////////////
 namespace cutlass::gemm {
 
-template <int Stages_, class KernelSchedule = KernelMoEArrayCooperative>
+template <
+    int Stages_,
+    int GroupN_ = 128,
+    int GroupK_ = 128,
+    class KernelSchedule = KernelMoEArrayCooperative>
 struct MainloopFP8BlockGroup {
   constexpr static int Stages = Stages_;
   constexpr static int SubgroupSize = 16;
   using ArchTag = arch::IntelXe;
   using Schedule = KernelSchedule;
   using ClusterShape = Shape<_1, _1, _1>;
+  static constexpr int GroupN = GroupN_;
+  static constexpr int GroupK = GroupK_;
 };
 
 }  // namespace cutlass::gemm
@@ -60,6 +66,8 @@ namespace cutlass::gemm::collective {
 
 template <
     int Stages,
+    int GroupN,
+    int GroupK,
     class Schedule,
     class TileShape_,
     class ElementPairA_,
@@ -76,7 +84,7 @@ template <
     class SmemCopyAtomB_,
     class TransformB_>
 struct CollectiveMma<
-    MainloopFP8BlockGroup<Stages, Schedule>,
+    MainloopFP8BlockGroup<Stages, GroupN, GroupK, Schedule>,
     TileShape_,
     ElementPairA_,
     StridePairA_,
@@ -92,7 +100,9 @@ struct CollectiveMma<
     SmemCopyAtomB_,
     TransformB_>
     : public CollectiveMma<
-          MainloopIntelXeXMX16BlockFp8<Stages>,
+          MainloopIntelXeXMX16BlockScaledImpl<
+              Stages,
+              cute::tuple<cute::Int<1>, cute::Int<GroupN>, cute::Int<GroupK>>>,
           TileShape_,
           ElementPairA_,
           StridePairA_,
@@ -111,9 +121,12 @@ struct CollectiveMma<
   //
   // Type Aliases
   //
-  using DispatchPolicy = MainloopFP8BlockGroup<Stages, Schedule>;
+  using DispatchPolicy =
+      MainloopFP8BlockGroup<Stages, GroupN, GroupK, Schedule>;
   using Base = CollectiveMma<
-      MainloopIntelXeXMX16BlockFp8<Stages>,
+      MainloopIntelXeXMX16BlockScaledImpl<
+          Stages,
+          cute::tuple<cute::Int<1>, cute::Int<GroupN>, cute::Int<GroupK>>>,
       TileShape_,
       ElementPairA_,
       StridePairA_,
@@ -143,32 +156,12 @@ struct CollectiveMma<
   using ElementScaleB = typename Base::ElementScaleB;
   using InternalStrideScaleA = typename Base::StrideScaleA;
   using InternalStrideScaleB = typename Base::StrideScaleB;
-  using ElementSF = typename Base::ElementSF;
 
   using StrideScaleA = remove_cvref_t<decltype(get<1>(StridePairA_{}))>;
   using StrideScaleB = remove_cvref_t<decltype(get<1>(StridePairB_{}))>;
 
-  using TensorMKL = decltype(make_tensor(
-      make_gmem_ptr(static_cast<ElementA const*>(nullptr)),
-      make_shape(0, 0, 0),
-      InternalStrideA{}));  //(m, k)
-  using TensorNKL = decltype(make_tensor(
-      make_gmem_ptr(static_cast<ElementB const*>(nullptr)),
-      make_shape(0, 0, 0),
-      InternalStrideB{}));  //(n, k)
-  using TensorScaleA = decltype(make_tensor(
-      make_gmem_ptr(static_cast<ElementScaleA const*>(nullptr)),
-      make_shape(0, 0, 0),
-      InternalStrideScaleA{}));  //(m, scale_k)
-  using TensorScaleB = decltype(make_tensor(
-      make_gmem_ptr(static_cast<ElementScaleB const*>(nullptr)),
-      make_shape(0, 0, 0),
-      InternalStrideScaleB{}));  //(n, scale_k)
-
-  using MainloopTensors =
-      cute::tuple<TensorMKL, TensorNKL, TensorScaleA, TensorScaleB>;
-
-  static constexpr auto GROUP_K = Base::GROUP_K;
+  static constexpr int BASE_GROUP_N = Base::GroupN;
+  static constexpr int BASE_GROUP_K = Base::GroupK;
 
   // Host side kernel arguments
   struct Arguments {
@@ -176,7 +169,6 @@ struct CollectiveMma<
     ElementB const* ptr_B;
     ElementScaleA const* ptr_SA = nullptr;
     ElementScaleB const* ptr_SB = nullptr;
-    int group_size = GROUP_K;
   };
 
   using Params = Arguments;
@@ -201,22 +193,24 @@ struct CollectiveMma<
     const int32_t N = get<1>(problem_shape_mnkl);
     const int32_t K = get<2>(problem_shape_mnkl);
 
-    auto scale_k = cute::ceil_div(K, GROUP_K);
-    auto scale_n = cute::ceil_div(N, GROUP_K);
+    auto scale_k = cute::ceil_div(K, BASE_GROUP_K);
+    auto scale_n = cute::ceil_div(N, BASE_GROUP_N);
     ElementA const* ptr_A_curr_batch =
         static_cast<ElementA const*>(mainloop_params.ptr_A) +
         expert_first_token_offset[next_group] * K;
     ElementB const* ptr_B_curr_batch =
         static_cast<ElementB const*>(mainloop_params.ptr_B) +
         next_group * N * K;
-    ElementSF const* ptr_SFA_curr_batch =
-        static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
+    ElementScaleA const* ptr_SFA_curr_batch =
+        static_cast<ElementScaleA const*>(mainloop_params.ptr_SA) +
         expert_first_token_offset[next_group] * scale_k;
-    ElementSF const* ptr_SFB_curr_batch =
-        static_cast<ElementSF const*>(mainloop_params.ptr_SB) +
+    ElementScaleB const* ptr_SFB_curr_batch =
+        static_cast<ElementScaleB const*>(mainloop_params.ptr_SB) +
         next_group * scale_n * scale_k;
-    StrideA dA = cutlass::make_cute_packed_stride(InternalStrideA{}, {M, K, 1});
-    StrideB dB = cutlass::make_cute_packed_stride(InternalStrideB{}, {N, K, 1});
+    StrideA dA =
+        cutlass::make_cute_packed_stride(InternalStrideA{}, {M, K, 1});
+    StrideB dB =
+        cutlass::make_cute_packed_stride(InternalStrideB{}, {N, K, 1});
     StrideScaleA dSA = cutlass::make_cute_packed_stride(
         InternalStrideScaleA{}, {M, scale_k, 1});
     StrideScaleB dSB = cutlass::make_cute_packed_stride(
@@ -230,8 +224,7 @@ struct CollectiveMma<
         ptr_SFA_curr_batch,
         dSA,
         ptr_SFB_curr_batch,
-        dSB,
-        GROUP_K};
+        dSB};
   }
 
   template <class ProblemShape>

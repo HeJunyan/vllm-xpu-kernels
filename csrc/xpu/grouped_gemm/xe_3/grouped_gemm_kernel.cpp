@@ -127,8 +127,7 @@ struct GroupedGemmRunner {
       ElementOutput* ptr_D,
       int64_t N,
       int64_t K,
-      int64_t groups,
-      int block_size) {
+      int64_t groups) {
     typename Gemm::Arguments arguments;
     decltype(arguments.epilogue.thread) fusion_args;
 
@@ -161,7 +160,7 @@ struct GroupedGemmRunner {
     } else {
       arguments = typename Gemm::Arguments{
           cutlass::gemm::GemmUniversalMode::kGrouped,
-          {ptr_A, ptr_B, ptr_A_scale, ptr_B_scale, block_size},
+          {ptr_A, ptr_B, ptr_A_scale, ptr_B_scale},
           {fusion_args, ptr_C, ptr_D},
           expert_first_token_offset,
           N,
@@ -186,8 +185,7 @@ struct GroupedGemmRunner {
       ElementOutput* ptr_D,
       int64_t N,
       int64_t K,
-      int64_t groups,
-      int block_size) {
+      int64_t groups) {
     Gemm gemm_op;
 
     auto arguments = args_from_options(
@@ -201,8 +199,7 @@ struct GroupedGemmRunner {
         ptr_D,
         N,
         K,
-        groups,
-        block_size);
+        groups);
 
     size_t workspace_size = Gemm::get_workspace_size(arguments);
     cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
@@ -262,8 +259,7 @@ void kernel_functor(
       reinterpret_cast<typename moe_policy::ElementOutput*>(ptr_D),
       N,
       K,
-      groups,
-      moe_policy::BlockSize);
+      groups);
 }
 
 #define INSTANTIATE_KERNEL(POLICY)      \

@@ -296,12 +296,12 @@ class moe_fp8block_policy : public moe_policy_base {
   using TileShape = Shape<_128, _128, _32>;
   using SGLayout = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
-      MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
+      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
       Layout<TileShape>,
       SGLayout>::TiledMMA;
 
   using GEMMDispatchPolicy =
-      cutlass::gemm::MainloopFP8BlockGroup<PipelineStages>;
+      cutlass::gemm::MainloopFP8BlockGroup<PipelineStages, 128, 128>;
   CALL_GENERATE_GEMM();
 };
 

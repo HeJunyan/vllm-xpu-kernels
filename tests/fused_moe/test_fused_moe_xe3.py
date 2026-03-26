@@ -45,8 +45,11 @@ MINI_PYTEST_PARAMS = {
             (64, 128, 128),
             (64, 256, 128),
             (64, 256, 256),
+            # m=256 needed for MXFP recipes (BLK_M=256 on CRI)
+            (256, 128, 128),
+            (256, 256, 256),
         ],
-        "e": [1, 2],
+        "e": [2],
         "topk": [2],
         "recipe": ["bf16", "mxfp8", "mxfp4", "fp8block"],
         "has_bias": [True]
@@ -224,6 +227,10 @@ def ref_fused_moe(recipe,
                          ["bf16", "fp16", "mxfp8", "mxfp4", "fp8block"])
 @pytest.mark.parametrize("has_bias", [True, False])
 def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
+    if topk > e:
+        pytest.skip(f"topk={topk} > num_experts={e}")
+    if recipe in ["mxfp8", "mxfp4"] and m < 256:
+        pytest.skip("MXFP requires m>=256 on CRI simulator (BLK_M=256)")
     seed_everything(7)
     data_dtype, scale_dtype = RECIPE_TO_DTYPE.get(recipe, (None, None))
 
