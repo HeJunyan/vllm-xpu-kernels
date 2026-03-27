@@ -278,20 +278,16 @@ def xpu_fused_moe(hidden_states,
                 hidden_states, input_scales = quant_mxfp_act(
                     hidden_states, "mxfp4")
 
-    inter_size = list(w13.shape)[-2] // 2
-    assert w13.is_contiguous() and w2.is_contiguous()
-
     # 4bits support [E, N, K]
     # other types [E, K, N]
     if not is_int4 and not is_mxfp4 and w13.dtype != torch.float4_e2m1fn_x2:
-        if not hasattr(w13, 'xpu_fused_moe'):
-            w13.data = w13.transpose(-1, -2).contiguous()
-            w2.data = w2.transpose(-1, -2).contiguous()
-            w13.xpu_fused_moe = True
-            w13.inter_size = inter_size
-        else:
-            inter_size = w13.inter_size
+        inter_size = list(w13.shape)[-1] // 2
+    else:
+        inter_size = list(w13.shape)[-2] // 2
 
+    assert w13.is_contiguous() and w2.is_contiguous()
+
+    # FIXME: move this to vllm
     if is_int4 and not hasattr(w13, 'xpu_fused_moe'):
         w13_tmp = torch.empty_like(w13)
         w2_tmp = torch.empty_like(w2)
@@ -390,7 +386,7 @@ def xpu_fused_moe(hidden_states,
         torch.ops._C.silu_and_mul(act_output, gemm1_output)
     elif activation == "gelu":
         torch.ops._C.gelu_and_mul(act_output, gemm1_output)
-    elif activation == "swigluoai":
+    elif activation == "swigluoai" or ("SWIGLUOAI" in str(activation)):
         torch.ops._C.swigluoai_and_mul(act_output, gemm1_output, 1.702, 7.0)
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
