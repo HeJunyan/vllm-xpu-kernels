@@ -151,17 +151,21 @@ def conv1d(
         device=input.device,
     )
 
-    # Determine block size for output width
+    # Determine block size for output width (power of 2 for Triton)
     BLOCK_SIZE_W = triton.next_power_of_2(min(out_width, 1024))
-    BLOCK_SIZE_W = max(BLOCK_SIZE_W, kernel_size)
 
     # Grid: one program per (batch, channel)
     grid = (batch_size * in_channels, )
 
+    # Triton requires valid pointers for all arguments even when unused.
+    # When bias is None, pass input as a dummy pointer (never dereferenced
+    # because HAS_BIAS=False is a compile-time constant that guards access).
+    bias_ptr = bias if bias is not None else input
+
     _conv1d_kernel[grid](
         input,
         weight,
-        bias if bias is not None else input,  # dummy ptr when no bias
+        bias_ptr,
         output,
         batch_size,
         in_channels,
