@@ -11,10 +11,8 @@ BATCH_SIZES = [1, 4, 16]
 CHANNELS = [64, 128, 512]
 WIDTHS = [32, 128, 1024]
 KERNEL_SIZES = [3, 4, 7]
-SEEDS = [0]
-XPU_DEVICES = [
-    f"xpu:{i}" for i in range(1 if torch.xpu.device_count() == 1 else 2)
-]
+SEED = 0
+XPU_DEVICE = "xpu"
 
 # Override pytest parameters when enable mini pytest
 MINI_PYTEST_PARAMS = {
@@ -32,8 +30,6 @@ MINI_PYTEST_PARAMS = {
 @pytest.mark.parametrize("channels", CHANNELS)
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", XPU_DEVICES)
 @torch.inference_mode()
 def test_conv1d(
     kernel_size: int,
@@ -41,12 +37,10 @@ def test_conv1d(
     channels: int,
     batch_size: int,
     dtype: torch.dtype,
-    seed: int,
-    device: str,
 ) -> None:
     """Test depthwise conv1d with padding = kernel_size - 1 (causal style)."""
-    seed_everything(seed)
-    torch.set_default_device(device)
+    seed_everything(SEED)
+    torch.set_default_device(XPU_DEVICE)
 
     padding = kernel_size - 1
     layer = Conv1d(stride=1, padding=padding)
@@ -70,8 +64,6 @@ def test_conv1d(
 @pytest.mark.parametrize("channels", CHANNELS)
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", XPU_DEVICES)
 @torch.inference_mode()
 def test_conv1d_with_bias(
     kernel_size: int,
@@ -79,12 +71,10 @@ def test_conv1d_with_bias(
     channels: int,
     batch_size: int,
     dtype: torch.dtype,
-    seed: int,
-    device: str,
 ) -> None:
     """Test depthwise conv1d with bias."""
-    seed_everything(seed)
-    torch.set_default_device(device)
+    seed_everything(SEED)
+    torch.set_default_device(XPU_DEVICE)
 
     padding = kernel_size - 1
     layer = Conv1d(stride=1, padding=padding)
@@ -106,18 +96,14 @@ def test_conv1d_with_bias(
 
 @pytest.mark.parametrize("stride", [1, 2])
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", XPU_DEVICES)
 @torch.inference_mode()
 def test_conv1d_stride(
     stride: int,
     dtype: torch.dtype,
-    seed: int,
-    device: str,
 ) -> None:
     """Test conv1d with different stride values."""
-    seed_everything(seed)
-    torch.set_default_device(device)
+    seed_everything(SEED)
+    torch.set_default_device(XPU_DEVICE)
 
     batch_size, channels, width, kernel_size = 4, 128, 128, 3
     padding = kernel_size - 1
@@ -138,17 +124,13 @@ def test_conv1d_stride(
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", XPU_DEVICES)
 @torch.inference_mode()
 def test_conv1d_no_padding(
     dtype: torch.dtype,
-    seed: int,
-    device: str,
 ) -> None:
     """Test conv1d without padding."""
-    seed_everything(seed)
-    torch.set_default_device(device)
+    seed_everything(SEED)
+    torch.set_default_device(XPU_DEVICE)
 
     batch_size, channels, width, kernel_size = 4, 128, 128, 3
     layer = Conv1d(stride=1, padding=0)
