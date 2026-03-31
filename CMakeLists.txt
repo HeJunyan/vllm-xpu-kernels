@@ -230,7 +230,8 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_LINK_FLAGS})
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS}
-                             -fsycl-max-parallel-link-jobs=16)
+                             -fsycl-max-parallel-link-jobs=16
+                             -Wno-sycl-target)
   set(SYCL_DEVICE_LINK_FLAGS
       ${SYCL_DEVICE_LINK_FLAGS}
       "-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"

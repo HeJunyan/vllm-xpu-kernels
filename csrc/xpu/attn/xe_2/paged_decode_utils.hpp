@@ -27,7 +27,7 @@ void decode_policy_dispatch_func(
   }
 }
 
-template <class QGroup>
+template <typename QGroup, typename PageSize>
 inline void dispatch_by_head_size(
     const int head_case,
     sycl::queue& queue,

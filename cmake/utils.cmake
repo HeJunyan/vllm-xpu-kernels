@@ -652,9 +652,10 @@ function(add_xe3_kernel_library LIBRARY_NAME)
   endif()
 
   # Set compile options and definitions
-  target_compile_options(${LIBRARY_NAME}
-                         PRIVATE ${SYCL_TLA_KERNELS_COMPILE_FLAGS} -fPIC)
-  target_compile_definitions(${LIBRARY_NAME} PRIVATE -DVLLM_XPU_ENABLE_XE3)
+  target_compile_options(
+    ${LIBRARY_NAME}
+    PRIVATE ${SYCL_TLA_KERNELS_COMPILE_FLAGS} -fPIC -Wno-c++20-extensions
+            -Wno-intel-compat -Wno-pragma-once-outside-header)
   target_compile_definitions(${LIBRARY_NAME} PRIVATE -DSYCL_INTEL_TARGET=35)
   target_include_directories(${LIBRARY_NAME} PRIVATE ${SYCL_TLA_INCLUDE_DIRS})
 
@@ -720,8 +721,10 @@ function(add_xe4_kernel_library LIBRARY_NAME)
   endif()
 
   # Set compile options and definitions
-  target_compile_options(${LIBRARY_NAME}
-                         PRIVATE ${SYCL_TLA_KERNELS_COMPILE_FLAGS} -fPIC)
+  target_compile_options(
+    ${LIBRARY_NAME}
+    PRIVATE ${SYCL_TLA_KERNELS_COMPILE_FLAGS} -fPIC -Wno-c++20-extensions
+            -Wno-intel-compat)
   target_compile_definitions(${LIBRARY_NAME} PRIVATE -DVLLM_XPU_ENABLE_XE4)
   target_compile_definitions(${LIBRARY_NAME} PRIVATE -DSYCL_INTEL_TARGET=40)
   target_include_directories(${LIBRARY_NAME} PRIVATE ${SYCL_TLA_INCLUDE_DIRS})
