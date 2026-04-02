@@ -414,10 +414,7 @@ struct FMHAFwdMainloop<
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
         if constexpr (Fp8KV) {
-          for (int i = 0; i < tSrK.size(); ++i) {
-            tSrK(i) =
-                static_cast<ElementQ>(scale_k * static_cast<float>(tSrK(i)));
-          }
+          dequantize(tSrK, scale_k);
         }
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
@@ -489,11 +486,7 @@ struct FMHAFwdMainloop<
             tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
         }
         if constexpr (Fp8KV) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tArV.size(); ++i) {
-            tArV(i) =
-                static_cast<ElementQ>(scale_v * static_cast<float>(tArV(i)));
-          }
+          dequantize(tArV, scale_v);
         }
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
