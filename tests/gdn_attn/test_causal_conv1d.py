@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import time
+
 import pytest
 import torch
 
@@ -18,6 +20,9 @@ SILU_ACTIVATION = [False, True]
 SEED = 0
 XPU_DEVICE = "xpu"
 
+NUM_WARMUP_ITERS = 5
+NUM_ITERS = 100
+
 # Override pytest parameters when enable mini pytest
 MINI_PYTEST_PARAMS = {
     "default": {
@@ -27,6 +32,26 @@ MINI_PYTEST_PARAMS = {
         "kernel_size": [3],
     },
 }
+
+
+def _measure_latency_us(
+    fn,
+    num_warmup_iters: int = NUM_WARMUP_ITERS,
+    num_iters: int = NUM_ITERS,
+) -> float:
+    """Measure average per-iteration latency in microseconds."""
+    for _ in range(num_warmup_iters):
+        fn()
+    torch.xpu.synchronize()
+
+    start = time.perf_counter()
+    for _ in range(num_iters):
+        fn()
+    torch.xpu.synchronize()
+    end = time.perf_counter()
+
+    return (end - start) / num_iters * 1e6
+
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("silu_activation", SILU_ACTIVATION)
@@ -58,11 +83,8 @@ def test_causal_conv1d(
         b = torch.randn(dim, dtype=dtype)
 
     out_ref = layer.forward_native(x, w, bias=b)
-#    print("##### out.shape is :", out_ref)
     out_opt = layer.forward_native_optimized(x, w, bias=b)
-#    print("@@@@@ out_opt.shape is :", out_opt)
     out_triton = layer.forward_xpu_triton(x, w, bias=b)
-#    print("===== 333 out_opt.shape is :", out_triton)
 
     torch.testing.assert_close(
         out_opt,
@@ -76,3 +98,17 @@ def test_causal_conv1d(
         atol=get_default_atol(out_triton),
         rtol=get_default_rtol(out_triton),
     )
+
+    # Performance measurement for each forward implementation.
+    lat_native = _measure_latency_us(lambda: layer.forward_native(x, w, bias=b))
+    lat_optimized = _measure_latency_us(
+        lambda: layer.forward_native_optimized(x, w, bias=b))
+    lat_triton = _measure_latency_us(
+        lambda: layer.forward_xpu_triton(x, w, bias=b))
+
+    config_str = (f"batch={batch_size}, dim={dim}, width={width}, "
+                  f"seqlen={seqlen}, bias={has_bias}, dtype={dtype}")
+    print(f"\n[perf] {config_str}")
+    print(f"  forward_native           : {lat_native:.2f} us")
+    print(f"  forward_native_optimized : {lat_optimized:.2f} us")
+    print(f"  forward_xpu_triton       : {lat_triton:.2f} us")
