@@ -110,4 +110,4 @@ class Conv1d(CustomOp):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Triton-based XPU implementation."""
-        return None
+        return conv1d(input, weight, bias)
