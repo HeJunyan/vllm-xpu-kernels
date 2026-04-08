@@ -568,8 +568,9 @@ def conv1d(
         raise ValueError(
             f"x must be a 3-D tensor [batch, seq_len, dim], got {x.dim()}-D")
     if weight.dim() != 2:
-        raise ValueError(f"weight must be a 2-D tensor [kernel_size, dim], "
-                         f"got {weight.dim()}-D")
+        raise ValueError(
+            f"weight must be a 2-D tensor [kernel_size, dim], "
+            f"got {weight.dim()}-D")
 
     bs, seq_len, dim = x.shape
     kernel_size, w_dim = weight.shape
@@ -578,7 +579,8 @@ def conv1d(
         raise ValueError(
             f"weight.shape[1] ({w_dim}) must match x.shape[2] ({dim})")
     if bias is not None and bias.shape != (dim, ):
-        raise ValueError(f"bias shape {tuple(bias.shape)} must be ({dim},)")
+        raise ValueError(
+            f"bias shape {tuple(bias.shape)} must be ({dim},)")
 
     # causal_conv1d_fn expects:
     #   x      : (dim, cu_seqlen) in channel-last layout, stride(0)==1
