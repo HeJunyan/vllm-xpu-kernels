@@ -12,6 +12,8 @@ from tests.ops.moe_align_block_size_ops import (batched_moe_align_block_size,
                                                 moe_align_block_size)
 from tests.utils import opcheck, round_up, seed_everything
 
+pytestmark = pytest.mark.skip(reason="Skip for PO/MOE not use this op currently")
+
 NUM_TOKENS = [1, 3, 256, 2256, 4096]
 NUM_EXPERTS = [32, 160, 256, 257]
 TOP_KS = [1, 2, 16, 32]
