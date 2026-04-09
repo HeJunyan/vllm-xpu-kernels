@@ -70,23 +70,26 @@ at::Tensor grouped_gemm_func(
       using moe_policy = grouped_gemm::moe_fp16_decode_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);
     }
-  } else if (A_dtype == at::kFloat8_e4m3fn) {
-    if (ptr_A_scale.has_value() &&
-        ptr_A_scale->scalar_type() == at::kFloat) {
-      using moe_policy = grouped_gemm::moe_fp8block_policy;
-      CALL_KERNEL_WITH_POLICY(moe_policy);
-    } else {
-      using moe_policy = grouped_gemm::moe_mxfp8_policy;
-      CALL_KERNEL_WITH_POLICY(moe_policy);
-    }
-  } else if (A_dtype == at::kFloat4_e2m1fn_x2) {
+  } else if (
+      A_dtype == at::kFloat8_e4m3fn && ptr_A_scale &&
+      ptr_A_scale->dtype() == at::kFloat8_e8m0fnu) {
+    using moe_policy = grouped_gemm::moe_mxfp8_policy;
+    CALL_KERNEL_WITH_POLICY(moe_policy);
+  } else if (
+      A_dtype == at::kFloat4_e2m1fn_x2 && ptr_A_scale &&
+      ptr_A_scale->dtype() == at::kFloat8_e8m0fnu) {
     using moe_policy = grouped_gemm::moe_mxfp4_policy;
+    CALL_KERNEL_WITH_POLICY(moe_policy);
+  } else if (
+      A_dtype == at::kFloat8_e4m3fn && ptr_A_scale &&
+      ptr_A_scale->dtype() == at::kFloat) {
+    using moe_policy = grouped_gemm::moe_fp8block_policy;
     CALL_KERNEL_WITH_POLICY(moe_policy);
   } else {
     TORCH_CHECK(
         false,
-        "grouped_gemm_func only supports BF16/FP16/MXFP8/MXFP4/FP8block "
-        "dtypes on XE3, but got: ",
+        "grouped_gemm_func only supports BF16/FP16/MXFP8/MXFP4/FP8(block) "
+        "dtypes, but got: ",
         A_dtype);
   }
   return ptr_D;
