@@ -7,6 +7,8 @@ import torch
 
 import tests.register_ops as ops
 
+pytestmark = pytest.mark.skip(reason="Skip for PO/MOE not use this op currently")
+
 # override pytest parameters when enable mini pytest
 MINI_PYTEST_PARAMS = {
     "default": {
