@@ -199,8 +199,13 @@ def fp4_e2m1fn_x2_to_float(t: torch.Tensor) -> torch.Tensor:
 
         return out.view(shape)
 
-    t_float = _floatx_unpacked_to_f32(unpack_uint4(t), ebits=2, mbits=1)
-    return t_float
+    # _floatx_unpacked_to_f32 uses boolean indexed assignment
+    # (e.g. result[mask] = val) which triggers index_functor_kernel
+    # assertions on CRI simulator.  Run the conversion on CPU.
+    orig_device = t.device
+    t_float = _floatx_unpacked_to_f32(
+        unpack_uint4(t.cpu()), ebits=2, mbits=1)
+    return t_float.to(orig_device)
 
 
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
