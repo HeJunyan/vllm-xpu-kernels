@@ -1,6 +1,8 @@
 #include "core/registration.h"
 #include "xpu/ops.h"
-#include "xpu/grouped_gemm/grouped_gemm_interface.h"
+#ifdef VLLM_MOE_ENABLED
+  #include "xpu/grouped_gemm/grouped_gemm_interface.h"
+#endif
 #include "xpu/lora/lora_ops.h"
 
 #include <torch/library.h>
@@ -35,7 +37,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "bias) -> Tensor");
   xpu_ops.impl("int4_gemm_w4a8", torch::kXPU, &int4_gemm_w4a8);
 
-#ifdef BUILD_SYCL_TLA_KERNELS
+#ifdef VLLM_MOE_ENABLED
   xpu_ops.def(
       "cutlass_grouped_gemm_interface(Tensor ptr_A, Tensor? ptr_A_scale, "
       "Tensor ptr_B, Tensor? "
@@ -75,6 +77,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "-> ()");
   xpu_ops.impl("bgmv_expand_slice", torch::kXPU, &bgmv_expand_slice);
 
+#ifdef VLLM_GDN_ENABLED
   xpu_ops.def(
       "gdn_attention(Tensor! core_attn_out, Tensor! z, Tensor "
       "projected_states_qkvz, Tensor projected_states_ba,"
@@ -86,6 +89,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "Tensor non_spec_state_indices_tensor, int num_actual_tokens, int "
       "tp_size, bool reorder_input) -> ()");
   xpu_ops.impl("gdn_attention", torch::kXPU, &gdn_attention);
+#endif
 
   // for empty tensor functions, we don't need dispatch key like torch::kXPU
   xpu_ops.def("is_bmg(int device_index) -> bool");

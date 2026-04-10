@@ -52,6 +52,7 @@ torch::Tensor int4_gemm_w4a8(
     const std::optional<torch::Tensor>& g_idx,
     const std::optional<torch::Tensor>& bias);
 
+#ifdef VLLM_MOE_ENABLED
 torch::Tensor cutlass_grouped_gemm_interface(
     torch::Tensor ptr_A,
     const c10::optional<at::Tensor>& ptr_A_scale,
@@ -65,6 +66,7 @@ torch::Tensor cutlass_grouped_gemm_interface(
     int64_t num_experts,
     bool is_B_int4,
     bool is_B_mxfp4);
+#endif
 
 std::tuple<at::Tensor, at::Tensor> deepseek_scaling_rope(
     const at::Tensor& positions,
@@ -75,6 +77,7 @@ std::tuple<at::Tensor, at::Tensor> deepseek_scaling_rope(
     int64_t rotary_dim,
     bool is_neox);
 
+#ifdef VLLM_GDN_ENABLED
 void gdn_attention(
     torch::Tensor& core_attn_out,
     torch::Tensor& z,
@@ -99,6 +102,7 @@ void gdn_attention(
     const int64_t num_actual_tokens,
     const int64_t tp_size,
     const bool reorder_input);
+#endif
 
 bool is_bmg(int64_t device_index);
 
