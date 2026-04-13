@@ -12,6 +12,19 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_D': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 256}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_D': 512}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_D': 1024}, num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_D': 128}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_D': 256}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_D': 512}, num_warps=16, num_stages=3),
+        triton.Config({'BLOCK_D': 1024}, num_warps=32, num_stages=3),
+    ],
+    key=['dim', 'KERNEL_SIZE'],
+)
 @triton.jit
 def _causal_conv1d_kernel(
     X_ptr,
@@ -35,18 +48,24 @@ def _causal_conv1d_kernel(
 ):
     """Triton kernel for depthwise causal conv1d.
 
-    Each program handles one (batch, sequence) position and a BLOCK_D-wide
-    slice of the channel dimension.
+    Each program handles a BLOCK_D-wide slice of the channel dimension for
+    one (batch, sequence) position.
 
-    Grid: (batch_size * seq_len, ceil_div(dim, BLOCK_D))
+    Grid: (ceil_div(dim, BLOCK_D), batch_size * seq_len)
+    axis=0 carries the channel-tile index (changes fastest on XPU) so that
+    concurrently executing work-groups access contiguous memory and benefit
+    from cache reuse.  axis=1 carries the combined batch*sequence index.
 
     Algorithm (mirrors forward_native_optimized):
         output[b, s, d] = sum_{k=0}^{K-1} x_padded[b, s+k, d] * weight[k, d]
     where x_padded is x left-padded with K-1 zeros along the sequence axis,
     so x_padded[b, i, d] = x[b, i-(K-1), d] for i >= K-1, else 0.
     """
-    pid_bs = tl.program_id(0)
-    pid_d = tl.program_id(1)
+    # axis=0: channel-tile index — fastest-changing on XPU, preserves cache
+    # locality because adjacent work-groups access contiguous channel slices.
+    # axis=1: combined batch * sequence index.
+    pid_d = tl.program_id(0)
+    pid_bs = tl.program_id(1)
 
     b = pid_bs // seq_len
     s = pid_bs % seq_len
@@ -132,10 +151,11 @@ def casual_conv1d(
 
     output = torch.empty_like(x)
 
-    # Choose a BLOCK_D that is a power of two and covers the full channel dim
-    # in as few blocks as possible while staying within reasonable SRAM limits.
-    BLOCK_D = min(triton.next_power_of_2(dim), 1024)
-    grid = (bs * seq_len, triton.cdiv(dim, BLOCK_D))
+    # axis=0: channel-tile dimension; axis=1: combined batch * sequence index.
+    # On XPU axis=0 changes fastest; placing the channel tile there ensures
+    # concurrent work-groups access contiguous memory and share cached data.
+    # The autotuner provides BLOCK_D via the META dict at runtime.
+    grid = lambda META: (triton.cdiv(dim, META['BLOCK_D']), bs * seq_len)
 
     # When there is no bias we pass `weight` as a harmless dummy pointer so
     # the kernel signature stays uniform; the HAS_BIAS constexpr ensures the
@@ -159,7 +179,6 @@ def casual_conv1d(
         output.stride(1),
         output.stride(2),
         HAS_BIAS=bias is not None,
-        BLOCK_D=BLOCK_D,
         KERNEL_SIZE=kernel_size,
     )
 
