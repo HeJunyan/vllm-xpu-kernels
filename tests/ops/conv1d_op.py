@@ -43,10 +43,10 @@ def _causal_conv1d_kernel(
     concurrently executing work-groups access contiguous memory and benefit
     from cache reuse.  axis=1 carries the combined batch*sequence index.
 
-    Algorithm (mirrors forward_native_optimized):
-        output[b, s, d] = sum_{k=0}^{K-1} x_padded[b, s+k, d] * weight[k, d]
+    Algorithm:
+        output[b, d, s] = sum_{k=0}^{K-1} x_padded[b, d, s+k] * weight[d, k]
     where x_padded is x left-padded with K-1 zeros along the sequence axis,
-    so x_padded[b, i, d] = x[b, i-(K-1), d] for i >= K-1, else 0.
+    so x_padded[b, d, i] = x[b, d, i-(K-1)] for i >= K-1, else 0.
     """
     # axis=0: channel-tile index — fastest-changing on XPU, preserves cache
     # locality because adjacent work-groups access contiguous channel slices.
@@ -108,27 +108,27 @@ def casual_conv1d(
     accumulate element-wise products across kernel positions.
 
     Args:
-        x: Input tensor of shape ``[batch, seq_len, dim]``.
-        weight: Weight tensor of shape ``[kernel_size, dim]``.
+        x: Input tensor of shape ``[batch, dim, seq_len]``.
+        weight: Weight tensor of shape ``[dim, kernel_size]``.
         bias: Optional bias tensor of shape ``[dim]``.
 
     Returns:
-        Output tensor of shape ``[batch, seq_len, dim]``.
+        Output tensor of shape ``[batch, dim, seq_len]``.
     """
     if x.dim() != 3:
         raise ValueError(
-            f"x must be a 3-D tensor [batch, seq_len, dim], got {x.dim()}-D")
+            f"x must be a 3-D tensor [batch, dim, seq_len], got {x.dim()}-D")
     if weight.dim() != 2:
         raise ValueError(
-            f"weight must be a 2-D tensor [kernel_size, dim], "
+            f"weight must be a 2-D tensor [dim, kernel_size], "
             f"got {weight.dim()}-D")
 
-    bs, seq_len, dim = x.shape
-    kernel_size, w_dim = weight.shape
+    bs, dim, seq_len = x.shape
+    w_dim, kernel_size = weight.shape
 
     if w_dim != dim:
         raise ValueError(
-            f"weight.shape[1] ({w_dim}) must match x.shape[2] ({dim})")
+            f"weight.shape[0] ({w_dim}) must match x.shape[1] ({dim})")
     if bias is not None and bias.shape != (dim, ):
         raise ValueError(
             f"bias shape {tuple(bias.shape)} must be ({dim},)")
@@ -153,6 +153,12 @@ def casual_conv1d(
     # bias load is never executed in that case.
     bias_ptr = bias if bias is not None else weight
 
+    # x layout: [batch, dim, seq_len]  → strides: (stride(0), stride(1), stride(2))
+    # kernel stride arguments: stride_xb=stride(0), stride_xs=stride(2) (seq axis),
+    #                          stride_xd=stride(1) (dim axis)
+    # weight layout: [dim, kernel_size] → strides: (stride(0), stride(1))
+    # kernel stride arguments: stride_wk=stride(1) (kernel axis),
+    #                          stride_wd=stride(0) (dim axis)
     _causal_conv1d_kernel[grid](
         x,
         weight,
@@ -162,13 +168,13 @@ def casual_conv1d(
         seq_len,
         dim,
         x.stride(0),
-        x.stride(1),
         x.stride(2),
-        weight.stride(0),
+        x.stride(1),
         weight.stride(1),
+        weight.stride(0),
         output.stride(0),
-        output.stride(1),
         output.stride(2),
+        output.stride(1),
         HAS_BIAS=bias is not None,
         KERNEL_SIZE=kernel_size,
         BLOCK_D=1024,
@@ -186,10 +192,10 @@ class Conv1d(CustomOp):
     independently with its own kernel (groups == channels).
 
     Shapes:
-        input: (batch, sequence, dim)
-        weight: (width, dim)
+        input: (batch, dim, sequence)
+        weight: (dim, width)
         bias: (dim,) or None
-        return: (batch, sequence, dim)
+        return: (batch, dim, sequence)
     """
 
     def __init__(
@@ -200,8 +206,8 @@ class Conv1d(CustomOp):
         has_bias: bool,
         dtype: torch.dtype,
     ):
-        self.w = torch.randn(width, dim, dtype=dtype)
-        self.w_t = self.w.t().contiguous()  # (dim, kernel_size)
+        self.w = torch.randn(dim, width, dtype=dtype)
+        self.w_t = self.w  # (dim, kernel_size)
 
         self.b = None
         self.has_bias = has_bias
@@ -221,12 +227,10 @@ class Conv1d(CustomOp):
         input: torch.Tensor,
     ) -> torch.Tensor:
         """PyTorch-native implementation using F.conv1d with groups."""
-        x = input.transpose(1, 2)
-        seqlen = x.shape[-1]
-        dim, width = self.w_t.shape
-        out = F.conv1d(x, self.w_t.unsqueeze(1), self.b, padding=width - 1, groups=dim)
+        # input: [batch, dim, seq_len]
+        bs, dim, seqlen = input.shape
+        out = F.conv1d(input, self.w_t.unsqueeze(1), self.b, padding=self.w_t.shape[1] - 1, groups=dim)
         out = out[..., :seqlen]
-        out = out.transpose(1, 2)
         return out
 
     def forward_native_optimized(
@@ -244,37 +248,37 @@ class Conv1d(CustomOp):
            dimension so that the output has the same sequence length as the
            input (causal padding).
         2. For each kernel index ``k`` in ``[0, kernel_size)``:
-           - Extract the slice ``x_padded[:, k : k + seq_len, :]``.
-           - Multiply element-wise by ``weight[k]`` (shape ``[dim]``), which
+           - Extract the slice ``x_padded[:, :, k : k + seq_len]``.
+           - Multiply element-wise by ``weight[:, k]`` (shape ``[dim]``), which
              broadcasts over the batch and sequence dimensions.
            - Accumulate the result in-place into the output buffer.
         3. Optionally add a bias term.
         """
 
         if x.dim() != 3:
-            raise ValueError(f"x must be a 3-D tensor [batch, seq_len, dim], got {x.dim()}-D")
+            raise ValueError(f"x must be a 3-D tensor [batch, dim, seq_len], got {x.dim()}-D")
         if self.w.dim() != 2:
             raise ValueError(
-                f"weight must be a 2-D tensor [kernel_size, dim], "
-                f"got {weight.dim()}-D")
+                f"weight must be a 2-D tensor [dim, kernel_size], "
+                f"got {self.w.dim()}-D")
 
-        bs, seq_len, dim = x.shape
-        kernel_size = self.w.shape[0]
+        bs, dim, seq_len = x.shape
+        kernel_size = self.w.shape[1]
 
-        if self.w.shape[1] != dim:
-            raise ValueError(f"self.w.shape[1] ({self.w.shape[1]}) must match x.shape[2] ({dim})")
+        if self.w.shape[0] != dim:
+            raise ValueError(f"self.w.shape[0] ({self.w.shape[0]}) must match x.shape[1] ({dim})")
         if self.b is not None and self.b.shape != (dim, ):
             raise ValueError(f"bias shape {tuple(self.b.shape)} must be ({dim},)")
 
         # Left-pad the sequence dimension with (kernel_size - 1) zeros so the
         # output keeps the same sequence length (causal padding).
-        x_padded = F.pad(x, (0, 0, kernel_size - 1, 0))
+        x_padded = F.pad(x, (kernel_size - 1, 0))
 
         # Accumulate contributions from each kernel position.
         output: torch.Tensor | None = None
         for k in range(kernel_size):
-            x_slice = x_padded[:, k:k + seq_len, :]   # [bs, seq_len, dim]
-            contribution = x_slice * self.w[k]          # broadcasts over bs/seq
+            x_slice = x_padded[:, :, k:k + seq_len]       # [bs, dim, seq_len]
+            contribution = x_slice * self.w[:, k].unsqueeze(-1)  # broadcasts over bs/seq
             if output is None:
                 output = contribution
             else:
@@ -283,7 +287,7 @@ class Conv1d(CustomOp):
         assert output is not None  # kernel_size >= 1 guaranteed by weight shape
 
         if self.b is not None:
-            output = output + self.b
+            output = output + self.b.unsqueeze(-1)
 
         return output
 
@@ -291,28 +295,4 @@ class Conv1d(CustomOp):
         self,
         input: torch.Tensor,
     ) -> torch.Tensor:
-        return casual_conv1d (input, self.w, self.b)
-
-#        x = input.transpose(1, 2)
-#        bs, seq_len, dim = input.shape
-#        # weight is (kernel_size, dim); extract kernel_size from axis 0
-#        kernel_size = self.w.shape[0]
-
-
-#        # Cumulative sequence lengths: [0, seq_len, 2*seq_len, ..., bs*seq_len]
-#        query_start_loc = torch.arange(0, (bs + 1) * seq_len, seq_len,
-#                                       dtype=torch.int32, device=input.device)
-
-#        out = causal_conv1d_fn(
-#            x=x.squeeze(0),
-#            weight=self.w_t,
-#            bias=self.b,
-#            conv_states=self.conv_states,
-#            query_start_loc=query_start_loc,
-#            cache_indices=self.cache_indices,
-#            has_initial_state=self.has_initial_state,
-#            activation=None,
-#        )
-
-#        # (dim, bs*seq_len) → (bs*seq_len, dim) → (bs, seq_len, dim)
-#        return out.t().reshape(bs, seq_len, dim)
+        return casual_conv1d(input, self.w, self.b)
