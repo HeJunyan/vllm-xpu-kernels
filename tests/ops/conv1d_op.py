@@ -12,19 +12,6 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_D': 128}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_D': 256}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_D': 512}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_D': 1024}, num_warps=16, num_stages=2),
-        triton.Config({'BLOCK_D': 128}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_D': 256}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_D': 512}, num_warps=16, num_stages=3),
-        triton.Config({'BLOCK_D': 1024}, num_warps=32, num_stages=3),
-    ],
-    key=['dim', 'KERNEL_SIZE'],
-)
 @triton.jit
 def _causal_conv1d_kernel(
     X_ptr,
@@ -155,7 +142,11 @@ def casual_conv1d(
     # On XPU axis=0 changes fastest; placing the channel tile there ensures
     # concurrent work-groups access contiguous memory and share cached data.
     # The autotuner provides BLOCK_D via the META dict at runtime.
-    grid = lambda META: (triton.cdiv(dim, META['BLOCK_D']), bs * seq_len)
+    def grid(META):
+#        print ("MMMMMMMMMMMMMeta is :", META)
+        ret = (triton.cdiv(dim, META['BLOCK_D']), bs * seq_len)
+#        print ("RRRRRRRRRRRRRet is :", ret)
+        return ret
 
     # When there is no bias we pass `weight` as a harmless dummy pointer so
     # the kernel signature stays uniform; the HAS_BIAS constexpr ensures the
@@ -180,6 +171,9 @@ def casual_conv1d(
         output.stride(2),
         HAS_BIAS=bias is not None,
         KERNEL_SIZE=kernel_size,
+        BLOCK_D=1024,
+#        num_warps=2,
+#        num_stages=1,
     )
 
     return output
