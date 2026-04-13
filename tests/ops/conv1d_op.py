@@ -278,28 +278,28 @@ class Conv1d(CustomOp):
         self,
         input: torch.Tensor,
     ) -> torch.Tensor:
-#        return casual_conv1d (input, self.w, self.b)
+        return casual_conv1d (input, self.w, self.b)
 
-        x = input.transpose(1, 2)
-        bs, seq_len, dim = input.shape
-        # weight is (kernel_size, dim); extract kernel_size from axis 0
-        kernel_size = self.w.shape[0]
+#        x = input.transpose(1, 2)
+#        bs, seq_len, dim = input.shape
+#        # weight is (kernel_size, dim); extract kernel_size from axis 0
+#        kernel_size = self.w.shape[0]
 
 
-        # Cumulative sequence lengths: [0, seq_len, 2*seq_len, ..., bs*seq_len]
-        query_start_loc = torch.arange(0, (bs + 1) * seq_len, seq_len,
-                                       dtype=torch.int32, device=input.device)
+#        # Cumulative sequence lengths: [0, seq_len, 2*seq_len, ..., bs*seq_len]
+#        query_start_loc = torch.arange(0, (bs + 1) * seq_len, seq_len,
+#                                       dtype=torch.int32, device=input.device)
 
-        out = causal_conv1d_fn(
-            x=x.squeeze(0),
-            weight=self.w_t,
-            bias=self.b,
-            conv_states=self.conv_states,
-            query_start_loc=query_start_loc,
-            cache_indices=self.cache_indices,
-            has_initial_state=self.has_initial_state,
-            activation=None,
-        )
+#        out = causal_conv1d_fn(
+#            x=x.squeeze(0),
+#            weight=self.w_t,
+#            bias=self.b,
+#            conv_states=self.conv_states,
+#            query_start_loc=query_start_loc,
+#            cache_indices=self.cache_indices,
+#            has_initial_state=self.has_initial_state,
+#            activation=None,
+#        )
 
-        # (dim, bs*seq_len) → (bs*seq_len, dim) → (bs, seq_len, dim)
-        return out.t().reshape(bs, seq_len, dim)
+#        # (dim, bs*seq_len) → (bs*seq_len, dim) → (bs, seq_len, dim)
+#        return out.t().reshape(bs, seq_len, dim)
