@@ -23,17 +23,14 @@ def _causal_conv1d_kernel(
     dim,
     stride_xb,
     stride_xs,
-    stride_xd,
     stride_wk,
-    stride_wd,
     stride_ob,
     stride_os,
-    stride_od,
     HAS_BIAS: tl.constexpr,
     BLOCK_D: tl.constexpr,
     KERNEL_SIZE: tl.constexpr,
 ):
-    """Triton kernel for depthwise causal conv1d.
+    """Triton kernel for depthwise causal conv1d using make_tensor_descriptor.
 
     Each program handles a BLOCK_D-wide slice of the channel dimension for
     one (batch, sequence) position.
@@ -47,6 +44,12 @@ def _causal_conv1d_kernel(
         output[b, s, d] = sum_{k=0}^{K-1} x_padded[b, s+k, d] * weight[k, d]
     where x_padded is x left-padded with K-1 zeros along the sequence axis,
     so x_padded[b, i, d] = x[b, i-(K-1), d] for i >= K-1, else 0.
+
+    Tensor descriptors replace manual pointer arithmetic and use hardware 2D
+    block IO.  The descriptor automatically zero-fills any out-of-bounds
+    access, including the negative row indices that arise from causal (left)
+    padding, so no explicit validity mask is needed for x.  The caller
+    guarantees contiguous tensors, so the last (column) stride is always 1.
     """
     # axis=0: channel-tile index — fastest-changing on XPU, preserves cache
     # locality because adjacent work-groups access contiguous channel slices.
@@ -58,42 +61,46 @@ def _causal_conv1d_kernel(
     s = pid_bs % seq_len
 
     d_start = pid_d * BLOCK_D
-    d_offsets = d_start + tl.arange(0, BLOCK_D)
-    d_mask = d_offsets < dim
 
-    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    # Create 2D tensor descriptors to leverage hardware 2D block IO on XPU.
+    # The last stride is 1 because the caller ensures contiguous tensors.
+    # Out-of-bounds accesses (including negative row indices for causal
+    # padding) are automatically filled with zero by the hardware.
+    x_desc = tl.make_tensor_descriptor(
+        base=X_ptr + b * stride_xb,
+        shape=[seq_len, dim],
+        strides=[stride_xs, 1],
+        block_shape=[1, BLOCK_D],
+    )
+    w_desc = tl.make_tensor_descriptor(
+        base=W_ptr,
+        shape=[KERNEL_SIZE, dim],
+        strides=[stride_wk, 1],
+        block_shape=[1, BLOCK_D],
+    )
+    o_desc = tl.make_tensor_descriptor(
+        base=O_ptr + b * stride_ob,
+        shape=[seq_len, dim],
+        strides=[stride_os, 1],
+        block_shape=[1, BLOCK_D],
+    )
+
+    acc = tl.zeros([1, BLOCK_D], dtype=tl.float32)
 
     for k in tl.static_range(KERNEL_SIZE):
-        # Index into the original (un-padded) x tensor.
-        # x_padded[b, s+k, d] == x[b, s+k-(K-1), d]  when s+k-(K-1) >= 0
+        # Causal padding: x_padded[b, s+k, d] == x[b, s+k-(K-1), d].
+        # x_s may be negative; the descriptor zero-fills those accesses.
         x_s = s + k - (KERNEL_SIZE - 1)
-
-        # Use tl.maximum to avoid negative pointer offsets while relying on
-        # the validity mask to suppress the load when x_s < 0.
-        valid = x_s >= 0
-        safe_x_s = tl.maximum(x_s, 0)
-
-        x_vals = tl.load(
-            X_ptr + b * stride_xb + safe_x_s * stride_xs +
-            d_offsets * stride_xd,
-            mask=valid & d_mask,
-            other=0.0,
-        )
-        w_vals = tl.load(
-            W_ptr + k * stride_wk + d_offsets * stride_wd,
-            mask=d_mask,
-        )
+        x_vals = x_desc.load([x_s, d_start])  # (1, BLOCK_D)
+        w_vals = w_desc.load([k, d_start])     # (1, BLOCK_D)
         acc += x_vals * w_vals
 
     if HAS_BIAS:
-        b_vals = tl.load(B_ptr + d_offsets, mask=d_mask)
-        acc += b_vals
+        d_offsets = d_start + tl.arange(0, BLOCK_D)
+        b_vals = tl.load(B_ptr + d_offsets, mask=d_offsets < dim)
+        acc += b_vals[None, :]  # broadcast [BLOCK_D] → [1, BLOCK_D]
 
-    tl.store(
-        O_ptr + b * stride_ob + s * stride_os + d_offsets * stride_od,
-        acc.to(O_ptr.dtype.element_ty),
-        mask=d_mask,
-    )
+    o_desc.store([s, d_start], acc.to(O_ptr.dtype.element_ty))
 
 
 def casual_conv1d(
@@ -163,12 +170,9 @@ def casual_conv1d(
         dim,
         x.stride(0),
         x.stride(1),
-        x.stride(2),
         weight.stride(0),
-        weight.stride(1),
         output.stride(0),
         output.stride(1),
-        output.stride(2),
         HAS_BIAS=bias is not None,
         KERNEL_SIZE=kernel_size,
         BLOCK_D=1024,
