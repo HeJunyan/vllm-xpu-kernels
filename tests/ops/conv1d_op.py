@@ -99,9 +99,14 @@ def _causal_conv1d_kernel(
         acc += x_vals * w_vals
 
     if HAS_BIAS:
-        d_offsets = d_start + tl.arange(0, BLOCK_D)
-        b_vals = tl.load(B_ptr + d_offsets, mask=d_offsets < dim)
-        acc += b_vals[None, :]  # broadcast [BLOCK_D] → [1, BLOCK_D]
+        b_desc = tl.make_tensor_descriptor(
+            base=B_ptr,
+            shape=[1, dim],
+            strides=[dim, 1],
+            block_shape=[1, BLOCK_D],
+        )
+        b_vals = b_desc.load([0, d_start])  # (1, BLOCK_D)
+        acc += b_vals
 
     o_desc.store([s, d_start], acc.to(O_ptr.dtype.element_ty))
 
