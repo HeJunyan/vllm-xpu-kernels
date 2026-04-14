@@ -111,3 +111,18 @@ bool is_pvc(int64_t device_index);
 bool is_cri(int64_t device_index);
 
 bool is_jgs(int64_t device_index);
+
+void exponential_2d_(
+    torch::Tensor& tensor,
+    torch::Tensor& seeds,  // should on CPU
+    const double lambda);
+
+void topk_topp_sampler(
+    torch::Tensor& random_sampled,
+    const std::optional<torch::Tensor>& logits_to_return,
+    torch::Tensor& logits,
+    const std::optional<torch::Tensor>& k,
+    const std::optional<torch::Tensor>& p,
+    const std::string& logprobs_mode,
+    torch::Tensor& seeds,  // should on CPU
+    const double lambda);
