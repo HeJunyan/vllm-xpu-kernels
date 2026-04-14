@@ -23,12 +23,9 @@ def _causal_conv1d_kernel(
     dim,
     stride_xb,
     stride_xs,
-    stride_xd,
     stride_wk,
-    stride_wd,
     stride_ob,
     stride_os,
-    stride_od,
     HAS_BIAS: tl.constexpr,
     BLOCK_D: tl.constexpr,
     KERNEL_SIZE: tl.constexpr,
@@ -47,6 +44,11 @@ def _causal_conv1d_kernel(
         output[b, s, d] = sum_{k=0}^{K-1} x_padded[b, s+k, d] * weight[k, d]
     where x_padded is x left-padded with K-1 zeros along the sequence axis,
     so x_padded[b, i, d] = x[b, i-(K-1), d] for i >= K-1, else 0.
+
+    Uses device-side tl.make_tensor_descriptor (3-D for X/O, 2-D for W/B) to
+    leverage hardware-optimised block-IO and automatic out-of-bounds masking.
+    The last stride of every descriptor is the literal 1 (contiguous) so the
+    Intel XPU backend can generate optimal 2D block-load/store instructions.
     """
     # axis=0: channel-tile index — fastest-changing on XPU, preserves cache
     # locality because adjacent work-groups access contiguous channel slices.
@@ -58,42 +60,70 @@ def _causal_conv1d_kernel(
     s = pid_bs % seq_len
 
     d_start = pid_d * BLOCK_D
-    d_offsets = d_start + tl.arange(0, BLOCK_D)
-    d_mask = d_offsets < dim
+
+    # Device-side tensor descriptors — created inside the kernel so the
+    # Intel XPU backend can lower them to hardware block-IO instructions.
+    # X and O are 3-D (bs, seq_len, dim); W is 2-D (KERNEL_SIZE, dim).
+    # The last stride is the literal 1 (contiguous) for best performance.
+    x_desc = tl.make_tensor_descriptor(
+        base=X_ptr,
+        shape=(bs, seq_len, dim),
+        strides=(stride_xb, stride_xs, 1),
+        block_shape=(1, 1, BLOCK_D),
+    )
+    w_desc = tl.make_tensor_descriptor(
+        base=W_ptr,
+        shape=(KERNEL_SIZE, dim),
+        strides=(stride_wk, 1),
+        block_shape=(1, BLOCK_D),
+    )
+    o_desc = tl.make_tensor_descriptor(
+        base=O_ptr,
+        shape=(bs, seq_len, dim),
+        strides=(stride_ob, stride_os, 1),
+        block_shape=(1, 1, BLOCK_D),
+    )
 
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    zeros_block = tl.zeros([BLOCK_D], dtype=tl.float32)
 
     for k in tl.static_range(KERNEL_SIZE):
         # Index into the original (un-padded) x tensor.
         # x_padded[b, s+k, d] == x[b, s+k-(K-1), d]  when s+k-(K-1) >= 0
         x_s = s + k - (KERNEL_SIZE - 1)
 
-        # Use tl.maximum to avoid negative pointer offsets while relying on
-        # the validity mask to suppress the load when x_s < 0.
+        # Use tl.maximum to keep the load offset non-negative; use tl.where
+        # to zero out the result when the position is before the sequence start.
         valid = x_s >= 0
         safe_x_s = tl.maximum(x_s, 0)
 
-        x_vals = tl.load(
-            X_ptr + b * stride_xb + safe_x_s * stride_xs +
-            d_offsets * stride_xd,
-            mask=valid & d_mask,
-            other=0.0,
-        )
-        w_vals = tl.load(
-            W_ptr + k * stride_wk + d_offsets * stride_wd,
-            mask=d_mask,
-        )
+        # x_desc loads a (1, 1, BLOCK_D) block; reshape to 1-D for arithmetic.
+        # Out-of-bounds channel elements (d >= dim) are automatically zeroed by
+        # the descriptor; the causal padding zeros are applied via tl.where.
+        x_vals = tl.reshape(x_desc.load([b, safe_x_s, d_start]), [BLOCK_D])
+        x_vals = tl.where(valid, x_vals, zeros_block)
+
+        # w_desc loads a (1, BLOCK_D) block; reshape to 1-D.
+        w_vals = tl.reshape(w_desc.load([k, d_start]), [BLOCK_D])
+
         acc += x_vals * w_vals
 
     if HAS_BIAS:
-        b_vals = tl.load(B_ptr + d_offsets, mask=d_mask)
+        # Bias is 1-D (dim,); describe it as 2-D (1, dim) so the last stride
+        # is 1 and the descriptor can use the same optimised block-IO path.
+        b_desc = tl.make_tensor_descriptor(
+            base=B_ptr,
+            shape=(1, dim),
+            # Bias is 1-D with stride 1; viewed as (1, dim) the row-stride is
+            # irrelevant (only row 0 is ever accessed), so use 1 for clarity.
+            strides=(1, 1),
+            block_shape=(1, BLOCK_D),
+        )
+        b_vals = tl.reshape(b_desc.load([0, d_start]), [BLOCK_D])
         acc += b_vals
 
-    tl.store(
-        O_ptr + b * stride_ob + s * stride_os + d_offsets * stride_od,
-        acc.to(O_ptr.dtype.element_ty),
-        mask=d_mask,
-    )
+    # Reshape accumulator to (1, 1, BLOCK_D) to match o_desc's block_shape.
+    o_desc.store([b, s, d_start], tl.reshape(acc.to(O_ptr.dtype.element_ty), [1, 1, BLOCK_D]))
 
 
 def casual_conv1d(
@@ -163,12 +193,9 @@ def casual_conv1d(
         dim,
         x.stride(0),
         x.stride(1),
-        x.stride(2),
         weight.stride(0),
-        weight.stride(1),
         output.stride(0),
         output.stride(1),
-        output.stride(2),
         HAS_BIAS=bias is not None,
         KERNEL_SIZE=kernel_size,
         BLOCK_D=1024,
