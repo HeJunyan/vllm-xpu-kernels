@@ -7,6 +7,7 @@
 #endif
 #ifdef VLLM_XPU_ENABLE_XE3
   #include "csrc/xpu/attn/xe_3/fmha_xe3.h"
+  #include "csrc/xpu/attn/xe_3/paged_decode_xe3.h"
 #endif
 #ifdef VLLM_XPU_ENABLE_XE4
   #include "csrc/xpu/attn/xe_4/fmha_xe4.h"
@@ -182,7 +183,39 @@ void cutlass_paged_decode_interface(
 #else
     TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
 #endif
-  } else {
+  }
+#ifdef VLLM_XPU_ENABLE_XE3
+  else if (vllm::xpu::is_xe3p_arch()) {
+    // Use XE3 cutlass kernel for XE3P (CRI simulator)
+    cutlass_paged_decode_xe3(
+        queue,
+        query,
+        key_cache,
+        value_cache,
+        out,
+        temp_out,
+        exp_sums,
+        max_logits,
+        block_table,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        k_scale,
+        v_scale,
+        sm_scale,
+        sm_sink_,
+        window_size_left,
+        window_size_right,
+        is_varlen,
+        is_paged,
+        is_causal,
+        is_local,
+        is_sink,
+        num_kv_splits);
+  }
+#endif
+  else {
     TORCH_CHECK(false, "Only XE2/XE3 cutlass kernel is supported currently.");
   }
 }
