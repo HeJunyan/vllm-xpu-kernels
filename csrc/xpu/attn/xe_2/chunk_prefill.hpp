@@ -16,6 +16,10 @@
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
+#ifndef VLLM_GRF_SIZE
+#define VLLM_GRF_SIZE 256
+#endif
+
 #include "collective/chunk_prefill_scheduler.hpp"
 #include "collective/chunk_prefill_epilogue.hpp"
 #include "kernel/chunk_prefill_kernel.hpp"
@@ -194,7 +198,7 @@ struct KernelLauncher {
         syclex::work_group_scratch_size(smem_size),
     };
     compat::experimental::kernel_properties kernel_props{
-        syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
+        syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<VLLM_GRF_SIZE>};
     compat::experimental::launch_policy policy{
         sycl_grid, sycl_block, launch_props, kernel_props};
     auto event =

@@ -584,6 +584,7 @@ function(add_xe2_kernel_library LIBRARY_NAME)
                          PRIVATE ${SYCL_TLA_KERNELS_COMPILE_FLAGS} -fPIC)
   target_compile_definitions(${LIBRARY_NAME} PRIVATE -DVLLM_XPU_ENABLE_XE2)
   target_compile_definitions(${LIBRARY_NAME} PRIVATE -DSYCL_INTEL_TARGET=20)
+  target_compile_definitions(${LIBRARY_NAME} PRIVATE -DVLLM_GRF_SIZE=256)
   target_include_directories(${LIBRARY_NAME} PRIVATE ${SYCL_TLA_INCLUDE_DIRS})
 
   # Link torch libraries
@@ -657,6 +658,7 @@ function(add_xe3_kernel_library LIBRARY_NAME)
     PRIVATE ${SYCL_TLA_KERNELS_COMPILE_FLAGS} -fPIC -Wno-c++20-extensions
             -Wno-intel-compat -Wno-pragma-once-outside-header)
   target_compile_definitions(${LIBRARY_NAME} PRIVATE -DSYCL_INTEL_TARGET=35)
+  target_compile_definitions(${LIBRARY_NAME} PRIVATE -DVLLM_GRF_SIZE=512)
   target_include_directories(${LIBRARY_NAME} PRIVATE ${SYCL_TLA_INCLUDE_DIRS})
 
   # Link torch libraries
@@ -676,7 +678,7 @@ function(add_xe3_kernel_library LIBRARY_NAME)
   set(XE3_GPU_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
   list(
     APPEND XE3_GPU_LINK_FLAGS -Xsycl-target-backend=spir64_gen
-    "-device ${XE3_AOT_DEVICES} -internal_options -cl-intel-256-GRF-per-thread")
+    "-device ${XE3_AOT_DEVICES} -internal_options -cl-intel-512-GRF-per-thread")
   target_link_options(${LIBRARY_NAME} PRIVATE ${XE3_GPU_LINK_FLAGS})
 endfunction()
 
