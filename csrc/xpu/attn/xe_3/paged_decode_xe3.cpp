@@ -167,6 +167,7 @@ void cutlass_paged_decode_impl(
       is_causal,
       is_local,
       is_sink,
+      false, // is_interleaved_kv_cache
       num_kv_splits,
       // KV cache strides
       key_cache.stride(0),
