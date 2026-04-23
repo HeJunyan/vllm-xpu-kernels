@@ -19,6 +19,10 @@ To add a new profile:
 """
 import torch
 
+M_NUM_TOKENS_CONFIG_1 = 1
+M_NUM_TOKENS_CONFIG_2 = 128
+M_NUM_TOKENS_CONFIG_3 = 1024
+
 # ---------------------------------------------------------------------------
 # Llama-family models (Llama-3-70B, CodeLlama, etc.)
 #   - SiluAndMul activation, RMSNorm, Rotary Embedding, attention with 64 heads
@@ -29,9 +33,13 @@ import torch
 # ---------------------------------------------------------------------------
 LLAMA3_HEAD_SIZE = 128
 LLAMA3_NUM_HEADS = 64
-LLAMA3_HIDDEN_SIZE = LLAMA3_HEAD_SIZE * LLAMA3_NUM_HEADS
-LLAMA3_INTERMEDIATE_SIZE = 28672
 LLAMA3_NUM_KV_HEADS = 8
+LLAMA3_HIDDEN_SIZE = LLAMA3_HEAD_SIZE * LLAMA3_NUM_HEADS  # 8192
+LLAMA3_QKV_SIZE = (
+    LLAMA3_HEAD_SIZE *
+    (LLAMA3_NUM_KV_HEADS * 2 + LLAMA3_NUM_HEADS)  # 128 * (8*2 + 64) = 10240
+)
+LLAMA3_INTERMEDIATE_SIZE = 28672
 _LLAMA3_PROFILE = {
     "tests/test_activation.py": {
         "test_act_and_mul": {
@@ -65,25 +73,27 @@ _LLAMA3_PROFILE = {
         },
     },
     "tests/test_fp8_quant.py": {
-        "test_dynamic_per_tensor_fp8_quant": {
-            "num_tokens": [1, 128],
-            "hidden_size": [LLAMA3_HIDDEN_SIZE],
-        },
-        "test_dynamic_per_token_fp8_quant": {
+        "test_per_block_mxfp8_quant": {
             "num_tokens": [1, 128],
             "hidden_size": [LLAMA3_HIDDEN_SIZE],
         },
     },
     "tests/test_fp8_gemm_onednn.py": {
-        "test_fp8_gemm_per_tensor": {
-            "mnk_factors":
-            [(1, LLAMA3_HIDDEN_SIZE, LLAMA3_INTERMEDIATE_SIZE),
-             (128, LLAMA3_HIDDEN_SIZE, LLAMA3_INTERMEDIATE_SIZE)],
-        },
-        "test_fp8_gemm_per_channel": {
-            "mnk_factors":
-            [(1, LLAMA3_HIDDEN_SIZE, LLAMA3_INTERMEDIATE_SIZE),
-             (128, LLAMA3_HIDDEN_SIZE, LLAMA3_INTERMEDIATE_SIZE)],
+        "test_mxfp8_gemm": {
+            "mnk_factors": [
+                # gate_up_proj
+                (1, LLAMA3_HIDDEN_SIZE, 2 * LLAMA3_INTERMEDIATE_SIZE),
+                (128, LLAMA3_HIDDEN_SIZE, 2 * LLAMA3_INTERMEDIATE_SIZE),
+                # down_proj
+                (1, LLAMA3_INTERMEDIATE_SIZE, LLAMA3_HIDDEN_SIZE),
+                (128, LLAMA3_INTERMEDIATE_SIZE, LLAMA3_HIDDEN_SIZE),
+                # output_proj
+                (1, LLAMA3_HIDDEN_SIZE, LLAMA3_HIDDEN_SIZE),
+                (128, LLAMA3_HIDDEN_SIZE, LLAMA3_HIDDEN_SIZE),
+                # qkv_proj
+                (1, LLAMA3_QKV_SIZE, LLAMA3_HIDDEN_SIZE),
+                (128, LLAMA3_QKV_SIZE, LLAMA3_HIDDEN_SIZE),
+            ],
         },
     },
     "tests/flash_attn/test_flash_attn_varlen_func.py": {
@@ -150,24 +160,24 @@ _LLAMA4_PROFILE = {
     },
     # ---- TopK routing: softmax, top-1, 16 experts, use torch.topk, ignore ----
     # ---- Fused MoE: 16 experts, top-1 ----
-    "tests/fused_moe/test_fused_moe.py": {
+    "tests/fused_moe/test_fused_moe_xe3.py": {
         "test_fused_moe": {
             "m,n,k": [(1, LLAMA4_INTERMEDIATE_SIZE, LLAMA4_HIDDEN_SIZE),
                       (128, LLAMA4_INTERMEDIATE_SIZE, LLAMA4_HIDDEN_SIZE)],
             "e": [LLAMA4_NUM_EXPERTS],
             "topk": [LLAMA4_TOPK],
-            "dtype": [torch.bfloat16],  #FIXME: add low precision
+            "dtype": [torch.bfloat16],  # FIXME: add low precision
             "has_bias": [True, False],
         },
     },
     # ---- Grouped GEMM: 16 experts, top-1 ----
-    "tests/fused_moe/test_grouped_gemm.py": {
+    "tests/fused_moe/test_grouped_gemm_xe3.py": {
         "test_grouped_gemm": {
             "m,n,k": [(1, LLAMA4_INTERMEDIATE_SIZE, LLAMA4_HIDDEN_SIZE),
                       (128, LLAMA4_INTERMEDIATE_SIZE, LLAMA4_HIDDEN_SIZE)],
             "e": [LLAMA4_NUM_EXPERTS],
             "topk": [LLAMA4_TOPK],
-            "dtype": [torch.bfloat16],  #FIXME: add low precision
+            "dtype": [torch.bfloat16],  # FIXME: add low precision
             "has_bias": [True, False],
         },
     },
@@ -330,7 +340,7 @@ _DEEPSEEK_PROFILE = {
             "scoring_func": ["softmax"],
         },
     },
-    "tests/fused_moe/test_fused_moe.py": {
+    "tests/fused_moe/test_fused_moe_xe3.py": {
         "test_fused_moe": {
             "m,n,k": [(1, 5120, 7168), (128, 5120, 7168)],
             "e": [256],
@@ -339,7 +349,7 @@ _DEEPSEEK_PROFILE = {
             "has_bias": [True],
         },
     },
-    "tests/fused_moe/test_grouped_gemm.py": {
+    "tests/fused_moe/test_grouped_gemm_xe3.py": {
         "test_grouped_gemm": {
             "m,n,k": [(1, 5120, 7168), (128, 5120, 7168)],
             "e": [256],
@@ -381,13 +391,9 @@ _DEEPSEEK_PROFILE = {
         },
     },
     "tests/test_fp8_quant.py": {
-        "test_dynamic_per_token_fp8_quant": {
+        "test_per_block_mxfp8_quant": {
             "num_tokens": [1, 128],
-            "hidden_size": [7168],
-        },
-        "test_per_block_fp8_quant": {
-            "num_tokens_block_quant": [1, 128],
-            "hidden_size_block_quant": [7168],
+            "hidden_size": [LLAMA3_HIDDEN_SIZE],
         },
     },
     "tests/test_swigluoai_and_mul.py": {
@@ -409,10 +415,15 @@ _DEEPSEEK_PROFILE = {
 # ---------------------------------------------------------------------------
 QWEN3_30B_HEAD_DIM = 128
 QWEN3_30B_NUM_HEADS = 32
+QWEN3_30B_NUM_KV_HEADS = 4
+# 128 * (4*2 + 32) = 5120
+QWEN3_30B_QKV_SIZE = (
+    QWEN3_30B_HEAD_DIM *
+    (QWEN3_30B_NUM_KV_HEADS * 2 + QWEN3_30B_NUM_HEADS)
+)
 QWEN3_30B_HIDDEN_SIZE = 2048
 QWEN3_30B_INTERMEDIATE_SIZE = 6144        # dense FFN intermediate
 QWEN3_30B_MOE_INTERMEDIATE_SIZE = 768     # per-expert FFN intermediate
-QWEN3_30B_NUM_KV_HEADS = 4
 QWEN3_30B_NUM_EXPERTS = 128
 QWEN3_30B_TOPK = 8
 _QWEN3_30B_A3B_PROFILE = {
@@ -459,10 +470,42 @@ _QWEN3_30B_A3B_PROFILE = {
             "n_token": [1, 128, 2048],
         },
     },
+    "tests/test_fp8_gemm_onednn.py": {
+        "test_mxfp8_gemm": {
+            "mnk_factors": [
+                # qkv_proj
+                (1, QWEN3_30B_QKV_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                (128, QWEN3_30B_QKV_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                # out_proj
+                (
+                    1,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    QWEN3_30B_HEAD_DIM * QWEN3_30B_NUM_HEADS,
+                ),
+                (
+                    128,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    QWEN3_30B_HEAD_DIM * QWEN3_30B_NUM_HEADS,
+                ),
+            ],
+        },
+    },
     # ---- Fused MoE: 128 experts, top-8 ----
-    "tests/fused_moe/test_fused_moe.py": {
+    "tests/fused_moe/test_fused_moe_xe3.py": {
         "test_fused_moe": {
             "m,n,k": [
+                # gate_up_proj
+                (
+                    1,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                ),
+                (
+                    128,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                ),
+                # down_proj
                 (1, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
                 (128, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
             ],
@@ -470,12 +513,25 @@ _QWEN3_30B_A3B_PROFILE = {
             "topk": [QWEN3_30B_TOPK],
             "dtype": [torch.bfloat16],
             "has_bias": [True, False],
+            "recipe": ["mxfp8", "bf16"],
         },
     },
     # ---- Grouped GEMM: 128 experts, top-8 ----
-    "tests/fused_moe/test_grouped_gemm.py": {
+    "tests/fused_moe/test_grouped_gemm_xe3.py": {
         "test_grouped_gemm": {
             "m,n,k": [
+                # gate_up_proj
+                (
+                    1,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                ),
+                (
+                    128,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                ),
+                # down_proj
                 (1, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
                 (128, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
             ],
@@ -483,6 +539,30 @@ _QWEN3_30B_A3B_PROFILE = {
             "topk": [QWEN3_30B_TOPK],
             "dtype": [torch.bfloat16],
             "has_bias": [True, False],
+            "recipe": ["bf16"],
+        },
+        "test_grouped_gemm_mxfp": {
+            "m,n,k": [
+                # gate_up_proj
+                (
+                    1,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                ),
+                (
+                    128,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                ),
+                # down_proj
+                (1, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                (128, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
+            ],
+            "e": [QWEN3_30B_NUM_EXPERTS],
+            "topk": [QWEN3_30B_TOPK],
+            "dtype": [torch.bfloat16],
+            "has_bias": [True, False],
+            "recipe": ["mxfp8"],
         },
     },
     # ---- MoE prologue ----
@@ -560,28 +640,9 @@ _QWEN3_30B_A3B_PROFILE = {
     },
     # ---- FP8 quantization ----
     "tests/test_fp8_quant.py": {
-        "test_dynamic_per_tensor_fp8_quant": {
+        "test_per_block_mxfp8_quant": {
             "num_tokens": [1, 128],
-            "hidden_size": [QWEN3_30B_HIDDEN_SIZE],
-        },
-        "test_dynamic_per_token_fp8_quant": {
-            "num_tokens": [1, 128],
-            "hidden_size": [QWEN3_30B_HIDDEN_SIZE],
-        },
-    },
-    # ---- FP8 GEMM ----
-    "tests/test_fp8_gemm_onednn.py": {
-        "test_fp8_gemm_per_tensor": {
-            "mnk_factors": [
-                (1, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
-                (128, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
-            ],
-        },
-        "test_fp8_gemm_per_channel": {
-            "mnk_factors": [
-                (1, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
-                (128, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
-            ],
+            "hidden_size": [LLAMA3_HIDDEN_SIZE],
         },
     },
 }
@@ -596,10 +657,15 @@ _QWEN3_30B_A3B_PROFILE = {
 # ---------------------------------------------------------------------------
 QWEN3_235B_HEAD_DIM = 128
 QWEN3_235B_NUM_HEADS = 64
+QWEN3_235B_NUM_KV_HEADS = 4
+# 128 * (4*2 + 64) = 9216
+QWEN3_235B_QKV_SIZE = (
+    QWEN3_235B_HEAD_DIM *
+    (QWEN3_235B_NUM_KV_HEADS * 2 + QWEN3_235B_NUM_HEADS)
+)
 QWEN3_235B_HIDDEN_SIZE = 4096
 QWEN3_235B_INTERMEDIATE_SIZE = 12288      # dense FFN intermediate
 QWEN3_235B_MOE_INTERMEDIATE_SIZE = 1536   # per-expert FFN intermediate
-QWEN3_235B_NUM_KV_HEADS = 4
 QWEN3_235B_NUM_EXPERTS = 128
 QWEN3_235B_TOPK = 8
 _QWEN3_235B_A22B_PROFILE = {
@@ -646,32 +712,98 @@ _QWEN3_235B_A22B_PROFILE = {
             "n_token": [1, 128, 2048],
         },
     },
+    "tests/test_fp4_gemm_onednn.py": {
+        "test_mxfp4_gemm": {
+            "mnk_factors": [
+                # qkv_proj
+                (1, QWEN3_235B_QKV_SIZE, QWEN3_235B_HIDDEN_SIZE),
+                (128, QWEN3_235B_QKV_SIZE, QWEN3_235B_HIDDEN_SIZE),
+                # out_proj
+                (
+                    1,
+                    QWEN3_235B_HIDDEN_SIZE,
+                    QWEN3_235B_HEAD_DIM * QWEN3_235B_NUM_HEADS,
+                ),
+                (
+                    128,
+                    QWEN3_235B_HIDDEN_SIZE,
+                    QWEN3_235B_HEAD_DIM * QWEN3_235B_NUM_HEADS,
+                ),
+            ],
+        },
+    },
     # ---- Fused MoE: 128 experts, top-8 ----
-    "tests/fused_moe/test_fused_moe.py": {
+    "tests/fused_moe/test_fused_moe_xe3.py": {
         "test_fused_moe": {
             "m,n,k": [
+                # gate_up_proj
+                (
+                    1,
+                    QWEN3_235B_HIDDEN_SIZE,
+                    2 * QWEN3_235B_MOE_INTERMEDIATE_SIZE,
+                ),
+                (
+                    128,
+                    QWEN3_235B_HIDDEN_SIZE,
+                    2 * QWEN3_235B_MOE_INTERMEDIATE_SIZE,
+                ),
+                # down_proj
                 (1, QWEN3_235B_MOE_INTERMEDIATE_SIZE, QWEN3_235B_HIDDEN_SIZE),
-                (128, QWEN3_235B_MOE_INTERMEDIATE_SIZE,
-                 QWEN3_235B_HIDDEN_SIZE),
+                (128, QWEN3_235B_MOE_INTERMEDIATE_SIZE, QWEN3_235B_HIDDEN_SIZE),
+            ],
+            "e": [QWEN3_235B_NUM_EXPERTS],
+            "topk": [QWEN3_235B_TOPK],
+            "dtype": [torch.bfloat16],
+            "has_bias": [True, False],
+            "recipe": ["mxfp4", "bf16"],
+        },
+    },
+    # ---- Grouped GEMM: 128 experts, top-8 ----
+    "tests/fused_moe/test_grouped_gemm_xe3.py": {
+        "test_grouped_gemm": { #bf16
+            "m,n,k": [
+                # gate_up_proj
+                (
+                    1,
+                    QWEN3_235B_HIDDEN_SIZE,
+                    2 * QWEN3_235B_MOE_INTERMEDIATE_SIZE,
+                ),
+                (
+                    128,
+                    QWEN3_235B_HIDDEN_SIZE,
+                    2 * QWEN3_235B_MOE_INTERMEDIATE_SIZE,
+                ),
+                # down_proj
+                (1, QWEN3_235B_MOE_INTERMEDIATE_SIZE, QWEN3_235B_HIDDEN_SIZE),
+                (128, QWEN3_235B_MOE_INTERMEDIATE_SIZE, QWEN3_235B_HIDDEN_SIZE),
             ],
             "e": [QWEN3_235B_NUM_EXPERTS],
             "topk": [QWEN3_235B_TOPK],
             "dtype": [torch.bfloat16],
             "has_bias": [True, False],
         },
-    },
-    # ---- Grouped GEMM: 128 experts, top-8 ----
-    "tests/fused_moe/test_grouped_gemm.py": {
-        "test_grouped_gemm": {
+        "test_grouped_gemm_mxfp": { # mxfp4
             "m,n,k": [
+                # gate_up_proj
+                (
+                    1,
+                    QWEN3_235B_HIDDEN_SIZE,
+                    2 * QWEN3_235B_MOE_INTERMEDIATE_SIZE,
+                ),
+                (
+                    128,
+                    QWEN3_235B_HIDDEN_SIZE,
+                    2 * QWEN3_235B_MOE_INTERMEDIATE_SIZE,
+                ),
+                # down_proj
                 (1, QWEN3_235B_MOE_INTERMEDIATE_SIZE, QWEN3_235B_HIDDEN_SIZE),
-                (128, QWEN3_235B_MOE_INTERMEDIATE_SIZE,
-                 QWEN3_235B_HIDDEN_SIZE),
+                (128, QWEN3_235B_MOE_INTERMEDIATE_SIZE, QWEN3_235B_HIDDEN_SIZE),
             ],
             "e": [QWEN3_235B_NUM_EXPERTS],
             "topk": [QWEN3_235B_TOPK],
             "dtype": [torch.bfloat16],
             "has_bias": [True, False],
+            "recipe": ["mxfp4"],
         },
     },
     # ---- MoE prologue ----
@@ -746,34 +878,6 @@ _QWEN3_235B_A22B_PROFILE = {
             "num_query_heads": [QWEN3_235B_NUM_HEADS],
             "head_size": [QWEN3_235B_HEAD_DIM],
             "output_dtype": [torch.bfloat16],
-        },
-    },
-    # ---- FP8 quantization ----
-    "tests/test_fp8_quant.py": {
-        "test_dynamic_per_tensor_fp8_quant": {
-            "num_tokens": [1, 128],
-            "hidden_size": [QWEN3_235B_HIDDEN_SIZE],
-        },
-        "test_dynamic_per_token_fp8_quant": {
-            "num_tokens": [1, 128],
-            "hidden_size": [QWEN3_235B_HIDDEN_SIZE],
-        },
-    },
-    # ---- FP8 GEMM ----
-    "tests/test_fp8_gemm_onednn.py": {
-        "test_fp8_gemm_per_tensor": {
-            "mnk_factors": [
-                (1, QWEN3_235B_HIDDEN_SIZE, QWEN3_235B_MOE_INTERMEDIATE_SIZE),
-                (128, QWEN3_235B_HIDDEN_SIZE,
-                 QWEN3_235B_MOE_INTERMEDIATE_SIZE),
-            ],
-        },
-        "test_fp8_gemm_per_channel": {
-            "mnk_factors": [
-                (1, QWEN3_235B_HIDDEN_SIZE, QWEN3_235B_MOE_INTERMEDIATE_SIZE),
-                (128, QWEN3_235B_HIDDEN_SIZE,
-                 QWEN3_235B_MOE_INTERMEDIATE_SIZE),
-            ],
         },
     },
 }
