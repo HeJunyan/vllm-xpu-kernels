@@ -6,6 +6,7 @@ import torch
 
 import vllm_xpu_kernels._xpu_C  # noqa: F401
 from tests.fused_moe.test_grouped_gemm_xe3 import (data_to_mx_scale,
+                                                   bfloat16_to_fp4_e2m1fn_x2,
                                                    fp4_e2m1fn_x2_to_float,
                                                    hp_from_1x128,
                                                    hp_from_128x128)
@@ -90,10 +91,15 @@ def quant_mxfp_weight(w, recipe):
         w = (w.to(torch.bfloat16).reshape(-1, BLOCK_SIZE) /
              w_scales.reshape(-1, 1).bfloat16()).reshape(orig_shape)
         w = w.clamp(min=min_val, max=max_val)
-        from torch.testing._internal.common_quantized import (
-            _bfloat16_to_float4_e2m1fn_x2)
-        w = _bfloat16_to_float4_e2m1fn_x2(w)
+        w = bfloat16_to_fp4_e2m1fn_x2(w)
     return w, w_scales
+
+
+def to_kernel_weight_layout(recipe, w13, w2):
+    # XE3 grouped GEMM expects non-MXFP4 weights in [E, K, N] layout.
+    if recipe == "mxfp4":
+        return w13, w2
+    return w13.transpose(-1, -2).contiguous(), w2.transpose(-1, -2).contiguous()
 
 
 def ref_fused_moe(recipe,
@@ -229,6 +235,7 @@ def ref_fused_moe(recipe,
 def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
     if topk > e:
         pytest.skip(f"topk={topk} > num_experts={e}")
+
     if recipe in ["mxfp8", "mxfp4"] and m < 256:
         pytest.skip("MXFP requires m>=256 on CRI simulator (BLK_M=256)")
     seed_everything(7)
@@ -309,12 +316,13 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
     ref_out = ref_fused_moe(recipe, hidden_states, w13, w13_scales, w13_bias,
                             w2, w2_scales, w2_bias, expert_scores,
                             expert_indices, topk, "silu", e)
+    kernel_w13, kernel_w2 = to_kernel_weight_layout(recipe, w13, w2)
 
     output = xpu_fused_moe(hidden_states=hidden_states,
-                           w13=w13,
+                           w13=kernel_w13,
                            w13_scales=w13_scales,
                            w13_bias=w13_bias,
-                           w2=w2,
+                           w2=kernel_w2,
                            w2_scales=w2_scales,
                            w2_bias=w2_bias,
                            topk_weights=expert_scores,

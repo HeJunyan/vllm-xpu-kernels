@@ -153,7 +153,10 @@ def quant_fp8_act(x: torch.Tensor):
 
 
 def quant_mxfp_act(x, recipe):
-    from tests.fused_moe.test_grouped_gemm_xe3 import data_to_mx_scale
+    from tests.fused_moe.test_grouped_gemm_xe3 import (
+        bfloat16_to_fp4_e2m1fn_x2,
+        data_to_mx_scale,
+    )
 
     # max value of `torch.float8_e4m3fn` (448)
     F8E4M3_MAX_VAL = torch.finfo(torch.float8_e4m3fn).max
@@ -178,9 +181,7 @@ def quant_mxfp_act(x, recipe):
         x = (x.to(torch.bfloat16).reshape(-1, 32) /
              x_scale.reshape(-1, 1).bfloat16()).reshape(ori_shape)
         x = x.clamp(min=min_val, max=max_val)
-        from torch.testing._internal.common_quantized import (
-            _bfloat16_to_float4_e2m1fn_x2)
-        x = _bfloat16_to_float4_e2m1fn_x2(x)
+        x = bfloat16_to_fp4_e2m1fn_x2(x)
     return x, x_scale
 
 
@@ -426,7 +427,7 @@ def xpu_fused_moe(hidden_states,
         ptr_bias=w2_bias,
         ptr_D=gemm2_output,
         expert_first_token_offset=expert_first_token_offset,
-        N=hidden_size,
+        N=ori_hidden_size,
         K=inter_size * inter_size_scale,
         num_experts=num_experts,
         is_B_int4=is_int4,

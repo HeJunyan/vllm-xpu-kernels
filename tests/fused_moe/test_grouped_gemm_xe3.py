@@ -5,6 +5,8 @@ import pytest
 import torch
 
 import vllm_xpu_kernels._xpu_C  # noqa: F401
+from tests.ops.mx_utils import (_bfloat16_to_float4_e2m1fn_x2,
+                                _floatx_unpacked_to_f32, unpack_uint4)
 from tests.utils import seed_everything
 from vllm_xpu_kernels.fused_moe_interface import cutlass_grouped_gemm
 
@@ -153,8 +155,6 @@ F8E8M0_EXP_BIAS = 127
 # exponent and mantissa bits of `torch.float4_e2m1fn_x2`
 FP4_EBITS, FP4_MBITS = 2, 1
 FP4_MAX_VAL = 6.0
-
-
 def data_to_mx_scale(x, block_size, recipe):
     # simple implementation of https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
     # section 6.3, not all edge cases (such as NaN) are handled/tested
@@ -180,32 +180,14 @@ def data_to_mx_scale(x, block_size, recipe):
 
 
 def fp4_e2m1fn_x2_to_float(t: torch.Tensor) -> torch.Tensor:
-    from torch.testing._internal.common_quantized import (
-        _floatx_unpacked_to_f32)
+    return _floatx_unpacked_to_f32(unpack_uint4(t.cpu()),
+                                   FP4_EBITS, FP4_MBITS).to(t.device)
 
-    def unpack_uint4(uint8_data) -> torch.Tensor:
-        # Take a packed uint8 tensor (i.e. nvfp4) and unpack into
-        # a tensor twice as wide. Useful for dequant operations.
-        shape = list(uint8_data.shape)
-        # 2x packed elements -> single non-packed => adjust shape
-        shape[-1] *= 2
-        out = torch.zeros(*shape, device=uint8_data.device,
-                          dtype=torch.uint8).view(-1)
 
-        uint8_data_as_uint8 = uint8_data.view(torch.uint8).view(-1)
-
-        out[1::2] = uint8_data_as_uint8[:] >> 4
-        out[::2] = uint8_data_as_uint8 & 15
-
-        return out.view(shape)
-
-    # _floatx_unpacked_to_f32 uses boolean indexed assignment
-    # (e.g. result[mask] = val) which triggers index_functor_kernel
-    # assertions on CRI simulator.  Run the conversion on CPU.
-    orig_device = t.device
-    t_float = _floatx_unpacked_to_f32(
-        unpack_uint4(t.cpu()), ebits=2, mbits=1)
-    return t_float.to(orig_device)
+def bfloat16_to_fp4_e2m1fn_x2(t: torch.Tensor) -> torch.Tensor:
+    assert t.dtype == torch.bfloat16
+    assert t.shape[-1] % 2 == 0
+    return _bfloat16_to_float4_e2m1fn_x2(t)
 
 
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
@@ -257,17 +239,15 @@ def test_grouped_gemm_mxfp(m, n, k, e, topk, recipe, has_bias):
         B_scale = B_scale.transpose(-1, -2).contiguous().transpose(-1, -2)
         max_val = FP4_MAX_VAL
         min_val = -1 * max_val
-        from torch.testing._internal.common_quantized import (
-            _bfloat16_to_float4_e2m1fn_x2)
         A = (A_ref.reshape(-1, BLOCK_SIZE) / A_scale.reshape(
             m * ceil_div(k, BLOCK_SIZE), 1).bfloat16()).reshape(m, k)
         A = A.clamp(min=min_val, max=max_val)
-        A = _bfloat16_to_float4_e2m1fn_x2(A)
+        A = bfloat16_to_fp4_e2m1fn_x2(A)
         B = (B_ref.reshape(-1, BLOCK_SIZE) / B_scale.reshape(
             num_experts * n * ceil_div(k, BLOCK_SIZE), 1).bfloat16()).reshape(
                 num_experts, n, k)
         B = B.clamp(min=min_val, max=max_val)
-        B = _bfloat16_to_float4_e2m1fn_x2(B)
+        B = bfloat16_to_fp4_e2m1fn_x2(B)
 
     if has_bias:
         bias = torch.randn((num_experts, n),
