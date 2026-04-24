@@ -98,7 +98,10 @@ _LLAMA3_PROFILE = {
     },
     "tests/flash_attn/test_flash_attn_varlen_func.py": {
         "test_varlen_with_paged_kv": {
-            "seq_lens": [[(1, 1)]],
+            "seq_lens": [
+                [(10, 10)] * 4,        # case1: input=10, bs=4 prefill
+                [(1024, 1024)] * 16,   # case2: input=1k, bs=16 prefill
+            ],
             "num_heads": [(LLAMA3_NUM_HEADS, LLAMA3_NUM_KV_HEADS)],
             "head_size": [LLAMA3_HEAD_SIZE],
             "num_blocks": [2048],
@@ -106,7 +109,10 @@ _LLAMA3_PROFILE = {
             "is_paged": [True],
         },
         "test_decode_with_paged_kv": {
-            "seq_lens": [[(1, 1)]],
+            "seq_lens": [
+                [(1, 42)] * 4,         # case1: input=10+output=32, bs=4
+                [(1, 2048)] * 16,      # case2: input=1k+output=1k, bs=16
+            ],
             "num_heads": [(LLAMA3_NUM_HEADS, LLAMA3_NUM_KV_HEADS)],
             "head_size": [LLAMA3_HEAD_SIZE],
             "num_blocks": [2048],
@@ -226,7 +232,10 @@ _LLAMA4_PROFILE = {
     # ---- Flash Attention: GQA 40q/8kv heads ----
     "tests/flash_attn/test_flash_attn_varlen_func.py": {
         "test_varlen_with_paged_kv": {
-            "seq_lens": [[(1, 1328), (5, 18), (129, 463)]],
+            "seq_lens": [
+                [(10, 10)] * 4,        # case1: input=10, bs=4 prefill
+                [(1024, 1024)] * 16,   # case2: input=1k, bs=16 prefill
+            ],
             "num_heads": [(LLAMA4_NUM_HEADS, LLAMA4_NUM_KV_HEADS)],
             "head_size": [LLAMA4_HEAD_SIZE],
             "num_blocks": [2048],
@@ -234,7 +243,10 @@ _LLAMA4_PROFILE = {
             "is_paged": [True],
         },
         "test_decode_with_paged_kv": {
-            "seq_lens": [[(1, 1025), (1, 523), (1, 37)]],
+            "seq_lens": [
+                [(1, 42)] * 4,         # case1: input=10+output=32, bs=4
+                [(1, 2048)] * 16,      # case2: input=1k+output=1k, bs=16
+            ],
             "num_heads": [(LLAMA4_NUM_HEADS, LLAMA4_NUM_KV_HEADS)],
             "head_size": [LLAMA4_HEAD_SIZE],
             "num_blocks": [2048],
@@ -368,13 +380,19 @@ _DEEPSEEK_PROFILE = {
     },
     "tests/flash_attn/test_flash_attn_varlen_func.py": {
         "test_decode_with_paged_kv_mla": {
-            "seq_lens": [[(1, 1025), (1, 523), (1, 37)]],
+            "seq_lens": [
+                [(1, 42)] * 4,         # case1: input=10+output=32, bs=4
+                [(1, 2048)] * 16,      # case2: input=1k+output=1k, bs=16
+            ],
             "num_heads": [(8, 1)],
             "head_size_kv": [(192, 128)],
             "num_blocks": [2048],
         },
         "test_varlen_with_paged_kv": {
-            "seq_lens": [[(1, 1328), (5, 18), (129, 463)]],
+            "seq_lens": [
+                [(10, 10)] * 4,        # case1: input=10, bs=4 prefill
+                [(1024, 1024)] * 16,   # case2: input=1k, bs=16 prefill
+            ],
             "num_heads": [(8, 1)],
             "head_size": [128],
             "num_blocks": [2048],
@@ -613,7 +631,10 @@ _QWEN3_30B_A3B_PROFILE = {
     # ---- Flash Attention: GQA 32q/4kv heads ----
     "tests/flash_attn/test_flash_attn_varlen_func.py": {
         "test_varlen_with_paged_kv": {
-            "seq_lens": [[(1, 1328), (5, 18), (129, 463)]],
+            "seq_lens": [
+                [(10, 10)] * 4,        # case1: input=10, bs=4 prefill
+                [(1024, 1024)] * 16,   # case2: input=1k, bs=16 prefill
+            ],
             "num_heads": [(QWEN3_30B_NUM_HEADS, QWEN3_30B_NUM_KV_HEADS)],
             "head_size": [QWEN3_30B_HEAD_DIM],
             "num_blocks": [2048],
@@ -621,7 +642,10 @@ _QWEN3_30B_A3B_PROFILE = {
             "is_paged": [True],
         },
         "test_decode_with_paged_kv": {
-            "seq_lens": [[(1, 1025), (1, 523), (1, 37)]],
+            "seq_lens": [
+                [(1, 42)] * 4,         # case1: input=10+output=32, bs=4
+                [(1, 2048)] * 16,      # case2: input=1k+output=1k, bs=16
+            ],
             "num_heads": [(QWEN3_30B_NUM_HEADS, QWEN3_30B_NUM_KV_HEADS)],
             "head_size": [QWEN3_30B_HEAD_DIM],
             "num_blocks": [2048],
@@ -855,7 +879,10 @@ _QWEN3_235B_A22B_PROFILE = {
     # ---- Flash Attention: GQA 64q/4kv heads ----
     "tests/flash_attn/test_flash_attn_varlen_func.py": {
         "test_varlen_with_paged_kv": {
-            "seq_lens": [[(1, 1328), (5, 18), (129, 463)]],
+            "seq_lens": [
+                [(10, 10)] * 4,        # case1: input=10, bs=4 prefill
+                [(1024, 1024)] * 16,   # case2: input=1k, bs=16 prefill
+            ],
             "num_heads": [(QWEN3_235B_NUM_HEADS, QWEN3_235B_NUM_KV_HEADS)],
             "head_size": [QWEN3_235B_HEAD_DIM],
             "num_blocks": [2048],
@@ -863,7 +890,10 @@ _QWEN3_235B_A22B_PROFILE = {
             "is_paged": [True],
         },
         "test_decode_with_paged_kv": {
-            "seq_lens": [[(1, 1025), (1, 523), (1, 37)]],
+            "seq_lens": [
+                [(1, 42)] * 4,         # case1: input=10+output=32, bs=4
+                [(1, 2048)] * 16,      # case2: input=1k+output=1k, bs=16
+            ],
             "num_heads": [(QWEN3_235B_NUM_HEADS, QWEN3_235B_NUM_KV_HEADS)],
             "head_size": [QWEN3_235B_HEAD_DIM],
             "num_blocks": [2048],
