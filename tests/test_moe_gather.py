@@ -30,7 +30,7 @@ MINI_PYTEST_PARAMS = {
 
 
 def ref_moe_gather(output, moe_output, topk_weights,
-                   unpermuted_row_to_permuted_row, expert_first_token_offset,
+                   unpermuted_row_to_permuted_row,
                    num_experts):
     input_len = output.shape[0]
     topk = topk_weights.shape[1]
@@ -84,8 +84,6 @@ def test_moe_gather(input_len, hidden_size, num_experts, topk, ep_rank,
                                        minlength=num_experts)
     expert_row_counts = expert_row_counts[expert_start_id:expert_end_id]
     expert_cumsum = torch.cumsum(expert_row_counts, dim=0)
-    expert_first_token_offset = torch.cat(
-        [torch.tensor([0], device=DEVICE), expert_cumsum])
 
     permuted_row_to_unpermuted_row = torch.randperm((input_len * topk),
                                                     dtype=torch.int32,
@@ -100,7 +98,6 @@ def test_moe_gather(input_len, hidden_size, num_experts, topk, ep_rank,
     torch.ops._moe_C.moe_gather(output_kernel, _to_kernel(moe_output),
                                 _to_kernel(expert_scores),
                                 _to_kernel(unpermuted_row_to_permuted_row),
-                                _to_kernel(expert_first_token_offset),
                                 num_experts_per_node)
     output = output_kernel.cpu()
 
@@ -108,6 +105,6 @@ def test_moe_gather(input_len, hidden_size, num_experts, topk, ep_rank,
                              device=DEVICE,
                              dtype=dtype)
     ref_moe_gather(ref_output, moe_output, expert_scores,
-                   unpermuted_row_to_permuted_row, expert_first_token_offset,
+                   unpermuted_row_to_permuted_row,
                    num_experts_per_node)
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=1e-2)
