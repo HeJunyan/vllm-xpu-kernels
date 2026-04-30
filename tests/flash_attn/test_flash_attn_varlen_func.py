@@ -196,7 +196,6 @@ def test_varlen_with_paged_kv(
     fp8_dtype: Optional[torch.dtype],
     stride_pad: int,
 ) -> None:
-    torch.set_default_device("xpu")
     torch.xpu.set_device("xpu:0")
     # # FIXME: remove skip
     if (is_casual and seq_lens[1][0]
@@ -305,44 +304,57 @@ def test_varlen_with_paged_kv(
         maybe_quantized_key_cache = (key_cache / k_descale).to(fp8_dtype)
         maybe_quantized_value_cache = (value_cache / v_descale).to(fp8_dtype)
 
+    q_xpu = maybe_quantized_query.to("xpu")
+    k_xpu = maybe_quantized_key_cache.to("xpu")
+    v_xpu = maybe_quantized_value_cache.to("xpu")
+    cu_query_lens_xpu = cu_query_lens.to("xpu")
+    cu_kv_lens_xpu = cu_kv_lens.to("xpu")
+    seq_k_xpu = seq_k.to("xpu")
+    block_tables_xpu = block_tables.to("xpu")
+    q_descale_xpu = q_descale.to("xpu") if q_descale is not None else None
+    k_descale_xpu = k_descale.to("xpu") if k_descale is not None else None
+    v_descale_xpu = v_descale.to("xpu") if v_descale is not None else None
+    sink_xpu = sink.to("xpu") if sink is not None else None
+
     if is_paged:
-        output = flash_attn_varlen_func(maybe_quantized_query,
-                                        maybe_quantized_key_cache,
-                                        maybe_quantized_value_cache,
+        output = flash_attn_varlen_func(q_xpu,
+                                        k_xpu,
+                                        v_xpu,
                                         max_query_len,
-                                        cu_query_lens,
+                                        cu_query_lens_xpu,
                                         max_kv_len,
-                                        seqused_k=seq_k,
-                                        q_descale=q_descale.expand(scale_shape)
-                                        if q_descale is not None else None,
-                                        k_descale=k_descale.expand(scale_shape)
-                                        if k_descale is not None else None,
-                                        v_descale=v_descale.expand(scale_shape)
-                                        if v_descale is not None else None,
+                                        seqused_k=seq_k_xpu,
+                                        q_descale=q_descale_xpu.expand(scale_shape)
+                                        if q_descale_xpu is not None else None,
+                                        k_descale=k_descale_xpu.expand(scale_shape)
+                                        if k_descale_xpu is not None else None,
+                                        v_descale=v_descale_xpu.expand(scale_shape)
+                                        if v_descale_xpu is not None else None,
                                         softmax_scale=scale,
                                         causal=is_casual,
-                                        block_table=block_tables,
+                                        block_table=block_tables_xpu,
                                         window_size=window_size,
-                                        s_aux=sink)
+                                        s_aux=sink_xpu)
     else:
-        output = flash_attn_varlen_func(maybe_quantized_query,
-                                        maybe_quantized_key_cache,
-                                        maybe_quantized_value_cache,
+        output = flash_attn_varlen_func(q_xpu,
+                                        k_xpu,
+                                        v_xpu,
                                         max_query_len,
-                                        cu_query_lens,
+                                        cu_query_lens_xpu,
                                         max_kv_len,
-                                        cu_seqlens_k=cu_kv_lens,
-                                        q_descale=q_descale.expand(scale_shape)
-                                        if q_descale is not None else None,
-                                        k_descale=k_descale.expand(scale_shape)
-                                        if k_descale is not None else None,
-                                        v_descale=v_descale.expand(scale_shape)
-                                        if v_descale is not None else None,
+                                        cu_seqlens_k=cu_kv_lens_xpu,
+                                        q_descale=q_descale_xpu.expand(scale_shape)
+                                        if q_descale_xpu is not None else None,
+                                        k_descale=k_descale_xpu.expand(scale_shape)
+                                        if k_descale_xpu is not None else None,
+                                        v_descale=v_descale_xpu.expand(scale_shape)
+                                        if v_descale_xpu is not None else None,
                                         softmax_scale=scale,
                                         causal=is_casual,
                                         block_table=None,
                                         window_size=window_size,
-                                        s_aux=sink)
+                                        s_aux=sink_xpu)
+    output = output.cpu()
 
     ref_output = ref_paged_attn(
         query=query.contiguous(),
