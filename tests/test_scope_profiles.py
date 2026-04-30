@@ -101,6 +101,16 @@ _LLAMA3_PROFILE = {
             "seq_lens": [
                 [(10, 10)] * 4,        # case1: input=10, bs=4 prefill
                 [(1024, 1024)] * 16,   # case2: input=1k, bs=16 prefill
+                # warmup (max_num_batched_tokens)
+                [(2048, 2048)],
+                [(8192, 8192)],
+                # chunked prefill
+                [(5, 5)],
+                [(8, 8)],
+                [(12, 12)],
+                [(16, 16)],
+                [(1024, 1024)],
+                [(4096, 4096)],
             ],
             "num_heads": [(LLAMA3_NUM_HEADS, LLAMA3_NUM_KV_HEADS)],
             "head_size": [LLAMA3_HEAD_SIZE],
@@ -112,6 +122,17 @@ _LLAMA3_PROFILE = {
             "seq_lens": [
                 [(1, 42)] * 4,         # case1: input=10+output=32, bs=4
                 [(1, 2048)] * 16,      # case2: input=1k+output=1k, bs=16
+                # decode context-length sweep (bs=16)
+                [(1, 1024)] * 16,
+                [(1, 2048)] * 16,
+                [(1, 3072)] * 16,
+                [(1, 4096)] * 16,
+                [(1, 5120)] * 16,
+                # decode batches (max_num_seqs=16, decreasing)
+                [(1, 5120)] * 1,
+                [(1, 5120)] * 2,
+                [(1, 5120)] * 4,
+                [(1, 5120)] * 8,
             ],
             "num_heads": [(LLAMA3_NUM_HEADS, LLAMA3_NUM_KV_HEADS)],
             "head_size": [LLAMA3_HEAD_SIZE],
@@ -235,6 +256,16 @@ _LLAMA4_PROFILE = {
             "seq_lens": [
                 [(10, 10)] * 4,        # case1: input=10, bs=4 prefill
                 [(1024, 1024)] * 16,   # case2: input=1k, bs=16 prefill
+                # warmup (max_num_batched_tokens)
+                [(2048, 2048)],
+                [(8192, 8192)],
+                # chunked prefill
+                [(5, 5)],
+                [(8, 8)],
+                [(12, 12)],
+                [(16, 16)],
+                [(1024, 1024)],
+                [(4096, 4096)],
             ],
             "num_heads": [(LLAMA4_NUM_HEADS, LLAMA4_NUM_KV_HEADS)],
             "head_size": [LLAMA4_HEAD_SIZE],
@@ -246,6 +277,17 @@ _LLAMA4_PROFILE = {
             "seq_lens": [
                 [(1, 42)] * 4,         # case1: input=10+output=32, bs=4
                 [(1, 2048)] * 16,      # case2: input=1k+output=1k, bs=16
+                # decode context-length sweep (bs=16)
+                [(1, 1024)] * 16,
+                [(1, 2048)] * 16,
+                [(1, 3072)] * 16,
+                [(1, 4096)] * 16,
+                [(1, 5120)] * 16,
+                # decode batches (max_num_seqs=16, decreasing)
+                [(1, 5120)] * 1,
+                [(1, 5120)] * 2,
+                [(1, 5120)] * 4,
+                [(1, 5120)] * 8,
             ],
             "num_heads": [(LLAMA4_NUM_HEADS, LLAMA4_NUM_KV_HEADS)],
             "head_size": [LLAMA4_HEAD_SIZE],
@@ -383,6 +425,17 @@ _DEEPSEEK_PROFILE = {
             "seq_lens": [
                 [(1, 42)] * 4,         # case1: input=10+output=32, bs=4
                 [(1, 2048)] * 16,      # case2: input=1k+output=1k, bs=16
+                # decode context-length sweep (bs=16)
+                [(1, 1024)] * 16,
+                [(1, 2048)] * 16,
+                [(1, 3072)] * 16,
+                [(1, 4096)] * 16,
+                [(1, 5120)] * 16,
+                # decode batches (max_num_seqs=16, decreasing)
+                [(1, 5120)] * 1,
+                [(1, 5120)] * 2,
+                [(1, 5120)] * 4,
+                [(1, 5120)] * 8,
             ],
             "num_heads": [(8, 1)],
             "head_size_kv": [(192, 128)],
@@ -392,6 +445,16 @@ _DEEPSEEK_PROFILE = {
             "seq_lens": [
                 [(10, 10)] * 4,        # case1: input=10, bs=4 prefill
                 [(1024, 1024)] * 16,   # case2: input=1k, bs=16 prefill
+                # warmup (max_num_batched_tokens)
+                [(2048, 2048)],
+                [(8192, 8192)],
+                # chunked prefill
+                [(5, 5)],
+                [(8, 8)],
+                [(12, 12)],
+                [(16, 16)],
+                [(1024, 1024)],
+                [(4096, 4096)],
             ],
             "num_heads": [(8, 1)],
             "head_size": [128],
@@ -634,6 +697,16 @@ _QWEN3_30B_A3B_PROFILE = {
             "seq_lens": [
                 [(10, 10)] * 4,        # case1: input=10, bs=4 prefill
                 [(1024, 1024)] * 16,   # case2: input=1k, bs=16 prefill
+                # warmup (max_num_batched_tokens)
+                [(2048, 2048)],
+                [(8192, 8192)],
+                # chunked prefill
+                [(5, 5)],
+                [(8, 8)],
+                [(12, 12)],
+                [(16, 16)],
+                [(1024, 1024)],
+                [(4096, 4096)],
             ],
             "num_heads": [(QWEN3_30B_NUM_HEADS, QWEN3_30B_NUM_KV_HEADS)],
             "head_size": [QWEN3_30B_HEAD_DIM],
@@ -645,6 +718,17 @@ _QWEN3_30B_A3B_PROFILE = {
             "seq_lens": [
                 [(1, 42)] * 4,         # case1: input=10+output=32, bs=4
                 [(1, 2048)] * 16,      # case2: input=1k+output=1k, bs=16
+                # decode context-length sweep (bs=16)
+                [(1, 1024)] * 16,
+                [(1, 2048)] * 16,
+                [(1, 3072)] * 16,
+                [(1, 4096)] * 16,
+                [(1, 5120)] * 16,
+                # decode batches (max_num_seqs=16, decreasing)
+                [(1, 5120)] * 1,
+                [(1, 5120)] * 2,
+                [(1, 5120)] * 4,
+                [(1, 5120)] * 8,
             ],
             "num_heads": [(QWEN3_30B_NUM_HEADS, QWEN3_30B_NUM_KV_HEADS)],
             "head_size": [QWEN3_30B_HEAD_DIM],
@@ -882,6 +966,16 @@ _QWEN3_235B_A22B_PROFILE = {
             "seq_lens": [
                 [(10, 10)] * 4,        # case1: input=10, bs=4 prefill
                 [(1024, 1024)] * 16,   # case2: input=1k, bs=16 prefill
+                # warmup (max_num_batched_tokens)
+                [(2048, 2048)],
+                [(8192, 8192)],
+                # chunked prefill
+                [(5, 5)],
+                [(8, 8)],
+                [(12, 12)],
+                [(16, 16)],
+                [(1024, 1024)],
+                [(4096, 4096)],
             ],
             "num_heads": [(QWEN3_235B_NUM_HEADS, QWEN3_235B_NUM_KV_HEADS)],
             "head_size": [QWEN3_235B_HEAD_DIM],
@@ -893,6 +987,17 @@ _QWEN3_235B_A22B_PROFILE = {
             "seq_lens": [
                 [(1, 42)] * 4,         # case1: input=10+output=32, bs=4
                 [(1, 2048)] * 16,      # case2: input=1k+output=1k, bs=16
+                # decode context-length sweep (bs=16)
+                [(1, 1024)] * 16,
+                [(1, 2048)] * 16,
+                [(1, 3072)] * 16,
+                [(1, 4096)] * 16,
+                [(1, 5120)] * 16,
+                # decode batches (max_num_seqs=16, decreasing)
+                [(1, 5120)] * 1,
+                [(1, 5120)] * 2,
+                [(1, 5120)] * 4,
+                [(1, 5120)] * 8,
             ],
             "num_heads": [(QWEN3_235B_NUM_HEADS, QWEN3_235B_NUM_KV_HEADS)],
             "head_size": [QWEN3_235B_HEAD_DIM],
