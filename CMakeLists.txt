@@ -55,10 +55,24 @@ option(VLLM_XPU_ENABLE_XE3 "Enable XE3 architecture kernels" OFF)
 option(VLLM_XPU_ENABLE_XE4 "Enable XE4 architecture kernels" OFF)
 option(VLLM_XPU_ENABLE_XE_DEFAULT "Enable XE Default architecture kernels" ON)
 
+set(BUILD_ON_NVL $ENV{BUILD_ON_NVL})
+message(STATUS "BUILD_ON_NVL: ${BUILD_ON_NVL}")
 set(BUILD_ON_SIMULATOR_CRI $ENV{BUILD_ON_SIMULATOR_CRI})
 message(STATUS "BUILD_ON_SIMULATOR_CRI: ${BUILD_ON_SIMULATOR_CRI}")
 set(BUILD_ON_SIMULATOR_JGS $ENV{BUILD_ON_SIMULATOR_JGS})
 message(STATUS "BUILD_ON_SIMULATOR_JGS: ${BUILD_ON_SIMULATOR_JGS}")
+if(BUILD_ON_NVL AND BUILD_ON_SIMULATOR_JGS)
+  message(
+    FATAL_ERROR
+      "Both BUILD_ON_NVL and BUILD_ON_SIMULATOR_JGS are set. Please set only one."
+  )
+endif()
+if(BUILD_ON_SIMULATOR_CRI AND BUILD_ON_NVL)
+  message(
+    FATAL_ERROR
+      "Both BUILD_ON_SIMULATOR_CRI and BUILD_ON_NVL are set. Please set only one."
+  )
+endif()
 if(BUILD_ON_SIMULATOR_CRI AND BUILD_ON_SIMULATOR_JGS)
   message(
     FATAL_ERROR
@@ -95,7 +109,7 @@ message(
 message(STATUS "  XPUMEM_ALLOCATOR_ENABLED     = ${XPUMEM_ALLOCATOR_ENABLED}")
 message(STATUS "")
 
-if(BUILD_ON_SIMULATOR_CRI)
+if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
   message(STATUS "Building on CRI simulator, enable XE3 kernels only.")
   set(VLLM_XPU_ENABLE_XE2 OFF) # actually we can enable XE2 as well on CRI
                                # simulator, but we will never test it there
@@ -237,6 +251,8 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} "-O3" "-DNDEBUG")
   if(BUILD_ON_SIMULATOR_CRI)
     set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=intel_gpu_cri)
+  elseif(BUILD_ON_NVL)
+    set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=intel_gpu_nvl_p)
   elseif(BUILD_ON_SIMULATOR_JGS)
     set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=intel_gpu_jgs)
   elseif(AOT_DEVICES)
@@ -259,9 +275,13 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
       ${SYCL_DEVICE_LINK_FLAGS}
       "-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"
   )
-  set(XE3_AOT_DEVICES "cri-a0")
+  if (BUILD_ON_NVL)
+    set(XE3_AOT_DEVICES "nvl-p,nvl-p-a0")
+  else()
+    set(XE3_AOT_DEVICES "cri-a0")
+  endif()
   set(XE4_AOT_DEVICES "xe4")
-  if(BUILD_ON_SIMULATOR_CRI)
+  if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
     set(AOT_DEVICES ${XE3_AOT_DEVICES})
   endif()
   if(BUILD_ON_SIMULATOR_JGS)
@@ -297,7 +317,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
   # when building.
-  if(BUILD_ON_SIMULATOR_CRI)
+  if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
     # update on WW12 for CRI, this commit id is latest from v0.1.0_next branch
     set(CUTLASS_REVISION
         "41d3a5eeee5a699c78e465fb0b57a463ebedc6b4"
@@ -347,7 +367,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   set(CUTLASS_ENABLE_SYCL "ON")
   # TODO: make this a list TODO: this may be not needed anymore since we will
   # add this in each cmake target
-  if(BUILD_ON_SIMULATOR_CRI)
+  if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
     set(DPCPP_SYCL_TARGET
         "intel_gpu_cri"
         CACHE STRING "DPC++ SYCL target architectures")
@@ -439,6 +459,8 @@ if(BUILD_SYCL_TLA_KERNELS)
     list(APPEND SYCL_TLA_COMPILE_OPTIONS -DVLLM_XPU_ENABLE_XE2)
   endif()
   if(VLLM_XPU_ENABLE_XE3)
+    list(APPEND SYCL_TLA_KERNELS_COMPILE_FLAGS
+         "-D__SYCL_TARGET_INTEL_GPU_CRI__")
     add_subdirectory(csrc/xpu/grouped_gemm/xe_3)
     add_subdirectory(csrc/xpu/attn/xe_3)
     list(APPEND GROUPED_GEMM_LIB_NAME "grouped_gemm_xe_3")

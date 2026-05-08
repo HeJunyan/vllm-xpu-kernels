@@ -115,7 +115,8 @@ static inline bool force_xe_default_kernel() {
 #ifdef VLLM_XPU_ENABLE_XE3
 static inline bool is_xe3p_arch(at::DeviceIndex device_index = -1) {
   auto arch = get_device_architecture(device_index);
-  return arch == syclex::architecture::intel_gpu_cri;
+  return arch == syclex::architecture::intel_gpu_cri ||
+         arch == syclex::architecture::intel_gpu_nvl_p;
 }
 #endif
 
