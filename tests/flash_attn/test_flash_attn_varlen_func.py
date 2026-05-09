@@ -198,9 +198,8 @@ def test_varlen_with_paged_kv(
 ) -> None:
     torch.xpu.set_device("xpu:0")
     # # FIXME: remove skip
-    if (is_casual and seq_lens[1][0]
-            == 5) and (os.getenv("SKIP_HANG_KERNEL") is not None
-                       and os.getenv("SKIP_HANG_KERNEL") == "1"):
+    if (os.getenv("SKIP_HANG_KERNEL") is not None
+        and os.getenv("SKIP_HANG_KERNEL") == "1") and (is_casual and seq_lens[1][0] == 5):
         pytest.skip("skip casual for seqlen0 to avoid runtime hang on CI.")
     if (window_size[0] != -1 or window_size[1]
             != -1) and (os.getenv("SKIP_HANG_KERNEL") is not None
@@ -411,9 +410,8 @@ def test_varlen_with_interleaved_paged_kv(
     torch.set_default_device("xpu")
     torch.xpu.set_device("xpu:0")
     # # FIXME: remove skip
-    if (is_casual and seq_lens[1][0]
-            == 5) and (os.getenv("SKIP_HANG_KERNEL") is not None
-                       and os.getenv("SKIP_HANG_KERNEL") == "1"):
+    if (os.getenv("SKIP_HANG_KERNEL") is not None
+        and os.getenv("SKIP_HANG_KERNEL") == "1") and (is_casual and seq_lens[1][0] == 5):
         pytest.skip("skip casual for seqlen0 to avoid runtime hang on CI.")
     if (window_size[0] != -1 or window_size[1]
             != -1) and (os.getenv("SKIP_HANG_KERNEL") is not None
