@@ -736,7 +736,7 @@ function(add_xe4_kernel_library LIBRARY_NAME)
   target_compile_options(
     ${LIBRARY_NAME}
     PRIVATE ${SYCL_TLA_KERNELS_COMPILE_FLAGS} -fPIC -Wno-c++20-extensions
-            -Wno-intel-compat)
+            -Wno-intel-compat -no-ftz -fsycl-targets=pisa)
   target_compile_definitions(${LIBRARY_NAME} PRIVATE -DVLLM_XPU_ENABLE_XE4)
   target_compile_definitions(${LIBRARY_NAME} PRIVATE -DSYCL_INTEL_TARGET=40)
   target_include_directories(${LIBRARY_NAME} PRIVATE ${SYCL_TLA_INCLUDE_DIRS})
@@ -755,9 +755,16 @@ function(add_xe4_kernel_library LIBRARY_NAME)
                                           COMPONENT ${LIBRARY_NAME})
 
   # Set link options for XE4 devices
-  set(XE4_GPU_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
+  set(XE4_GPU_LINK_FLAGS
+      ${SYCL_LINK_FLAGS}
+      -fsycl
+      -fsycl-targets=pisa
+      -fsycl-max-parallel-link-jobs=16
+      "-Xsze-intel-xe-features=+set-abarrier-arrive-lmc,+disable-misched,+null-dst"
+      "-Xsxe-enable-phi-uniform"
+      "-Xsxe-enable-texp-overlap")
   list(
-    APPEND XE4_GPU_LINK_FLAGS -Xsycl-target-backend=spir64_gen
+    APPEND XE4_GPU_LINK_FLAGS
     "-device ${XE4_AOT_DEVICES} -options -ze-intel-xe-features=+set-abarrier-arrive-lmc,+disable-misched,+total-grf-num-96,+null-dst")
   target_link_options(${LIBRARY_NAME} PRIVATE ${XE4_GPU_LINK_FLAGS})
 endfunction()

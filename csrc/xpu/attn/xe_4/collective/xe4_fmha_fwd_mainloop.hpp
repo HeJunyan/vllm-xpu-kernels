@@ -30,10 +30,8 @@
  **************************************************************************************************/
 #pragma once
 
-#include "cutlass/cutlass.h"
-#include "cutlass/arch/barrier.h"
-#include "cutlass/pipeline/xe4_pipeline.hpp"
-#include "cutlass/epilogue/thread/xe4_detail.hpp"
+#include <cutlass/arch/barrier.h>
+#include <cutlass/cutlass.h>
 
 #include "xe4_fmha_fwd_softmax_epilogue.hpp"
 #include "fmha_fusion.hpp"
@@ -43,38 +41,37 @@ namespace cutlass::flash_attention::collective {
 using namespace cute;
 
 template <
-  class ProblemShape_,
-  class TileShape_,
-  class ElementQ_,
-  class ElementK_,
-  class ElementV_,
-  class ElementS_,
-  class ElementP_,
-  class ElementAccum_,
-  class ElementOutput_,
-  class StrideQ_,
-  class StrideK_,
-  class StrideV_,
-  class TiledMmaQK_,
-  class TiledMmaPV_,
-  class SmemLayoutQ_,
-  class SmemLayoutK_,
-  class SmemLayoutV_,
-  class SmemLayoutOutputAccum_,
-  class SmemLayoutOutput_,
-  class TMACopyAtomQ_,
-  class TMACopyAtomK_,
-  class TMACopyAtomV_,
-  uint32_t PipelineStages_,
-  uint32_t PipelineStagesQ_,
-  bool Paged_>
+    class ProblemShape_,
+    class TileShape_,
+    class ElementQ_,
+    class ElementK_,
+    class ElementV_,
+    class ElementS_,
+    class ElementP_,
+    class ElementAccum_,
+    class ElementOutput_,
+    class StrideQ_,
+    class StrideK_,
+    class StrideV_,
+    class TiledMmaQK_,
+    class TiledMmaPV_,
+    class SmemLayoutQ_,
+    class SmemLayoutK_,
+    class SmemLayoutV_,
+    class SmemLayoutOutputAccum_,
+    class SmemLayoutOutput_,
+    class TMACopyAtomQ_,
+    class TMACopyAtomK_,
+    class TMACopyAtomV_,
+    bool IsPaged_ = false>
 struct CollectiveMmaAttention {
-
   using ProblemShape = ProblemShape_;
 
-  using TileShape = TileShape_;                                   // <BLK_M_Q, BLK_N_V, BLK_N_QK, BLK_K_QK>
-  using TileShapeQK_MNK = decltype(select<0, 2, 3>(TileShape{})); // <BLK_M_Q, BLK_N_QK, BLK_K_QK>
-  using TileShapePV_MNK = decltype(select<0, 1, 2>(TileShape{})); // <BLK_M_PV, BLK_N_V, BLK_N_QK>
+  using TileShape = TileShape_; // <BLK_M_Q, BLK_N_V, BLK_N_QK, BLK_K_QK>
+  using TileShapeQK_MNK =
+      decltype(select<0, 2, 3>(TileShape{})); // <BLK_M_Q, BLK_N_QK, BLK_K_QK>
+  using TileShapePV_MNK =
+      decltype(select<0, 1, 2>(TileShape{})); // <BLK_M_PV, BLK_N_V, BLK_N_QK>
 
   using ElementQ = ElementQ_;
   using ElementK = ElementK_;
@@ -101,174 +98,252 @@ struct CollectiveMmaAttention {
   using TMACopyAtomK = TMACopyAtomK_;
   using TMACopyAtomV = TMACopyAtomV_;
 
-  /* template feature */
-  static constexpr bool VarLen = is_variable_length_v<typename ProblemShape::SeqLenType>;
-  static constexpr bool Paged = Paged_;
-
   // TODO add assert to check unsupported configs
 
-  static constexpr uint32_t PipelineStages = PipelineStages_;
-  using MainloopPipeline = cutlass::PipelineTmaAsync<PipelineStages>;
-  using PipelineState = typename cutlass::PipelineState<PipelineStages>;
+  // number of QO stages per workgroup; tunable based on tile shapes
+  static constexpr int NumStageQO = 2;
+  static constexpr int NumStageKV = 2;
 
-  static constexpr uint32_t PipelineStagesQ = PipelineStagesQ_;
-  using MainloopPipelineQ = cutlass::PipelineTmaAsync<PipelineStagesQ>;
-  using PipelineStateQ = typename cutlass::PipelineState<PipelineStagesQ>;
+  using ClusterShape = Shape<_1, _1, _1>;
 
-  static constexpr int NumProducerWarps = 1;
-  static constexpr int NumMMAWarps = 1;
+  // from load q to mma
+  using PipelineQ = cutlass::PipelineTmaAsync<NumStageQO>;
 
-  static constexpr int NumControlerWarps = 4;
+  // from load k to mma
+  using PipelineK = cutlass::PipelineTmaAsync<NumStageKV>;
+
+  // from load v to mma
+  using PipelineV = cutlass::PipelineTmaAsync<NumStageKV>;
+
+  // from mma (QK) to softmax
+  using PipelineS = cutlass::PipelineTmaAsync<2>;
+
+  // from mma (PV) to softmax
+  using PipelineO = cutlass::PipelineTmaAsync<2>;
+
+  // from softmax to epilogue
+  using PipelineEpi = cutlass::PipelineTmaAsync<2>;
 
   using TMA_Q = decltype(make_tma_copy(
-    TMACopyAtomQ{},
-    make_tensor(make_gmem_ptr(static_cast<ElementQ const*>(nullptr)),
-                repeat_like(StrideQ{}, int32_t(0)),
-                StrideQ{}),
-    SmemLayoutQ{}(_, _, cute::Int<0>{}),
-    select<0, 2>(TileShapeQK_MNK{}),
-    _1{}
-  ));
+      TMACopyAtomQ{},
+      make_tensor(
+          make_gmem_ptr(static_cast<ElementQ const*>(nullptr)),
+          repeat_like(StrideQ{}, int32_t(0)),
+          StrideQ{}),
+      SmemLayoutQ{}(_, _, cute::Int<0>{}),
+      select<0, 2>(TileShapeQK_MNK{}),
+      _1{} // no mcast
+      ));
 
   using TMA_K = decltype(make_tma_copy(
-    TMACopyAtomK{},
-    make_tensor(make_gmem_ptr(static_cast<ElementK const*>(nullptr)),
-                repeat_like(StrideK{}, int32_t(0)),
-                StrideK{}),
-    SmemLayoutK{}(_, _, cute::Int<0>{}),
-    select<1, 2>(TileShapeQK_MNK{}),
-    _1{}
-  ));
+      TMACopyAtomK{},
+      make_tensor(
+          make_gmem_ptr(static_cast<ElementK const*>(nullptr)),
+          repeat_like(StrideK{}, int32_t(0)),
+          StrideK{}),
+      SmemLayoutK{}(_, _, cute::Int<0>{}),
+      select<1, 2>(TileShapeQK_MNK{}),
+      _1{}));
 
   using TMA_V = decltype(make_tma_copy(
-    TMACopyAtomV{},
-    make_tensor(make_gmem_ptr(static_cast<ElementV const*>(nullptr)),
-                repeat_like(StrideV{}, int32_t(0)),
-                StrideV{}),
-    SmemLayoutV{}(_, _, cute::Int<0>{}),
-    select<1, 2>(TileShapePV_MNK{}),
-    _1{}
-  ));
-  static constexpr uint32_t sg_size = cutlass::NumThreadsPerWarp;
-  static constexpr int StagesSP = PipelineStages;
-
+      TMACopyAtomV{},
+      make_tensor(
+          make_gmem_ptr(static_cast<ElementV const*>(nullptr)),
+          repeat_like(StrideV{}, int32_t(0)),
+          StrideV{}),
+      SmemLayoutV{}(_, _, cute::Int<0>{}),
+      select<1, 2>(TileShapePV_MNK{}),
+      _1{}));
   using SmemLayoutStageS = decltype(make_layout(
-      cute::select<0, 1>(TileShapeQK_MNK{}), GenRowMajor{}));
+      cute::select<0, 1>(TileShapeQK_MNK{}),
+      GenRowMajor{}));
   using SmemLayoutS = decltype(tile_to_shape(
       SmemLayoutStageS{},
-      make_shape(shape<0>(TileShapeQK_MNK{}),
-                 shape<1>(TileShapeQK_MNK{}),
-                 Int<StagesSP>{})));
+      make_shape(
+          shape<0>(TileShapeQK_MNK{}),
+          shape<1>(TileShapeQK_MNK{}),
+          Int<NumStageQO>{})));
 
   using SmemLayoutStageP = decltype(make_layout(
-      cute::select<0, 1>(TileShapeQK_MNK{}), GenRowMajor{}));
+      cute::select<0, 1>(TileShapeQK_MNK{}),
+      GenRowMajor{}));
   using SmemLayoutP = decltype(tile_to_shape(
       SmemLayoutStageP{},
-      make_shape(shape<0>(TileShapeQK_MNK{}),
-                 shape<1>(TileShapeQK_MNK{}),
-                 Int<StagesSP>{})));
+      make_shape(
+          shape<0>(TileShapeQK_MNK{}),
+          shape<1>(TileShapeQK_MNK{}),
+          Int<NumStageQO>{})));
 
   static constexpr size_t SmemAlignment = 512;
-  struct SharedStorage
-  {
-    struct TensorStorage : cute::aligned_struct<SmemAlignment, _0>
-    {
-      cute::array_aligned<ElementQ, cute::cosize_v<SmemLayoutQ>, SmemAlignment> smem_Q;
-      cute::array_aligned<ElementK, cute::cosize_v<SmemLayoutK>, SmemAlignment> smem_K;
-      cute::array_aligned<ElementV, cute::cosize_v<SmemLayoutV>, SmemAlignment> smem_V;
-      cute::array_aligned<ElementS, cute::cosize_v<SmemLayoutS>, SmemAlignment> smem_S;
-      cute::array_aligned<ElementP, cute::cosize_v<SmemLayoutP>, SmemAlignment> smem_P;
-      cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutOutputAccum>, SmemAlignment> smem_Oacc;
+  struct SharedStorage {
+    struct TensorStorage : cute::aligned_struct<SmemAlignment, _0> {
+      cute::array_aligned<ElementQ, cute::cosize_v<SmemLayoutQ>, SmemAlignment>
+          smem_Q;
+      cute::array_aligned<ElementK, cute::cosize_v<SmemLayoutK>, SmemAlignment>
+          smem_K;
+      cute::array_aligned<ElementV, cute::cosize_v<SmemLayoutV>, SmemAlignment>
+          smem_V;
+      // cute::array_aligned<ElementAM, cute::cosize_v<SmemLayoutAM>,
+      // SmemAlignment> smem_AM;
+      cute::array_aligned<ElementS, cute::cosize_v<SmemLayoutS>, SmemAlignment>
+          smem_S;
+      cute::array_aligned<ElementP, cute::cosize_v<SmemLayoutP>, SmemAlignment>
+          smem_P;
+      cute::array_aligned<
+          ElementAccum,
+          cute::cosize_v<SmemLayoutOutputAccum>,
+          SmemAlignment>
+          smem_Oacc;
     };
     struct PipelineStorage {
-      typename MainloopPipelineQ::SharedStorage storage_Q;
-
-      typename MainloopPipeline::SharedStorage storage_K;
-      typename MainloopPipeline::SharedStorage storage_V;
-
-      typename MainloopPipeline::SharedStorage storage_S;
-      typename MainloopPipeline::SharedStorage storage_P;
-
-      cutlass::arch::ClusterTransactionBarrier barrier_Q;
-      cutlass::arch::ClusterTransactionBarrier barrier_O;
-      cutlass::arch::ClusterTransactionBarrier barrier_O_empty;
-
-      // TODO: Add async_gmma PISA with only .dtm.btm, without .atm
-      cutlass::arch::ClusterTransactionBarrier barrier_q_dummy;
+      // TODO: add AMMA atom with different combinations of .dtm, .atm, and .btm
+      cutlass::arch::ClusterTransactionBarrier barrier_dummy;
     };
   };
 
   using TensorStorage = typename SharedStorage::TensorStorage;
   using PipelineStorage = typename SharedStorage::PipelineStorage;
 
-  static constexpr uint32_t TmaTransactionBytesQ = sizeof(TensorStorage::smem_Q) / PipelineStagesQ;
-  static constexpr uint32_t TmaTransactionBytesK = sizeof(TensorStorage::smem_K) / PipelineStages;
-  static constexpr uint32_t TmaTransactionBytesV = sizeof(TensorStorage::smem_V) / PipelineStages;
+  static constexpr uint32_t TmaTransactionBytesQ =
+      sizeof(TensorStorage::smem_Q) / NumStageQO;
+  static constexpr uint32_t TmaTransactionBytesK =
+      sizeof(TensorStorage::smem_K) / NumStageKV;
+  static constexpr uint32_t TmaTransactionBytesV =
+      sizeof(TensorStorage::smem_V) / NumStageKV;
+  static constexpr int TileShapeM = size<0>(TileShapeQK_MNK{});
+  static constexpr int TileShapeN = size<1>(TileShapeQK_MNK{});
 
   // Host side kernel arguments
   struct Arguments {
     ElementQ const* ptr_Q;
+    StrideQ dQ;
     ElementK const* ptr_K;
+    StrideK dK;
     ElementV const* ptr_V;
-
-    // page table KV cache
-    const int* ptr_page_table;
-    int page_size;
-    int max_pages_per_seq;
-    int total_seqlen_kv;
+    StrideV dV;
+    // Paged KV cache
+    const int* ptr_page_table = nullptr;
+    int page_size = 0;
+    int max_pages_per_seq = 0;
+    int total_seqlen_kv = 0;
+    // VarLen total sequence lengths (needed for TMA tensor setup)
+    int total_seqlen_q = 0;
   };
+
+  static constexpr bool IsVarLen =
+      collective::is_variable_length_v<typename ProblemShape::SeqLenType>;
+  static constexpr bool IsPaged = IsPaged_;
 
   // Device side kernel params
   struct Params {
     ProblemShape problem_shape;
-    ElementQ const* ptr_Q;
-    ElementK const* ptr_K;
-    ElementV const* ptr_V;
-    
-    // page table KV cache
-    const int* ptr_page_table;
-    int page_size;
-    int max_pages_per_seq;
-    int total_seqlen_kv;
+    TMA_Q tma_load_Q;
+    TMA_K tma_load_K;
+    TMA_V tma_load_V;
+    // Paged KV cache
+    const int* ptr_page_table = nullptr;
+    int page_size = 0;
+    int max_pages_per_seq = 0;
+    int total_seqlen_kv = 0;
+    int total_seqlen_q = 0;
   };
 
   CollectiveMmaAttention() = default;
 
   static constexpr Params to_underlying_arguments(
-    ProblemShape const& problem_shape, 
-    Arguments const& args) 
-  {
-    return {problem_shape, args.ptr_Q, args.ptr_K, args.ptr_V,
-            args.ptr_page_table, args.page_size, args.max_pages_per_seq, args.total_seqlen_kv};
-  }
+      ProblemShape const& problem_shape,
+      Arguments const& args) {
+    auto
+        [batch,
+         num_heads_q,
+         num_heads_kv,
+         seq_len_qo,
+         seq_len_kv,
+         head_size_qk,
+         head_size_vo] = problem_shape;
 
-  CUTLASS_DEVICE
-  Shape<int, int> get_sequence_length_shape(
-      ProblemShape const& problem_shape, int const& batch) {
-    if constexpr (VarLen) {
-      if constexpr (Paged) {
-        auto q_len = collective::apply_variable_length(
-            Shape<VariableLength>{problem_shape.seq_len_qo}, batch);
-        return Shape<int, int>{
-            get<0>(q_len), problem_shape.seq_len_kv.cumulative_length[batch]};
-      } else {
-        return collective::apply_variable_length(
-            Shape<VariableLength, VariableLength>{
-                problem_shape.seq_len_qo, problem_shape.seq_len_kv},
-            batch);
-      }
-    } else {
-      return Shape<int, int>{
-          problem_shape.seq_len_qo, problem_shape.seq_len_kv};
+    // For VarLen: TMA tensors use batch=1 for L dim, strides already encode
+    // the interleaved [total_seq, num_heads, head_size] layout.
+    // total_seqlen is passed explicitly since it can't be derived from
+    // the interleaved strides.
+    // For Paged+VarLen KV: use total_seqlen_kv from args.
+    int tma_batch = IsVarLen ? 1 : int(batch);
+    int tma_seq_q = int(seq_len_qo);
+    int tma_seq_kv = int(seq_len_kv);
+
+    if constexpr (IsVarLen) {
+      tma_seq_q = args.total_seqlen_q;
+      tma_seq_kv = args.total_seqlen_kv;
     }
+
+    Tensor mQ = make_tensor(
+        make_gmem_ptr(args.ptr_Q),
+        make_layout(
+            make_shape(tma_seq_q, head_size_qk, tma_batch * num_heads_q),
+            args.dQ));
+
+    TMA_Q tma_load_Q = make_tma_copy(
+        TMACopyAtomQ{},
+        mQ,
+        SmemLayoutQ{}(_, _, _0{}),
+        select<0, 2>(TileShapeQK_MNK{}),
+        _1{});
+
+    Tensor mK = make_tensor(
+        make_gmem_ptr(args.ptr_K),
+        make_layout(
+            make_shape(tma_seq_kv, head_size_qk, tma_batch * num_heads_kv),
+            args.dK));
+
+    TMA_K tma_load_K = make_tma_copy(
+        TMACopyAtomK{},
+        mK,
+        SmemLayoutK{}(_, _, _0{}),
+        select<1, 2>(TileShapeQK_MNK{}),
+        _1{});
+
+    Tensor mV = make_tensor(
+        make_gmem_ptr(args.ptr_V),
+        make_layout(
+            make_shape(head_size_vo, tma_seq_kv, tma_batch * num_heads_kv),
+            args.dV));
+    TMA_V tma_load_V = make_tma_copy(
+        TMACopyAtomV{},
+        mV,
+        SmemLayoutV{}(_, _, _0{}),
+        select<1, 2>(TileShapePV_MNK{}),
+        _1{});
+    return {problem_shape, tma_load_Q, tma_load_K, tma_load_V,
+            args.ptr_page_table, args.page_size,
+            args.max_pages_per_seq, args.total_seqlen_kv, args.total_seqlen_q};
   }
 
-  CUTLASS_DEVICE int get_paged_idx(Params const& params, int K, int idx_b) {
-    int tiles_per_page = params.page_size / get<1>(TileShapeQK_MNK{});
-    int b_offset = idx_b * params.max_pages_per_seq;
-    int page_local_idx = K * get<1>(TileShapeQK_MNK{}) / params.page_size;
+  template <class ProblemShape, class TileShape>
+  static bool can_implement(
+      ProblemShape const& problem_shape,
+      TileShape const& tile_shape,
+      Arguments const& args) {
+    bool implementable = true;
 
-    // Clamp page_local_idx to the valid range [0, max_pages_per_seq - 1]
+    auto seq_len_qo = size<3>(problem_shape);
+    auto tile_shape_qo = size<0>(tile_shape);
+
+    implementable = implementable && (seq_len_qo % (tile_shape_qo * 2) == 0);
+    if (!(seq_len_qo % (tile_shape_qo * 2) == 0)) {
+      CUTLASS_TRACE_HOST(
+          "seq_len qo=" << seq_len_qo
+                        << " must be divisible by (tile_shape QO * 2)="
+                        << (tile_shape_qo * 2) << " for QO double buffering\n");
+    }
+    return implementable;
+  }
+
+  CUTLASS_DEVICE static int get_paged_idx(
+      Params const& params, int K, int idx_b) {
+    int tiles_per_page = params.page_size / TileShapeN;
+    int b_offset = idx_b * params.max_pages_per_seq;
+    int page_local_idx = K * TileShapeN / params.page_size;
+
     if (page_local_idx >= params.max_pages_per_seq) {
       page_local_idx = params.max_pages_per_seq - 1;
     }
@@ -279,626 +354,907 @@ struct CollectiveMmaAttention {
 
   template <typename DescTuple, typename BlockCoord>
   CUTLASS_DEVICE void load(
-    Params const& params,
-    TensorStorage& shared_tensors,
-    PipelineStorage& shared_pipelines,
-    DescTuple const& tdesc_tuple,
-    BlockCoord const& block_coord,
-    BlockCoord const& block_coord_next,
-    int const num_kv_tiles, 
-    MainloopPipelineQ pipeline_q, PipelineStateQ& smem_pipe_write_q,
-    MainloopPipeline pipeline_k, PipelineState& smem_pipe_write_k,
-    MainloopPipeline pipeline_v, PipelineState& smem_pipe_write_v,
-    bool is_first_wave, bool is_last_wave)
-  {
+      Params const& params,
+      TensorStorage& shared_tensors,
+      PipelineStorage& shared_pipelines,
+      DescTuple const& tdesc_tuple,
+      BlockCoord const& block_coord,
+      int const num_kv_tiles_,
+      PipelineQ& pipeline_q,
+      PipelineQ::PipelineState& pipeline_q_producer_state,
+      PipelineK& pipeline_k,
+      PipelineK::PipelineState& pipeline_k_producer_state,
+      PipelineV& pipeline_v,
+      PipelineV::PipelineState& pipeline_v_producer_state,
+      bool is_first_wave,
+      bool is_last_wave) {
     bool lane_predicate = cute::elect_one_sync();
-
-    if (lane_predicate) {
-      // get shape params && scheduler params
-      auto batch = params.problem_shape.batch;
-      auto num_heads = params.problem_shape.num_heads;
-      auto head_size_qk = params.problem_shape.head_size_qk;
-      auto head_size_vo = params.problem_shape.head_size_vo;
-
-      auto blk_m_coord = get<1>(block_coord); // seq_len_blk_idx
-      auto blk_n_coord = get<0>(block_coord); // head_size_blk_idx
-      auto batch_coord = get<2>(block_coord); // batch_blk_idx
-      auto num_heads_coord = get<3>(block_coord); // num_heads_blk_idx
-      // auto blk_l_coord = batch_coord * num_heads + num_heads_coord;
-      auto blk_l_coord = num_heads_coord;
-
-      auto [seq_len_qo, seq_len_kv] = get_sequence_length_shape(params.problem_shape, batch_coord);
-      seq_len_kv = Paged ? params.total_seqlen_kv : seq_len_kv;
-
-      bool is_valid_q = true;
-      if (blk_m_coord * get<0>(TileShapeQK_MNK{}) >= seq_len_qo) is_valid_q = false;
-
-      // Re-Initialize TMA copy
-      int offset_q = 0, offset_k = 0, offset_v = 0;
-      if constexpr (VarLen) {
-        auto qo_cumulative = params.problem_shape.seq_len_qo.cumulative_length;
-        auto kv_cumulative = params.problem_shape.seq_len_kv.cumulative_length;
-        offset_q = num_heads * head_size_qk * qo_cumulative[batch_coord];
-        offset_k = Paged ? 0 : num_heads * head_size_qk * kv_cumulative[batch_coord];
-        offset_v = Paged ? 0 : num_heads * head_size_vo * kv_cumulative[batch_coord];
-      }
-      const ElementQ* dcQ = const_cast<ElementQ*>(params.ptr_Q + offset_q);
-      const ElementK* dcK = const_cast<ElementK*>(params.ptr_K + offset_k);
-      const ElementV* dcV = const_cast<ElementV*>(params.ptr_V + offset_v);
-
-      auto batch_dim_qo = VarLen ? 1 : batch;
-      auto batch_dim_kv = VarLen ? 1 : batch;
-      auto shape_Q = make_shape(seq_len_qo, head_size_qk, num_heads * batch_dim_qo);
-      auto shape_K = make_shape(seq_len_kv, head_size_qk, num_heads * batch_dim_kv);
-      auto shape_V = make_shape(head_size_vo, seq_len_kv, num_heads * batch_dim_kv);
-
-      auto layout_Q = make_ordered_layout(shape_Q, Step<_2, _0, _1>{});
-      auto layout_K = make_ordered_layout(shape_K, Step<_2, _0, _1>{});
-      auto layout_V = make_ordered_layout(shape_V, Step<_0, _2, _1>{});
-
-      Tensor mQ = make_tensor(make_gmem_ptr(dcQ), layout_Q);
-      auto tma_load_Q = make_tma_copy(
-        TMACopyAtomQ{},
-        mQ, 
-        SmemLayoutQ{}(_, _, _0{}),
-        select<0, 2>(TileShapeQK_MNK{}), 
-        _1{}
-      );
-
-      Tensor mK = make_tensor(make_gmem_ptr(dcK), layout_K);
-      auto tma_load_K = make_tma_copy(
-        TMACopyAtomK{},
-        mK, 
-        SmemLayoutK{}(_, _, _0{}),
-        select<1, 2>(TileShapeQK_MNK{}), 
-        _1{}
-      );
-
-      Tensor mV = make_tensor(make_gmem_ptr(dcV), layout_V);
-      auto tma_load_V = make_tma_copy(
-        TMACopyAtomV{},
-        mV, 
-        SmemLayoutV{}(_, _, _0{}),
-        select<1, 2>(TileShapePV_MNK{}), 
-        _1{}
-      );
-
-      // Initialize matrix descriptor
-      auto [tdesc_q, tdesc_k, tdesc_v] = tdesc_tuple;
-      tma_load_Q.cache_.set_tensor_desc(tdesc_q);
-      tma_load_K.cache_.set_tensor_desc(tdesc_k);
-      tma_load_V.cache_.set_tensor_desc(tdesc_v);
-
-      Tensor mQ_mkl = tma_load_Q.get_tma_tensor(shape_Q); // (M,K,L)
-      Tensor mK_nkl = tma_load_K.get_tma_tensor(shape_K); // (N,K,L)
-      Tensor mV_nkl = tma_load_V.get_tma_tensor(shape_V); // (N,K,L)
-
-      Tensor sQ = make_tensor(make_smem_ptr(shared_tensors.smem_Q.data()), SmemLayoutQ{}); // (BLK_M,BLK_K,PIPE_Q)
-      Tensor sK = make_tensor(make_smem_ptr(shared_tensors.smem_K.data()), SmemLayoutK{}); // (BLK_N,BLK_K,PIPE)
-      Tensor sV = make_tensor(make_smem_ptr(shared_tensors.smem_V.data()), SmemLayoutV{}); // (BLK_N,BLK_K,PIPE)
-
-      Tensor gQ = local_tile(mQ_mkl(_, _, blk_l_coord), TileShapeQK_MNK{},
-                             make_coord(blk_m_coord, _, blk_n_coord), Step<_1, X, _1>{}); // (BLK_M,BLK_K)
-      Tensor gK = local_tile(mK_nkl(_, _, blk_l_coord), TileShapeQK_MNK{},
-                             make_coord(_, _, blk_n_coord), Step<X, _1, _1>{});           // (BLK_N,BLK_K,k)
-      Tensor gV = local_tile(mV_nkl(_, _, blk_l_coord), TileShapePV_MNK{},
-                             make_coord(_, blk_n_coord, _), Step<X, _1, _1>{});           // (BLK_N,BLK_K,k)
-
-      auto [tQgQ, tQsQ] = tma_partition(tma_load_Q, _0{}, Layout<_1>{},
-                                        group_modes<0, 2>(sQ), group_modes<0, 2>(gQ)); // (TMA), (TMA,PIPE_Q)
-      auto [tKgK, tKsK] = tma_partition(tma_load_K, _0{}, Layout<_1>{},
-                                        group_modes<0, 2>(sK), group_modes<0, 2>(gK)); // (TMA,k), (TMA,PIPE)
-      auto [tVgV, tVsV] = tma_partition(tma_load_V, _0{}, Layout<_1>{},
-                                        group_modes<0, 2>(sV), group_modes<0, 2>(gV)); // (TMA,k), (TMA,PIPE)
-
-
-      if (is_valid_q) {
-        // load Q and K tile for the iter_0 of the first wave
-        if (is_first_wave) {
-          // shared_pipelines.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
-          pipeline_q.producer_acquire(smem_pipe_write_q);
-          copy(tma_load_Q.with(
-              pipeline_q.producer_get_barrier(smem_pipe_write_q), 0),
-              tQgQ, tQsQ(_, smem_pipe_write_q.index())
-          );
-          ++smem_pipe_write_q;
-
-          int k_idx_fisrt = Paged ? get_paged_idx(params, 0, batch_coord) : 0;
-          pipeline_k.producer_acquire(smem_pipe_write_k);
-          copy(tma_load_K.with(
-                pipeline_k.producer_get_barrier(smem_pipe_write_k), 0),
-                tKgK(_, k_idx_fisrt), tKsK(_, smem_pipe_write_k.index())
-          );
-          ++smem_pipe_write_k;
-        }
-
-        for (int i = 1; i < num_kv_tiles; ++i) {
-          int k_idx = Paged ? get_paged_idx(params, i, batch_coord) : i;
-          pipeline_k.producer_acquire(smem_pipe_write_k);
-          copy(tma_load_K.with(
-                pipeline_k.producer_get_barrier(smem_pipe_write_k), 0),
-                tKgK(_, k_idx), tKsK(_, smem_pipe_write_k.index())
-          );
-          ++smem_pipe_write_k;
-          
-          int v_idx = Paged ? get_paged_idx(params, i - 1, batch_coord) : i - 1;
-          pipeline_v.producer_acquire(smem_pipe_write_v);
-          copy(tma_load_V.with(
-                pipeline_v.producer_get_barrier(smem_pipe_write_v), 0),
-                tVgV(_, v_idx), tVsV(_, smem_pipe_write_v.index())
-          );
-          ++smem_pipe_write_v;
-        }
-      }
-
-      // load Q and K tile for the iter_0 of the next wave
-      if (!is_last_wave) {
-        auto blk_m_coord_next = get<1>(block_coord_next); // seq_len_blk_idx
-        auto blk_n_coord_next = get<0>(block_coord_next); // head_size_blk_idx
-        auto batch_coord_next = get<2>(block_coord_next); // batch_blk_idx
-        auto num_heads_coord_next = get<3>(block_coord_next); // num_heads_blk_idx
-        // auto blk_l_coord_next = batch_coord_next * num_heads + num_heads_coord_next;
-        auto blk_l_coord_next = num_heads_coord_next;
-
-        // get shape params
-        auto [seq_len_qo_next, seq_len_kv_next] = get_sequence_length_shape(params.problem_shape, batch_coord_next);
-        seq_len_kv_next = Paged ? params.total_seqlen_kv : seq_len_kv_next;
-
-        bool is_valid_q_next = true;
-        if (blk_m_coord_next * get<0>(TileShapeQK_MNK{}) >= seq_len_qo_next) is_valid_q_next = false;
-
-        if (is_valid_q_next) {
-          // Re-Initialize TMA copy
-          int offset_q_next = 0, offset_k_next = 0;
-          if constexpr (VarLen) {
-            auto qo_cumulative = params.problem_shape.seq_len_qo.cumulative_length;
-            auto kv_cumulative = params.problem_shape.seq_len_kv.cumulative_length;
-            offset_q_next = Paged ? 0 : num_heads * head_size_qk * qo_cumulative[batch_coord_next];
-            offset_k_next = Paged ? 0 : num_heads * head_size_qk * kv_cumulative[batch_coord_next];
-          }
-          const ElementQ* dcQ_next = const_cast<ElementQ*>(params.ptr_Q + offset_q_next);
-          const ElementK* dcK_next = const_cast<ElementK*>(params.ptr_K + offset_k_next);
-
-          auto shape_Q_next = make_shape(seq_len_qo_next, head_size_qk, num_heads * batch_dim_qo);
-          auto shape_K_next = make_shape(seq_len_kv_next, head_size_qk, num_heads * batch_dim_kv);
-
-          auto layout_Q_next = make_ordered_layout(shape_Q_next, Step<_2, _0, _1>{});
-          auto layout_K_next = make_ordered_layout(shape_K_next, Step<_2, _0, _1>{});
-
-          Tensor mQ_next = make_tensor(make_gmem_ptr(dcQ_next), layout_Q_next);
-          auto tma_load_Q_next = make_tma_copy(
-            TMACopyAtomQ{},
-            mQ_next, 
-            SmemLayoutQ{}(_, _, _0{}),
-            select<0, 2>(TileShapeQK_MNK{}), 
-            _1{}
-          );
-
-          Tensor mK_next = make_tensor(make_gmem_ptr(dcK_next), layout_K_next);
-          auto tma_load_K_next = make_tma_copy(
-            TMACopyAtomK{},
-            mK_next, 
-            SmemLayoutK{}(_, _, _0{}),
-            select<1, 2>(TileShapeQK_MNK{}), 
-            _1{}
-          );
-
-          tma_load_Q_next.cache_.set_tensor_desc(tdesc_q);
-          tma_load_K_next.cache_.set_tensor_desc(tdesc_k);
-
-          Tensor mQ_mkl_next = tma_load_Q_next.get_tma_tensor(shape_Q_next); // (M,K,L)
-          Tensor mK_nkl_next = tma_load_K_next.get_tma_tensor(shape_K_next); // (N,K,L)
-
-          Tensor gQ_next = local_tile(mQ_mkl_next(_, _, blk_l_coord_next), TileShapeQK_MNK{},
-                                  make_coord(blk_m_coord_next, _, blk_n_coord_next), Step<_1, X, _1>{}); // (BLK_M,BLK_K)
-          Tensor gK_next = local_tile(mK_nkl_next(_, _, blk_l_coord_next), TileShapeQK_MNK{},
-                                  make_coord(_, _, blk_n_coord_next), Step<X, _1, _1>{});           // (BLK_N,BLK_K,k)
-
-          auto [tQgQ_next, tQsQ_next] = tma_partition(tma_load_Q_next, _0{}, Layout<_1>{},
-                                            group_modes<0, 2>(sQ), group_modes<0, 2>(gQ_next)); // (TMA), (TMA,PIPE_Q)
-          auto [tKgK_next, tKsK_next] = tma_partition(tma_load_K_next, _0{}, Layout<_1>{},
-                                            group_modes<0, 2>(sK), group_modes<0, 2>(gK_next)); // (TMA,k), (TMA,PIPE)
-
-          pipeline_q.producer_acquire(smem_pipe_write_q);
-          copy(tma_load_Q_next.with(
-              pipeline_q.producer_get_barrier(smem_pipe_write_q), 0),
-              tQgQ_next, tQsQ(_, smem_pipe_write_q.index())
-          );
-          ++smem_pipe_write_q;
-
-          int k_idx_next = Paged ? get_paged_idx(params, 0, batch_coord_next) : 0;
-          pipeline_k.producer_acquire(smem_pipe_write_k);
-          copy(tma_load_K_next.with(
-                pipeline_k.producer_get_barrier(smem_pipe_write_k), 0),
-                tKgK_next(_, k_idx_next), tKsK(_, smem_pipe_write_k.index())
-          );
-          ++smem_pipe_write_k;
-        }
-      }
-
-      if (is_valid_q) {
-        int v_idx_last = Paged ? get_paged_idx(params, num_kv_tiles - 1, batch_coord) : num_kv_tiles - 1;
-        pipeline_v.producer_acquire(smem_pipe_write_v);
-        copy(tma_load_V.with(
-              pipeline_v.producer_get_barrier(smem_pipe_write_v), 0),
-              tVgV(_, v_idx_last), tVsV(_, smem_pipe_write_v.index())
-        );
-        ++smem_pipe_write_v;
-      }
-    }
-  }
-
-  template <typename EpilogueTensorStorage, typename CollectiveSoftmax>
-  CUTLASS_DEVICE void mma(
-    Params const& params,
-    TensorStorage& shared_tensors,
-    EpilogueTensorStorage& epi_shared_tensors,
-    PipelineStorage& shared_pipelines,
-    int const num_kv_tiles,
-    MainloopPipelineQ pipeline_q, PipelineStateQ& smem_pipe_read_q,
-    MainloopPipeline pipeline_k, PipelineState& smem_pipe_read_k,
-    MainloopPipeline pipeline_v, PipelineState& smem_pipe_read_v,
-    MainloopPipeline pipeline_s, PipelineState& smem_pipe_write_s,
-    MainloopPipeline pipeline_p, PipelineState& smem_pipe_read_p,
-    CollectiveSoftmax& collective_softmax,
-    bool is_first_wave, bool is_last_wave,
-    bool is_valid_q, bool is_valid_q_next)
-  {
-    bool lane_predicate = cute::elect_one_sync();
-
-    if (lane_predicate) {
-      auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-      auto sg = item.get_sub_group();
-      uint32_t item_id = item.get_local_linear_id();
-      uint32_t sg_id = get_sg_id();
-      int thread_idx = static_cast<int>(ThreadIdxX());
-
-      TiledMmaQK tiled_mma_qk;
-      TiledMmaPV tiled_mma_pv;
-
-      auto thr_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
-      auto thr_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx);
-
-      Tensor sQ = make_tensor(make_smem_ptr(shared_tensors.smem_Q.data()), SmemLayoutQ{});      // (BLK_M,BLK_K,PIPE_Q)
-      Tensor sK = make_tensor(make_smem_ptr(shared_tensors.smem_K.data()), SmemLayoutK{});      // (BLK_N,BLK_K,PIPE)
-      Tensor sV = make_tensor(make_smem_ptr(shared_tensors.smem_V.data()), SmemLayoutV{});      // (BLK_N,BLK_K,PIPE)
-      Tensor sS = make_tensor(make_smem_ptr(shared_tensors.smem_S.data()), SmemLayoutS{});  // (BLK_M,BLK_N,PIPE)
-      Tensor sP = make_tensor(make_smem_ptr(shared_tensors.smem_P.data()), SmemLayoutP{});  // (BLK_M,BLK_N,PIPE)
-      Tensor sOacc = make_tensor(make_smem_ptr(shared_tensors.smem_Oacc.data()), SmemLayoutOutputAccum{});  // (BLK_M,BLK_N)
-      Tensor sO = make_tensor(make_smem_ptr(epi_shared_tensors.smem_O.data()), SmemLayoutOutput{}); // (BLK_M,BLK_N)
-
-      // Matrix descriptors
-      Tensor tSsQ = thr_mma_qk.partition_fragment_A(sQ); // (MMA,MMA_M,MMA_K,PIPE_Q)
-      Tensor tSsK = thr_mma_qk.partition_fragment_B(sK); // (MMA,MMA_N,MMA_K,PIPE)
-      Tensor tOsP = thr_mma_pv.partition_fragment_A(sP); // (MMA,MMA_M,MMA_K,PIPE)
-      Tensor tOsV = thr_mma_pv.partition_fragment_B(sV); // (MMA,MMA_N,MMA_K,PIPE)
-      Tensor tSsS = thr_mma_qk.partition_fragment_C(sS); // (MMA,MMA_M,MMA_N,PIPE)
-      Tensor tOsOacc = thr_mma_pv.partition_fragment_C(sOacc); // (MMA,MMA_M,MMA_N)
-      Tensor tOsO = thr_mma_pv.partition_fragment_C(sO); // (MMA,MMA_M,MMA_N)
-
-      constexpr uint64_t qk_mma_ctrl = 0x100;
-      uint64_t pv_mma_ctrl = 0x100;
-      constexpr uint32_t mcast_mask = 0;
-
-      if (is_valid_q) {
-        // QK for the iter_0 of the first wave
-        if (is_first_wave) {
-          // shared_pipelines.barrier_Q.wait(/*phase=*/0);
-          pipeline_q.consumer_wait(smem_pipe_read_q);
-          pipeline_k.consumer_wait(smem_pipe_read_k);
-          pipeline_s.producer_acquire(smem_pipe_write_s);
-
-          // Compute S = Q * K^T
-          cute::gemm(tiled_mma_qk.with(
-            AMMA::TrackMethod<AMMA::Tracking::DAB>{},
-            qk_mma_ctrl,
-            pipeline_s.producer_get_barrier(smem_pipe_write_s),
-            pipeline_q.consumer_get_barrier(smem_pipe_read_q),
-            pipeline_k.consumer_get_barrier(smem_pipe_read_k),
-            mcast_mask, mcast_mask
-          ), tSsQ(_, _, _, smem_pipe_read_q.index()), tSsK(_, _, _, smem_pipe_read_k.index()), tSsS(_, _, _, smem_pipe_write_s.index()));
-          
-          pipeline_k.consumer_commit(smem_pipe_read_k, 1);
-
-          ++smem_pipe_read_k;
-          ++smem_pipe_write_s;
-        }
-
-        for (int i = 1; i < num_kv_tiles; ++i) {
-          pipeline_k.consumer_wait(smem_pipe_read_k);
-          pipeline_s.producer_acquire(smem_pipe_write_s);
-
-          // Compute S = Q * K^T
-          cute::gemm(tiled_mma_qk.with(
-            AMMA::TrackMethod<AMMA::Tracking::DAB>{},
-            qk_mma_ctrl,
-            pipeline_s.producer_get_barrier(smem_pipe_write_s),
-            pipeline_q.consumer_get_barrier(smem_pipe_read_q),
-            pipeline_k.consumer_get_barrier(smem_pipe_read_k),
-            mcast_mask, mcast_mask
-          ), tSsQ(_, _, _, smem_pipe_read_q.index()), tSsK(_, _, _, smem_pipe_read_k.index()), tSsS(_, _, _, smem_pipe_write_s.index()));
-
-          pipeline_k.consumer_commit(smem_pipe_read_k, 1);
-
-          ++smem_pipe_read_k;
-          ++smem_pipe_write_s;
-
-          // Finish the use of Q tile for current wave
-          if (i == num_kv_tiles - 1) {
-            pipeline_q.consumer_commit(smem_pipe_read_q, num_kv_tiles);
-            ++smem_pipe_read_q;
-          }
-
-          pipeline_v.consumer_wait(smem_pipe_read_v);
-          pipeline_p.consumer_wait(smem_pipe_read_p);
-
-          shared_pipelines.barrier_O_empty.wait(/*phase*/i % 2);
-          
-          // Compute O = P * V
-          auto K = size<2>(tOsP);
-          CUTE_UNROLL
-          for (int k = 0; k < K; ++k) {
-            cute::gemm(tiled_mma_pv.with(
-              AMMA::TrackMethod<AMMA::Tracking::DAB>{},
-              pv_mma_ctrl,
-              reinterpret_cast<uint64_t*>(&shared_pipelines.barrier_O),
-              pipeline_p.consumer_get_barrier(smem_pipe_read_p),
-              pipeline_v.consumer_get_barrier(smem_pipe_read_v),
-              mcast_mask, mcast_mask
-            ), tOsP(_, _, k, smem_pipe_read_p.index()), tOsV(_, _, k, smem_pipe_read_v.index()), tOsOacc);
-
-            pv_mma_ctrl = 0x0;
-          }
-
-          pipeline_v.consumer_commit(smem_pipe_read_v, K);
-          pipeline_p.consumer_commit(smem_pipe_read_p, K);
-          shared_pipelines.barrier_O.arrive_and_expect_tx(K);
-
-          ++smem_pipe_read_v;
-          ++smem_pipe_read_p;
-        }
-      }
-
-      // QK for the iter_0 of the next wave
-      if (!is_last_wave) {
-        if (is_valid_q_next) {
-          // shared_pipelines.barrier_Q.wait(/*phase=*/0);
-          pipeline_q.consumer_wait(smem_pipe_read_q);
-          pipeline_k.consumer_wait(smem_pipe_read_k);
-          pipeline_s.producer_acquire(smem_pipe_write_s);
-
-          // Compute S = Q * K^T
-          cute::gemm(tiled_mma_qk.with(
-            AMMA::TrackMethod<AMMA::Tracking::DAB>{},
-            qk_mma_ctrl,
-            pipeline_s.producer_get_barrier(smem_pipe_write_s),
-            pipeline_q.consumer_get_barrier(smem_pipe_read_q),
-            pipeline_k.consumer_get_barrier(smem_pipe_read_k),
-            mcast_mask, mcast_mask
-          ), tSsQ(_, _, _, smem_pipe_read_q.index()), tSsK(_, _, _, smem_pipe_read_k.index()), tSsS(_, _, _, smem_pipe_write_s.index()));
-          
-          pipeline_k.consumer_commit(smem_pipe_read_k, 1);
-
-          ++smem_pipe_read_k;
-          ++smem_pipe_write_s;
-        }
-      }
-
-      if (is_valid_q) {
-        pipeline_v.consumer_wait(smem_pipe_read_v);
-        pipeline_p.consumer_wait(smem_pipe_read_p);
-        
-        shared_pipelines.barrier_O_empty.wait(/*phase*/num_kv_tiles % 2);
-
-        // Compute O = P * V
-        auto K = size<2>(tOsP);
-        CUTE_UNROLL
-        for (int k = 0; k < K; ++k) {
-          cute::gemm(tiled_mma_pv.with(
-            AMMA::TrackMethod<AMMA::Tracking::DAB>{},
-            pv_mma_ctrl,
-            reinterpret_cast<uint64_t*>(&shared_pipelines.barrier_O),
-            pipeline_p.consumer_get_barrier(smem_pipe_read_p),
-            pipeline_v.consumer_get_barrier(smem_pipe_read_v),
-            mcast_mask, mcast_mask
-          ), tOsP(_, _, k, smem_pipe_read_p.index()), tOsV(_, _, k, smem_pipe_read_v.index()), tOsOacc);
-
-          pv_mma_ctrl = 0x0;
-        }
-
-        pipeline_v.consumer_commit(smem_pipe_read_v, K);
-        pipeline_p.consumer_commit(smem_pipe_read_p, K);
-        shared_pipelines.barrier_O.arrive_and_expect_tx(K);
-
-        ++smem_pipe_read_v;
-        ++smem_pipe_read_p;
-      }
-    }
-  }
-
-  template <typename EpilogueTensorStorage, typename EpiloguePipelineStorage, typename CollectiveSoftmax,
-            typename FragMax, typename FragExp, typename FragSum>
-  CUTLASS_DEVICE void softmax(
-    Params const& params,
-    TensorStorage& shared_tensors,
-    EpilogueTensorStorage& epi_shared_tensors,
-    PipelineStorage& shared_pipelines,
-    EpiloguePipelineStorage& epi_shared_pipelines,
-    int const num_kv_tiles,
-    MainloopPipeline pipeline_s, PipelineState& smem_pipe_read_s,
-    MainloopPipeline pipeline_p, PipelineState& smem_pipe_write_p,
-    CollectiveSoftmax& collective_softmax,
-    FragMax& max_reg, FragExp& exp_reg, FragSum& sum_reg,
-    bool is_first_wave, bool is_last_wave,
-    bool is_valid_q, bool is_valid_q_next)
-  {
     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    auto sg = item.get_sub_group();
-    uint32_t sg_id = get_sg_id();
+    uint32_t worker_id = item.get_local_linear_id();
 
-    uint32_t item_id = item.get_local_linear_id();
+    auto
+        [batch,
+         num_heads_q,
+         num_heads_kv,
+         seq_len_qo,
+         seq_len_kv,
+         head_size_qk,
+         head_size_vo] = params.problem_shape;
+
+    auto blk_m_coord = get<0>(block_coord); // seq_len_blk_idx
+    auto blk_n_coord = get<1>(block_coord); // head_size_blk_idx
+    auto batch_coord = get<2>(block_coord); // batch_blk_idx
+    auto q_num_heads_coord = get<3>(block_coord);
+    auto kv_num_heads_coord = get<4>(block_coord);
+
+    // VarLen: L dim = num_heads only (batch folded into seq dim)
+    // Non-VarLen: L dim = batch * num_heads
+    int q_blk_l_coord, kv_blk_l_coord;
+    int q_tile_offset = 0;  // cumulative Q tile offset for VarLen
+    int kv_tile_offset = 0; // cumulative KV tile offset for VarLen (non-paged)
+
+    int tma_seq_q = int(seq_len_qo);
+    int tma_seq_kv = int(seq_len_kv);
+    int tma_l_q = int(batch) * num_heads_q;
+    int tma_l_kv = int(batch) * num_heads_kv;
+
+    if constexpr (IsVarLen) {
+      q_blk_l_coord = q_num_heads_coord;
+      kv_blk_l_coord = kv_num_heads_coord;
+
+      auto* cum_q = seq_len_qo.cumulative_length;
+      int cum_q_start = cum_q[batch_coord];
+      q_tile_offset = cum_q_start / TileShapeM;
+
+      tma_seq_q = params.total_seqlen_q;
+      tma_l_q = num_heads_q;
+
+      if constexpr (IsPaged) {
+        tma_seq_kv = params.total_seqlen_kv;
+      } else {
+        auto* cum_k = seq_len_kv.cumulative_length;
+        int cum_k_start = cum_k[batch_coord];
+        kv_tile_offset = cum_k_start / TileShapeN;
+        tma_seq_kv = cum_k[int(batch)]; // total_seqlen_k
+      }
+      tma_l_kv = num_heads_kv;
+    } else {
+      q_blk_l_coord = batch_coord * num_heads_q + q_num_heads_coord;
+      kv_blk_l_coord = batch_coord * num_heads_kv + kv_num_heads_coord;
+    }
+
+    // Initialize matrix descriptor
+    auto [tdesc_q, tdesc_k, tdesc_v] = tdesc_tuple;
+    params.tma_load_Q.cache_.set_tensor_desc(tdesc_q);
+    params.tma_load_K.cache_.set_tensor_desc(tdesc_k);
+    params.tma_load_V.cache_.set_tensor_desc(tdesc_v);
+
+    Tensor mQ_mkl = params.tma_load_Q.get_tma_tensor(
+        make_shape(tma_seq_q, head_size_qk, tma_l_q)); // (M,K,L)
+    Tensor mK_nkl = params.tma_load_K.get_tma_tensor(
+        make_shape(tma_seq_kv, head_size_qk, tma_l_kv)); // (N,K,L)
+    Tensor mV_nkl = params.tma_load_V.get_tma_tensor(
+        make_shape(head_size_vo, tma_seq_kv, tma_l_kv)); // (N,K,L)
+
+    Tensor gQ = local_tile(
+        mQ_mkl(_, _, q_blk_l_coord),
+        TileShapeQK_MNK{},
+        make_coord(_, _, blk_n_coord),
+        Step<_1, X, _1>{}); // (BLK_M,BLK_K,q)
+    Tensor gK = local_tile(
+        mK_nkl(_, _, kv_blk_l_coord),
+        TileShapeQK_MNK{},
+        make_coord(_, _, blk_n_coord),
+        Step<X, _1, _1>{}); // (BLK_N,BLK_K,k)
+    Tensor gV = local_tile(
+        mV_nkl(_, _, kv_blk_l_coord),
+        TileShapePV_MNK{},
+        make_coord(_, blk_n_coord, _),
+        Step<X, _1, _1>{}); // (BLK_N,BLK_K,k)
+
+    Tensor sQ = make_tensor(
+        make_smem_ptr(shared_tensors.smem_Q.data()),
+        SmemLayoutQ{}); // (BLK_M,BLK_K,PIPE)
+    Tensor sK = make_tensor(
+        make_smem_ptr(shared_tensors.smem_K.data()),
+        SmemLayoutK{}); // (BLK_N,BLK_K,PIPE)
+    Tensor sV = make_tensor(
+        make_smem_ptr(shared_tensors.smem_V.data()),
+        SmemLayoutV{}); // (BLK_N,BLK_K,PIPE)
+
+    auto [tQgQ, tQsQ] = tma_partition(
+        params.tma_load_Q,
+        _0{},
+        Layout<_1>{},
+        group_modes<0, 2>(sQ),
+        group_modes<0, 2>(gQ)); // (TMA,q), (TMA,PIPE)
+    auto [tKgK, tKsK] = tma_partition(
+        params.tma_load_K,
+        _0{},
+        Layout<_1>{},
+        group_modes<0, 2>(sK),
+        group_modes<0, 2>(gK)); // (TMA,k), (TMA,PIPE)
+    auto [tVgV, tVsV] = tma_partition(
+        params.tma_load_V,
+        _0{},
+        Layout<_1>{},
+        group_modes<0, 2>(sV),
+        group_modes<0, 2>(gV)); // (TMA,k), (TMA,PIPE)
+
+    constexpr uint32_t mcast_mask = 0;
+
+    // Q tile indices: offset by cumulative_length for VarLen
+    int q0_index = q_tile_offset + NumStageQO * blk_m_coord;
+    int q1_index = q_tile_offset + NumStageQO * blk_m_coord + 1;
+
+    pipeline_q.producer_acquire(pipeline_q_producer_state);
+    copy(
+        params.tma_load_Q.with(
+            pipeline_q.producer_get_barrier(pipeline_q_producer_state),
+            mcast_mask),
+        tQgQ(_, q0_index),
+        tQsQ(_, pipeline_q_producer_state.index()));
+    ++pipeline_q_producer_state;
+
+    // First KV tile: apply paged or VarLen offset
+    auto kv_tile_idx = [&](int i) -> int {
+      if constexpr (IsPaged) {
+        return get_paged_idx(params, i, batch_coord);
+      } else {
+        return i + kv_tile_offset;
+      }
+    };
+
+    pipeline_k.producer_acquire(pipeline_k_producer_state);
+    copy(
+        params.tma_load_K.with(
+            pipeline_k.producer_get_barrier(pipeline_k_producer_state),
+            mcast_mask),
+        tKgK(_, kv_tile_idx(0)),
+        tKsK(_, pipeline_k_producer_state.index()));
+    ++pipeline_k_producer_state;
+
+    pipeline_q.producer_acquire(pipeline_q_producer_state);
+    copy(
+        params.tma_load_Q.with(
+            pipeline_q.producer_get_barrier(pipeline_q_producer_state),
+            mcast_mask),
+        tQgQ(_, q1_index),
+        tQsQ(_, pipeline_q_producer_state.index()));
+    ++pipeline_q_producer_state;
+
+    pipeline_v.producer_acquire(pipeline_v_producer_state);
+    copy(
+        params.tma_load_V.with(
+            pipeline_v.producer_get_barrier(pipeline_v_producer_state),
+            mcast_mask),
+        tVgV(_, kv_tile_idx(0)),
+        tVsV(_, pipeline_v_producer_state.index()));
+    ++pipeline_v_producer_state;
+
+    int num_kv_tiles = num_kv_tiles_;
+    // Causal tile count uses local (within-batch) Q position
+    int q1_local = NumStageQO * blk_m_coord + 1;
+    num_kv_tiles = q1_local * TileShapeM / TileShapeN + 1;
+    num_kv_tiles = num_kv_tiles > 1 ? num_kv_tiles : 2;
+
+    for (int i = 1; i < num_kv_tiles; ++i) {
+      pipeline_k.producer_acquire(pipeline_k_producer_state);
+      copy(
+          params.tma_load_K.with(
+              pipeline_k.producer_get_barrier(pipeline_k_producer_state),
+              mcast_mask),
+          tKgK(_, kv_tile_idx(i)),
+          tKsK(_, pipeline_k_producer_state.index()));
+      ++pipeline_k_producer_state;
+
+      pipeline_v.producer_acquire(pipeline_v_producer_state);
+      copy(
+          params.tma_load_V.with(
+              pipeline_v.producer_get_barrier(pipeline_v_producer_state),
+              mcast_mask),
+          tVgV(_, kv_tile_idx(i)),
+          tVsV(_, pipeline_v_producer_state.index()));
+      ++pipeline_v_producer_state;
+    }
+  }
+
+  template <typename BlockCoord>
+  CUTLASS_DEVICE void mma(
+      TensorStorage& shared_tensors,
+      PipelineStorage& shared_pipelines,
+      BlockCoord const& block_coord,
+      int const num_kv_tiles_,
+      PipelineQ& pipeline_q,
+      PipelineQ::PipelineState& pipeline_q_consumer_state,
+      PipelineK& pipeline_k,
+      PipelineK::PipelineState& pipeline_k_consumer_state,
+      PipelineV& pipeline_v,
+      PipelineV::PipelineState& pipeline_v_consumer_state,
+      PipelineS& pipeline_s,
+      PipelineS::PipelineState& pipeline_s_producer_state,
+      PipelineO& pipeline_corr,
+      PipelineO::PipelineState& pipeline_corr_producer_state,
+      bool is_first_wave,
+      bool is_last_wave) {
     int thread_idx = static_cast<int>(ThreadIdxX());
-    
-    // also minus the mma and store warp
-    uint32_t worker_id = item_id - sg_size * NumControlerWarps;
-    bool lane_predicate = cute::elect_one_sync();
 
     TiledMmaQK tiled_mma_qk;
     TiledMmaPV tiled_mma_pv;
 
-    auto thr_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx);
     auto thr_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
+    auto thr_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx);
 
-    auto tiled_copy_s2r_update = collective_softmax.get_params().tiled_copy_s2r_update;
+    Tensor sQ = make_tensor(
+        make_smem_ptr(shared_tensors.smem_Q.data()),
+        SmemLayoutQ{}); // (BLK_M,BLK_K,PIPE)
+    Tensor sK = make_tensor(
+        make_smem_ptr(shared_tensors.smem_K.data()),
+        SmemLayoutK{}); // (BLK_N,BLK_K,PIPE)
+    Tensor sV = make_tensor(
+        make_smem_ptr(shared_tensors.smem_V.data()),
+        SmemLayoutV{}); // (BLK_N,BLK_K,PIPE)
+    Tensor sS = make_tensor(
+        make_smem_ptr(shared_tensors.smem_S.data()),
+        SmemLayoutS{}); // (BLK_M,BLK_N,PIPE)
+    Tensor sP = make_tensor(
+        make_smem_ptr(shared_tensors.smem_P.data()),
+        SmemLayoutP{}); // (BLK_M,BLK_K,PIPE)
+    Tensor sOacc = make_tensor(
+        make_smem_ptr(shared_tensors.smem_Oacc.data()),
+        SmemLayoutOutputAccum{}); // (BLK_M,BLK_N,PIPE)
+
+    // Matrix descriptors
+    Tensor tSsQ = thr_mma_qk.partition_fragment_A(sQ); // (MMA,MMA_M,MMA_K,PIPE)
+    Tensor tSsK = thr_mma_qk.partition_fragment_B(sK); // (MMA,MMA_N,MMA_K,PIPE)
+    Tensor tOsV = thr_mma_pv.partition_fragment_B(sV); // (MMA,MMA_N,MMA_K,PIPE)
+    Tensor tSsS = thr_mma_qk.partition_fragment_C(sS); // (MMA,MMA_M,MMA_N,PIPE)
+    Tensor tOsP = thr_mma_pv.partition_fragment_A(sP); // (MMA,MMA_M,MMA_K,PIPE)
+    Tensor tOsOacc =
+        thr_mma_pv.partition_fragment_C(sOacc); // (MMA,MMA_M,MMA_N, PIPE)
+
+    constexpr uint64_t qk_mma_ctrl = 0x100;
+    uint64_t pv_mma_ctrl_0 = 0x100;
+    uint64_t pv_mma_ctrl_1 = 0x100;
+
+    constexpr uint32_t mcast_mask = 0;
+
+    constexpr int qk_mma_k_itr = size<2>(tSsQ); // 1
+    constexpr int pv_mma_k_itr = size<2>(tOsP); // 4
+
+    int num_kv_tiles = num_kv_tiles_;
+    num_kv_tiles = (2 * get<0>(block_coord) + 1) * TileShapeM / TileShapeN + 1;
+    num_kv_tiles = num_kv_tiles > 1 ? num_kv_tiles : 2;
+
+    // Compute the S1 and S2 for the first wave. Note, if not the first wave, S1
+    // and S2 computation will be done in the end of the previous wave
+    if (is_first_wave) {
+      pipeline_q.consumer_wait(pipeline_q_consumer_state);
+      pipeline_k.consumer_wait(pipeline_k_consumer_state);
+
+      pipeline_s.producer_acquire(pipeline_s_producer_state);
+
+      // gemm Q1 * K1 -> S1
+      CUTE_UNROLL
+      for (int k = 0; k < qk_mma_k_itr; ++k) {
+        cute::gemm(
+            tiled_mma_qk.with(
+                AMMA::TrackMethod<AMMA::Tracking::DAB>{},
+                qk_mma_ctrl,
+                pipeline_s.producer_get_barrier(pipeline_s_producer_state),
+                pipeline_q.consumer_get_barrier(pipeline_q_consumer_state),
+                pipeline_k.consumer_get_barrier(pipeline_k_consumer_state),
+                mcast_mask,
+                mcast_mask),
+            tSsQ(_, _, k, _0{}),
+            tSsK(_, _, k, pipeline_k_consumer_state.index()),
+            tSsS(_, _, _, _0{}));
+      }
+
+      if (num_kv_tiles == 1) {
+        pipeline_q.consumer_commit(pipeline_q_consumer_state, 1);
+      }
+      ++pipeline_q_consumer_state;
+      ++pipeline_s_producer_state;
+
+      pipeline_q.consumer_wait(pipeline_q_consumer_state);
+
+      pipeline_s.producer_acquire(pipeline_s_producer_state);
+
+      // gemm Q2 * K1 -> S2
+      CUTE_UNROLL
+      for (int k = 0; k < qk_mma_k_itr; ++k) {
+        cute::gemm(
+            tiled_mma_qk.with(
+                AMMA::TrackMethod<AMMA::Tracking::DAB>{},
+                qk_mma_ctrl,
+                pipeline_s.producer_get_barrier(pipeline_s_producer_state),
+                pipeline_q.consumer_get_barrier(pipeline_q_consumer_state),
+                pipeline_k.consumer_get_barrier(pipeline_k_consumer_state),
+                mcast_mask,
+                mcast_mask),
+            tSsQ(_, _, k, _1{}),
+            tSsK(_, _, k, pipeline_k_consumer_state.index()),
+            tSsS(_, _, _, _1{}));
+      }
+
+      if (num_kv_tiles == 1) {
+        pipeline_q.consumer_commit(pipeline_q_consumer_state, 1);
+      }
+      ++pipeline_q_consumer_state;
+      ++pipeline_s_producer_state;
+
+      pipeline_k.consumer_commit(pipeline_k_consumer_state, 2 * qk_mma_k_itr);
+      ++pipeline_k_consumer_state;
+    }
+
+    for (int i = 1; i < num_kv_tiles; ++i) {
+      pipeline_v.consumer_wait(pipeline_v_consumer_state);
+
+      pipeline_corr.producer_acquire(pipeline_corr_producer_state);
+
+      pipeline_s.producer_acquire(pipeline_s_producer_state);
+
+      // gemm P1 * V(i-1) -> O1
+      CUTE_UNROLL
+      for (int k = 0; k < pv_mma_k_itr; ++k) {
+        cute::gemm(
+            tiled_mma_pv.with(
+                AMMA::TrackMethod<AMMA::Tracking::DAB>{},
+                pv_mma_ctrl_0,
+                pipeline_corr.producer_get_barrier(
+                    pipeline_corr_producer_state),
+                reinterpret_cast<uint64_t*>(&shared_pipelines.barrier_dummy),
+                pipeline_v.consumer_get_barrier(pipeline_v_consumer_state),
+                mcast_mask,
+                mcast_mask),
+            tOsP(_, _, k, _0{}),
+            tOsV(_, _, k, pipeline_v_consumer_state.index()),
+            tOsOacc(_, _, _, _0{}));
+
+        pv_mma_ctrl_0 = 0x0;
+      }
+
+      ++pipeline_corr_producer_state;
+
+      pipeline_k.consumer_wait(pipeline_k_consumer_state);
+
+      typename PipelineQ::PipelineState tmp_state; // stage = 0
+
+      // gemm Q1 * Ki -> S1
+      CUTE_UNROLL
+      for (int k = 0; k < qk_mma_k_itr; ++k) {
+        cute::gemm(
+            tiled_mma_qk.with(
+                AMMA::TrackMethod<AMMA::Tracking::DAB>{},
+                qk_mma_ctrl,
+                pipeline_s.producer_get_barrier(pipeline_s_producer_state),
+                pipeline_q.consumer_get_barrier(tmp_state),
+                pipeline_k.consumer_get_barrier(pipeline_k_consumer_state),
+                mcast_mask,
+                mcast_mask),
+            tSsQ(_, _, k, _0{}),
+            tSsK(_, _, k, pipeline_k_consumer_state.index()),
+            tSsS(_, _, _, _0{}));
+      }
+
+      // Finish the use of Q1 tile for current wave
+      if (i == num_kv_tiles - 1) {
+        pipeline_q.consumer_commit(tmp_state, num_kv_tiles);
+      }
+
+      ++pipeline_s_producer_state;
+
+      pipeline_corr.producer_acquire(pipeline_corr_producer_state);
+
+      pipeline_s.producer_acquire(pipeline_s_producer_state);
+
+      // gemm P2 * V(i-1) -> O2
+      CUTE_UNROLL
+      for (int k = 0; k < pv_mma_k_itr; ++k) {
+        cute::gemm(
+            tiled_mma_pv.with(
+                AMMA::TrackMethod<AMMA::Tracking::DAB>{},
+                pv_mma_ctrl_1,
+                pipeline_corr.producer_get_barrier(
+                    pipeline_corr_producer_state),
+                reinterpret_cast<uint64_t*>(&shared_pipelines.barrier_dummy),
+                pipeline_v.consumer_get_barrier(pipeline_v_consumer_state),
+                mcast_mask,
+                mcast_mask),
+            tOsP(_, _, k, _1{}),
+            tOsV(_, _, k, pipeline_v_consumer_state.index()),
+            tOsOacc(_, _, _, _1{}));
+
+        pv_mma_ctrl_1 = 0x0;
+      }
+
+      ++pipeline_corr_producer_state;
+
+      pipeline_v.consumer_commit(pipeline_v_consumer_state, 2 * pv_mma_k_itr);
+      ++pipeline_v_consumer_state;
+
+      ++tmp_state; // stage = 1
+
+      // gemm Q2 * Ki -> S2
+      CUTE_UNROLL
+      for (int k = 0; k < qk_mma_k_itr; ++k) {
+        cute::gemm(
+            tiled_mma_qk.with(
+                AMMA::TrackMethod<AMMA::Tracking::DAB>{},
+                qk_mma_ctrl,
+                pipeline_s.producer_get_barrier(pipeline_s_producer_state),
+                pipeline_q.consumer_get_barrier(tmp_state),
+                pipeline_k.consumer_get_barrier(pipeline_k_consumer_state),
+                mcast_mask,
+                mcast_mask),
+            tSsQ(_, _, k, _1{}),
+            tSsK(_, _, k, pipeline_k_consumer_state.index()),
+            tSsS(_, _, _, _1{}));
+      }
+
+      // Finish the use of Q2 tile for current wave
+      if (i == num_kv_tiles - 1) {
+        pipeline_q.consumer_commit(tmp_state, num_kv_tiles);
+      }
+
+      ++pipeline_s_producer_state;
+
+      pipeline_k.consumer_commit(pipeline_k_consumer_state, 2 * qk_mma_k_itr);
+      ++pipeline_k_consumer_state;
+    }
+
+    pipeline_v.consumer_wait(pipeline_v_consumer_state);
+
+    pipeline_corr.producer_acquire(pipeline_corr_producer_state);
+
+    pipeline_s.producer_acquire(pipeline_s_producer_state);
+
+    // gemm P1 * Vn -> O1
+    CUTE_UNROLL
+    for (int k = 0; k < pv_mma_k_itr; ++k) {
+      cute::gemm(
+          tiled_mma_pv.with(
+              AMMA::TrackMethod<AMMA::Tracking::DAB>{},
+              pv_mma_ctrl_0,
+              pipeline_corr.producer_get_barrier(pipeline_corr_producer_state),
+              reinterpret_cast<uint64_t*>(&shared_pipelines.barrier_dummy),
+              pipeline_v.consumer_get_barrier(pipeline_v_consumer_state),
+              mcast_mask,
+              mcast_mask),
+          tOsP(_, _, k, _0{}),
+          tOsV(_, _, k, pipeline_v_consumer_state.index()),
+          tOsOacc(_, _, _, _0{}));
+
+      pv_mma_ctrl_0 = 0x0;
+    }
+
+    // Optionally compute S1 for the next wave
+    if (!is_last_wave) {
+      pipeline_q.consumer_wait(pipeline_q_consumer_state);
+      pipeline_k.consumer_wait(pipeline_k_consumer_state);
+
+      // gemm Q1 * K1 -> S1
+      CUTE_UNROLL
+      for (int k = 0; k < qk_mma_k_itr; ++k) {
+        cute::gemm(
+            tiled_mma_qk.with(
+                AMMA::TrackMethod<AMMA::Tracking::DAB>{},
+                qk_mma_ctrl,
+                pipeline_s.producer_get_barrier(pipeline_s_producer_state),
+                pipeline_q.consumer_get_barrier(pipeline_q_consumer_state),
+                pipeline_k.consumer_get_barrier(pipeline_k_consumer_state),
+                mcast_mask,
+                mcast_mask),
+            tSsQ(_, _, k, 0 /* stage=0 */),
+            tSsK(_, _, k, pipeline_k_consumer_state.index()),
+            tSsS(_, _, _, pipeline_s_producer_state.index()));
+      }
+
+      ++pipeline_q_consumer_state;
+    }
+
+    ++pipeline_s_producer_state;
+
+    ++pipeline_corr_producer_state;
+
+    pipeline_corr.producer_acquire(pipeline_corr_producer_state);
+
+    pipeline_s.producer_acquire(pipeline_s_producer_state);
+
+    // gemm P2 * Vn -> O2
+    CUTE_UNROLL
+    for (int k = 0; k < pv_mma_k_itr; ++k) {
+      cute::gemm(
+          tiled_mma_pv.with(
+              AMMA::TrackMethod<AMMA::Tracking::DAB>{},
+              pv_mma_ctrl_1,
+              pipeline_corr.producer_get_barrier(pipeline_corr_producer_state),
+              reinterpret_cast<uint64_t*>(&shared_pipelines.barrier_dummy),
+              pipeline_v.consumer_get_barrier(pipeline_v_consumer_state),
+              mcast_mask,
+              mcast_mask),
+          tOsP(_, _, k, _1{}),
+          tOsV(_, _, k, pipeline_v_consumer_state.index()),
+          tOsOacc(_, _, _, _1{}));
+
+      pv_mma_ctrl_1 = 0x0;
+    }
+
+    // Optionally compute S2 for the next wave
+    if (!is_last_wave) {
+      pipeline_q.consumer_wait(pipeline_q_consumer_state);
+
+      // gemm Q2 * K1 -> S2
+      CUTE_UNROLL
+      for (int k = 0; k < qk_mma_k_itr; ++k) {
+        cute::gemm(
+            tiled_mma_qk.with(
+                AMMA::TrackMethod<AMMA::Tracking::DAB>{},
+                qk_mma_ctrl,
+                pipeline_s.producer_get_barrier(pipeline_s_producer_state),
+                pipeline_q.consumer_get_barrier(pipeline_q_consumer_state),
+                pipeline_k.consumer_get_barrier(pipeline_k_consumer_state),
+                mcast_mask,
+                mcast_mask),
+            tSsQ(_, _, k, 1 /* stage=1 */),
+            tSsK(_, _, k, pipeline_k_consumer_state.index()),
+            tSsS(_, _, _, pipeline_s_producer_state.index()));
+      }
+
+      ++pipeline_q_consumer_state;
+
+      pipeline_k.consumer_commit(pipeline_k_consumer_state, 2 * qk_mma_k_itr);
+      ++pipeline_k_consumer_state;
+    }
+
+    ++pipeline_s_producer_state;
+    ++pipeline_corr_producer_state;
+
+    pipeline_v.consumer_commit(pipeline_v_consumer_state, 2 * pv_mma_k_itr);
+    ++pipeline_v_consumer_state;
+  }
+
+  template <
+      typename CollectiveSoftmax,
+      typename EpiTensorStorage,
+      typename BlockCoord>
+  CUTLASS_DEVICE void softmax(
+      CollectiveSoftmax& collective_softmax,
+      TensorStorage& shared_tensors,
+      EpiTensorStorage& epi_shared_tensors,
+      int const num_kv_tiles_,
+      uint32_t worker_id,
+      PipelineS& pipeline_s,
+      PipelineS::PipelineState& pipeline_s_consumer_state,
+      PipelineO& pipeline_o,
+      PipelineO::PipelineState& pipeline_o_consumer_state,
+      PipelineEpi& pipeline_epi,
+      PipelineEpi::PipelineState& pipeline_epi_producer_state,
+      ElementS (*max_reg)[CollectiveSoftmax::TotalRowsPerThread],
+      ElementAccum* exp_reg,
+      ElementAccum (*sum_reg)[CollectiveSoftmax::TotalRowsPerThread],
+      bool is_first_wave,
+      bool is_last_wave,
+      BlockCoord const& block_coord,
+      bool is_causal,
+      int actual_kv_len,
+      int causal_offset) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = item.get_sub_group();
+
+    // get<0>(block_coord) is already batch-local: the tile scheduler's
+    // grid.x = ceil_div(max_queries, block_size), so each batch-head
+    // pair starts from X=0.
+    int q_tile_local = get<0>(block_coord);
+
+    auto tiled_copy_s2r_update =
+        collective_softmax.get_params().tiled_copy_s2r_update;
     auto thr_copy_s2r_update = tiled_copy_s2r_update.get_slice(worker_id);
 
-    auto tiled_copy_r2s_rescale_o = collective_softmax.get_params().tiled_copy_r2s_rescale_o;
+    auto tiled_copy_r2s_rescale_o =
+        collective_softmax.get_params().tiled_copy_r2s_rescale_o;
     auto thr_copy_r2s_rescale_o = tiled_copy_r2s_rescale_o.get_slice(worker_id);
 
-    auto tiled_copy_r2s_final_rescale_o = collective_softmax.get_params().tiled_copy_r2s_final_rescale_o;
-    auto thr_copy_r2s_final_rescale_o = tiled_copy_r2s_final_rescale_o.get_slice(worker_id);
-
-    Tensor sS = make_tensor(make_smem_ptr(shared_tensors.smem_S.data()), SmemLayoutS{});  // (BLK_M,BLK_N,PIPE)
-    Tensor sP = make_tensor(make_smem_ptr(shared_tensors.smem_P.data()), SmemLayoutP{});  // (BLK_M,BLK_N,PIPE)
-    Tensor sOac = make_tensor(make_smem_ptr(shared_tensors.smem_Oacc.data()), SmemLayoutOutputAccum{});  // (BLK_M,BLK_N)
+    auto tiled_copy_r2s_final_rescale_o =
+        collective_softmax.get_params().tiled_copy_r2s_final_rescale_o;
+    auto thr_copy_r2s_final_rescale_o =
+        tiled_copy_r2s_final_rescale_o.get_slice(worker_id);
 
     // Matrix descriptors
     using dtype_packed = uint32_t;
     constexpr auto kv_stride = shape<1>(TileShapeQK_MNK{});
     constexpr auto q_stride = shape<0>(TileShapeQK_MNK{});
-    constexpr auto slm_bytes_per_s_stage = q_stride * kv_stride * sizeof(ElementS);
-    constexpr auto slm_bytes_per_p_stage = q_stride * kv_stride * sizeof(ElementP);
-    constexpr uint32_t packed_row_size_s = kv_stride * sizeof(ElementS) / sizeof(dtype_packed);
-    constexpr uint32_t packed_row_size_p = kv_stride * sizeof(ElementP) / sizeof(dtype_packed);
-    auto tOsS = matrix_desc_t(shared_tensors.smem_S.data(), packed_row_size_s, slm_matrix_type::type1);
-#ifdef USE_LD_ST_MATRIX
-    auto tOsP = matrix_desc_t(shared_tensors.smem_P.data(), packed_row_size_p, slm_matrix_type::type1);
-#else
-    auto tOsP = matrix_desc_t(shared_tensors.smem_P.data(), kv_stride, slm_matrix_type::type1);
-#endif
+    constexpr uint32_t packed_row_size_s =
+        kv_stride * sizeof(ElementS) / sizeof(dtype_packed);
+    constexpr uint32_t packed_row_size_p =
+        kv_stride * sizeof(ElementP) / sizeof(dtype_packed);
+    constexpr auto slm_bytes_per_s_stage =
+        q_stride * kv_stride * sizeof(ElementS);
+    constexpr auto slm_bytes_per_p_stage =
+        q_stride * kv_stride * sizeof(ElementP);
 
     constexpr auto o_row_len = shape<1>(TileShapePV_MNK{});
     constexpr uint32_t row_size_oacc = o_row_len; // matrix stride in elements
     constexpr uint32_t row_size_o = o_row_len;
-    auto tOsOacc = matrix_desc_t(shared_tensors.smem_Oacc.data(), row_size_oacc, slm_matrix_type::type1);
-    auto tOsO = matrix_desc_t(epi_shared_tensors.smem_O.data(), row_size_o, slm_matrix_type::type1);
+    constexpr auto slm_bytes_per_oacc_stage =
+        q_stride * row_size_oacc * sizeof(ElementAccum);
+    constexpr auto slm_bytes_per_o_stage =
+        q_stride * row_size_o * sizeof(ElementOutput);
 
-    auto retiled_layout_sS = cutlass::epilogue::thread::detail::CoreMatrix::retile<ElementS>(SmemLayoutS{});
-    Tensor sS_post_process = make_tensor(make_smem_ptr(shared_tensors.smem_S.begin()), retiled_layout_sS);
-    Tensor tSR_sS = group_modes<1, 3>(thr_copy_s2r_update.partition_S(sS_post_process));
+    auto tOsS = matrix_desc_t(
+        shared_tensors.smem_S.data(),
+        packed_row_size_s,
+        slm_matrix_type::type1);
+#ifdef USE_LD_ST_MATRIX
+    auto tOsP = matrix_desc_t(
+        shared_tensors.smem_P.data(),
+        packed_row_size_p,
+        slm_matrix_type::type1);
+#else
+    auto tOsP = matrix_desc_t(
+        shared_tensors.smem_P.data(), kv_stride, slm_matrix_type::type1);
+#endif
+    auto tOsOacc = matrix_desc_t(
+        shared_tensors.smem_Oacc.data(), row_size_oacc, slm_matrix_type::type1);
+    auto tOsO = matrix_desc_t(
+        epi_shared_tensors.smem_O.data(), row_size_o, slm_matrix_type::type1);
 
-    auto retiled_layout_sOacc = cutlass::epilogue::thread::detail::CoreMatrix::retile_2d<ElementAccum>(SmemLayoutOutputAccum{});
-    Tensor sOacc_post_process = make_tensor(make_smem_ptr(shared_tensors.smem_Oacc.begin()), retiled_layout_sOacc);
-    Tensor tSR_sOacc = group_modes<1, -1>(thr_copy_r2s_rescale_o.partition_D(sOacc_post_process));
+    auto retiled_layout_sS =
+        cutlass::epilogue::thread::detail::CoreMatrix::retile<ElementS>(
+            SmemLayoutS{});
+    Tensor sS_post_process = make_tensor(
+        make_smem_ptr(shared_tensors.smem_S.begin()), retiled_layout_sS);
+    Tensor tSR_sS =
+        group_modes<1, 3>(thr_copy_s2r_update.partition_S(sS_post_process));
 
-    auto retiled_layout_sO = cutlass::epilogue::thread::detail::CoreMatrix::retile_2d<ElementOutput>(SmemLayoutOutput{});
-    Tensor sO_post_process = make_tensor(make_smem_ptr(epi_shared_tensors.smem_O.begin()), retiled_layout_sO);
-    Tensor tSR_sO = group_modes<1, -1>(thr_copy_r2s_final_rescale_o.partition_D(sO_post_process));
+    auto retiled_layout_sOacc =
+        cutlass::epilogue::thread::detail::CoreMatrix::retile<ElementAccum>(
+            SmemLayoutOutputAccum{});
+    Tensor sOacc_post_process = make_tensor(
+        make_smem_ptr(shared_tensors.smem_Oacc.begin()), retiled_layout_sOacc);
+    Tensor tSR_sOacc = group_modes<1, 3>(thr_copy_r2s_rescale_o.partition_D(
+        sOacc_post_process)); // (VEC,VEC_M,PIPE)
 
-    constexpr uint32_t total_rows_per_wi = CollectiveSoftmax::TotalRowsPerThread;
+    auto retiled_layout_sO =
+        cutlass::epilogue::thread::detail::CoreMatrix::retile<ElementOutput>(
+            SmemLayoutOutput{});
+    Tensor sO_post_process = make_tensor(
+        make_smem_ptr(epi_shared_tensors.smem_O.begin()), retiled_layout_sO);
+    Tensor tSR_sO = group_modes<1, 3>(thr_copy_r2s_final_rescale_o.partition_D(
+        sO_post_process)); // (VEC,VEC_M,PIPE)
 
-    if (is_valid_q) {
-      // softmax for the iter_0 of the first wave
-      if (is_first_wave) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < total_rows_per_wi; ++i) {
-          max_reg[i] = -INFINITY;
-          sum_reg[i] = ElementAccum(0);
-        }
+    constexpr uint32_t total_rows_per_wi =
+        CollectiveSoftmax::TotalRowsPerThread;
 
-        pipeline_s.consumer_wait(smem_pipe_read_s);
-        pipeline_p.producer_acquire(smem_pipe_write_p);
-
-        collective_softmax.template update</*init=*/true>(sg, worker_id, 
-                                                          tSR_sS(_, _, smem_pipe_read_s.index()), 
-                                                          // *tOsS(_, _, _, smem_pipe_read_s.index()).data(),
-                                                          tOsS + smem_pipe_read_s.index() * slm_bytes_per_s_stage,
-                                                          max_reg, sum_reg, exp_reg, 
-                                                          // *tOsP(_, _, _, smem_pipe_write_p.index()).data(),
-                                                          tOsP + smem_pipe_write_p.index() * slm_bytes_per_p_stage);
-
-        pipeline_s.consumer_release(smem_pipe_read_s);
-        pipeline_p.producer_commit(smem_pipe_write_p, 1);
-
-        ++smem_pipe_read_s;
-        ++smem_pipe_write_p;
-      }
-
-      for (int i = 1; i < num_kv_tiles; ++i) {
-        pipeline_s.consumer_wait(smem_pipe_read_s);
-        pipeline_p.producer_acquire(smem_pipe_write_p);
-
-        // softmax for iter_i
-        collective_softmax.template update</*init=*/false>(sg, worker_id, 
-                                                            tSR_sS(_, _, smem_pipe_read_s.index()), 
-                                                          //  *tOsS(_, _, _, smem_pipe_read_s.index()).data(),
-                                                            tOsS + smem_pipe_read_s.index() * slm_bytes_per_s_stage,
-                                                            max_reg, sum_reg, exp_reg, 
-                                                          //  *tOsP(_, _, _, smem_pipe_write_p.index()).data(),
-                                                            tOsP + smem_pipe_write_p.index() * slm_bytes_per_p_stage);
-
-        // rescale O for iter_i-1
-        shared_pipelines.barrier_O.wait(/*phase=*/1 - (i % 2)); // phase = (i-1)%2
-        collective_softmax.rescale_O(sg, worker_id, tSR_sOacc, tOsOacc, exp_reg);
-
-        shared_pipelines.barrier_O_empty.arrive();
-        pipeline_p.producer_commit(smem_pipe_write_p, 1);
-        pipeline_s.consumer_release(smem_pipe_read_s);
-
-        ++smem_pipe_read_s;
-        ++smem_pipe_write_p;
-      }
+    int num_kv_tiles_0 = num_kv_tiles_;
+    int num_kv_tiles_1 = num_kv_tiles_;
+    if (is_causal) {
+      num_kv_tiles_0 =
+          ((2 * q_tile_local) * TileShapeM + causal_offset) / TileShapeN + 1;
+      num_kv_tiles_1 =
+          ((2 * q_tile_local + 1) * TileShapeM + causal_offset) / TileShapeN + 1;
+      num_kv_tiles_0 = num_kv_tiles_0 > 1 ? num_kv_tiles_0 : 2;
+      num_kv_tiles_1 = num_kv_tiles_1 > 1 ? num_kv_tiles_1 : 2;
     }
 
-    Tensor sum_reg_next = make_tensor<ElementAccum>(Shape<Int<total_rows_per_wi>>{});
-    if (is_valid_q_next) {
-      // softmax for the iter_0 of the next wave
-      if (!is_last_wave) {
-        CUTLASS_PRAGMA_UNROLL
+    if (is_first_wave) {
+      for (int stage = 0; stage < NumStageQO; ++stage) {
         for (int i = 0; i < total_rows_per_wi; ++i) {
-          max_reg[i] = -INFINITY;
-          sum_reg_next[i] = ElementAccum(0);
+          max_reg[stage][i] = -INFINITY;
+          sum_reg[stage][i] = ElementAccum(0);
         }
-
-        pipeline_s.consumer_wait(smem_pipe_read_s);
-        pipeline_p.producer_acquire(smem_pipe_write_p);
-
-        collective_softmax.template update</*init=*/true>(sg, worker_id, 
-                                                          tSR_sS(_, _, smem_pipe_read_s.index()), 
-                                                          // *tOsS(_, _, _, smem_pipe_read_s.index()).data(),
-                                                          tOsS + smem_pipe_read_s.index() * slm_bytes_per_s_stage,
-                                                          max_reg, sum_reg_next, exp_reg, 
-                                                          // *tOsP(_, _, _, smem_pipe_write_p.index()).data(),
-                                                          tOsP + smem_pipe_write_p.index() * slm_bytes_per_p_stage);
-
-        pipeline_s.consumer_release(smem_pipe_read_s);
-        pipeline_p.producer_commit(smem_pipe_write_p, 1);
-
-        ++smem_pipe_read_s;
-        ++smem_pipe_write_p;
       }
+
+      pipeline_s.consumer_wait(pipeline_s_consumer_state);
+
+      collective_softmax.template update<true>(
+          0,
+          sg,
+          worker_id,
+          tSR_sS(_, _, _0{}),
+          tOsS,
+          max_reg[0],
+          sum_reg[0],
+          exp_reg,
+          tOsP,
+          2 * q_tile_local,
+          0,
+          is_causal,
+          actual_kv_len,
+          causal_offset);
+
+      pipeline_s.consumer_release(pipeline_s_consumer_state);
+      ++pipeline_s_consumer_state;
+
+      pipeline_s.consumer_wait(pipeline_s_consumer_state);
+
+      collective_softmax.template update<true>(
+          1,
+          sg,
+          worker_id,
+          tSR_sS(_, _, _1{}),
+          tOsS + slm_bytes_per_s_stage,
+          max_reg[1],
+          sum_reg[1],
+          exp_reg,
+          tOsP + slm_bytes_per_p_stage,
+          (2 * q_tile_local + 1),
+          0,
+          is_causal,
+          actual_kv_len,
+          causal_offset);
+
+      pipeline_s.consumer_release(pipeline_s_consumer_state);
+      ++pipeline_s_consumer_state;
     }
 
-    if (is_valid_q) {
-      shared_pipelines.barrier_O.wait(/*phase=*/(num_kv_tiles - 1) % 2);
+    for (int kv_tile = 1; kv_tile < num_kv_tiles_1; ++kv_tile) {
+      pipeline_s.consumer_wait(pipeline_s_consumer_state);
 
-      collective_softmax.final_rescale_O(sg, worker_id, tSR_sOacc, tSR_sO, 
-                                        tOsOacc, tOsO, 
-                                        sum_reg);
+      collective_softmax.template update<false>(
+          2,
+          sg,
+          worker_id,
+          tSR_sS(_, _, _0{}),
+          tOsS,
+          max_reg[0],
+          sum_reg[0],
+          exp_reg,
+          tOsP,
+          2 * q_tile_local,
+          kv_tile,
+          is_causal ? (kv_tile == num_kv_tiles_0 - 1) : false,
+          actual_kv_len,
+          causal_offset);
 
-      if (!is_last_wave) {
-        if (is_valid_q_next) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < total_rows_per_wi; ++i) {
-            sum_reg[i] = sum_reg_next[i];
-          }
-        }
+      pipeline_s.consumer_release(pipeline_s_consumer_state);
+      ++pipeline_s_consumer_state;
+
+      pipeline_o.consumer_wait(pipeline_o_consumer_state);
+
+      collective_softmax.rescale_O(
+          sg, worker_id, tSR_sOacc(_, _, _0{}), tOsOacc, exp_reg);
+
+      pipeline_o.consumer_release(pipeline_o_consumer_state);
+      ++pipeline_o_consumer_state;
+
+      pipeline_s.consumer_wait(pipeline_s_consumer_state);
+
+      collective_softmax.template update<false>(
+          3,
+          sg,
+          worker_id,
+          tSR_sS(_, _, _1{}),
+          tOsS + slm_bytes_per_s_stage,
+          max_reg[1],
+          sum_reg[1],
+          exp_reg,
+          tOsP + slm_bytes_per_p_stage,
+          2 * q_tile_local + 1,
+          kv_tile,
+          is_causal ? (kv_tile == num_kv_tiles_1 - 1) : false,
+          actual_kv_len,
+          causal_offset);
+
+      pipeline_s.consumer_release(pipeline_s_consumer_state);
+      ++pipeline_s_consumer_state;
+
+      pipeline_o.consumer_wait(pipeline_o_consumer_state);
+
+      collective_softmax.rescale_O(
+          sg,
+          worker_id,
+          tSR_sOacc(_, _, _1{}),
+          tOsOacc + slm_bytes_per_oacc_stage,
+          exp_reg);
+
+      pipeline_o.consumer_release(pipeline_o_consumer_state);
+      ++pipeline_o_consumer_state;
+    }
+
+    ElementAccum sum_reg_next[total_rows_per_wi];
+    if (!is_last_wave) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < total_rows_per_wi; ++i) {
+        max_reg[0][i] = -INFINITY;
+        sum_reg_next[i] = ElementAccum(0);
       }
 
-      shared_pipelines.barrier_O_empty.arrive();
-      epi_shared_pipelines.barrier_O_final.arrive();
+      pipeline_s.consumer_wait(pipeline_s_consumer_state);
+
+      collective_softmax.template update<true>(
+          4,
+          sg,
+          worker_id,
+          tSR_sS(_, _, _0{}),
+          tOsS,
+          max_reg[0],
+          sum_reg_next,
+          exp_reg,
+          tOsP,
+          2 * q_tile_local,
+          0,
+          is_causal,
+          actual_kv_len,
+          causal_offset);
+
+      pipeline_s.consumer_release(pipeline_s_consumer_state);
+      ++pipeline_s_consumer_state;
+    }
+    pipeline_o.consumer_wait(pipeline_o_consumer_state);
+    pipeline_epi.producer_acquire(pipeline_epi_producer_state);
+
+    collective_softmax.final_rescale_O(
+        sg,
+        worker_id,
+        tSR_sOacc(_, _, _0{}),
+        tSR_sO(_, _, _0{}),
+        tOsOacc,
+        tOsO,
+        sum_reg[0]);
+
+    pipeline_o.consumer_release(pipeline_o_consumer_state);
+    ++pipeline_o_consumer_state;
+
+    pipeline_epi.producer_commit(pipeline_epi_producer_state, 1);
+    ++pipeline_epi_producer_state;
+
+    if (!is_last_wave) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < total_rows_per_wi; ++i) {
+        sum_reg[0][i] = sum_reg_next[i];
+        max_reg[1][i] = -INFINITY;
+        sum_reg_next[i] = ElementAccum(0);
+      }
+
+      pipeline_s.consumer_wait(pipeline_s_consumer_state);
+
+      collective_softmax.template update<true>(
+          5,
+          sg,
+          worker_id,
+          tSR_sS(_, _, _1{}),
+          tOsS + slm_bytes_per_s_stage,
+          max_reg[1],
+          sum_reg_next,
+          exp_reg,
+          tOsP + slm_bytes_per_p_stage,
+          (2 * q_tile_local + 1),
+          0,
+          is_causal,
+          actual_kv_len,
+          causal_offset);
+
+      pipeline_s.consumer_release(pipeline_s_consumer_state);
+      ++pipeline_s_consumer_state;
+    }
+
+    pipeline_o.consumer_wait(pipeline_o_consumer_state);
+    pipeline_epi.producer_acquire(pipeline_epi_producer_state);
+
+    collective_softmax.final_rescale_O(
+        sg,
+        worker_id,
+        tSR_sOacc(_, _, _1{}),
+        tSR_sO(_, _, _1{}),
+        tOsOacc + slm_bytes_per_oacc_stage,
+        tOsO + slm_bytes_per_o_stage,
+        sum_reg[1]);
+
+    pipeline_o.consumer_release(pipeline_o_consumer_state);
+    ++pipeline_o_consumer_state;
+
+    pipeline_epi.producer_commit(pipeline_epi_producer_state, 1);
+    ++pipeline_epi_producer_state;
+
+    if (!is_last_wave) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < total_rows_per_wi; ++i) {
+        sum_reg[1][i] = sum_reg_next[i];
+        sum_reg_next[i] = ElementAccum(0);
+      }
     }
   }
-
 };
 } // namespace cutlass::flash_attention::collective

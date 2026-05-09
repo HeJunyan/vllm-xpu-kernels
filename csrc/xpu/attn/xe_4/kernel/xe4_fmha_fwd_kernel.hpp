@@ -31,10 +31,13 @@
 #pragma once
 
 #include "cutlass/cutlass.h"
+#include <sycl/ext/intel/experimental/control_sub_group.hpp>
+
 #include "xe4_tile_scheduler.hpp"
 #include "csrc/xpu/attn/xe_4/collective/xe4_fmha_fwd_mainloop.hpp"
 #include "csrc/xpu/attn/xe_4/collective/fmha_fusion.hpp"
 
+namespace syclex = sycl::ext::intel::experimental;
 namespace cutlass::flash_attention::kernel {
 
 template <bool IsVarLen_ = false>
@@ -42,24 +45,29 @@ struct FMHAProblemShape {
   using SeqLenType = cute::
       conditional_t<IsVarLen_, collective::VariableLength, int>;
   int batch;
-  int num_heads;
+  int num_heads_q, num_heads_kv;
   SeqLenType seq_len_qo, seq_len_kv;
   int head_size_qk, head_size_vo;
 };
 
 template <
-  class ProblemShape_,
-  class CollectiveMainloop_,
-  class CollectiveSoftmaxEpilogue_,
-  class CollectiveEpilogue_,
-  class TileScheduler_>
+    class ProblemShape_,
+    class CollectiveMainloop_,
+    class CollectiveSoftmaxEpilogue_,
+    class CollectiveEpilogue_,
+    class TileScheduler_>
 class GemmUniversalAttention {
-public:
-
+ public:
   using ProblemShape = ProblemShape_;
+  static constexpr bool IsVarLen =
+      collective::is_variable_length_v<typename ProblemShape::SeqLenType>;
+  static constexpr bool IsPaged = CollectiveMainloop_::IsPaged;
 
   // Mainloop derived types
   using CollectiveMainloop = CollectiveMainloop_;
+  using ClusterShape = typename CollectiveMainloop::ClusterShape;
+  using TiledMmaQK = typename CollectiveMainloop::TiledMmaQK;
+  using TiledMmaPV = typename CollectiveMainloop::TiledMmaPV;
   using TileShape = typename CollectiveMainloop::TileShape;
   using TileShapeQK_MNK = typename CollectiveMainloop::TileShapeQK_MNK;
   using TileShapePV_MNK = typename CollectiveMainloop::TileShapePV_MNK;
@@ -72,14 +80,10 @@ public:
   using StrideK = typename CollectiveMainloop::StrideK;
   using StrideV = typename CollectiveMainloop::StrideV;
 
-  using MainloopPipeline = typename CollectiveMainloop::MainloopPipeline;
-  using PipelineState = typename CollectiveMainloop::PipelineState;
-  using MainloopPipelineQ = typename CollectiveMainloop::MainloopPipelineQ;
-  using PipelineStateQ = typename CollectiveMainloop::PipelineStateQ;
-  static constexpr int NumProducerWarps = CollectiveMainloop::NumProducerWarps;
-  static constexpr int NumMMAWarps = CollectiveMainloop::NumMMAWarps;
-  static constexpr int NumControlerWarps = CollectiveMainloop::NumControlerWarps;
-  static constexpr int SgSize = CollectiveMainloop::sg_size;
+  static constexpr int qk_mma_k_itr = shape<2>(TileShapeQK_MNK{}) /
+      cute::size<2>(typename TiledMmaQK::Shape_MNK{});
+  static constexpr int pv_mma_k_itr = shape<2>(TileShapePV_MNK{}) /
+      cute::size<2>(typename TiledMmaPV::Shape_MNK{});
 
   // Epilogue derived types
   using CollectiveEpilogue = CollectiveEpilogue_;
@@ -88,11 +92,36 @@ public:
 
   using CollectiveSoftmaxEpilogue = CollectiveSoftmaxEpilogue_;
 
-  static constexpr int NumSoftmaxWarps = CollectiveSoftmaxEpilogue::NumSoftmaxWarps;
-
-  static constexpr int NumSGs = NumControlerWarps + NumSoftmaxWarps;
-
   using TileScheduler = TileScheduler_;
+
+  enum class SgRole { MMA, Load, Epilogue, Softmax, Empty };
+
+  static constexpr int NumControlSgs = 4;
+
+  static constexpr int NumMmaSgs = 1;
+  static constexpr int NumLoadSgs = 1;
+  static constexpr int NumEpilogueSgs = 1;
+
+  static constexpr int NumSoftmaxSgs =
+      CollectiveSoftmaxEpilogue::NumSoftmaxWarps;
+
+  static constexpr int TotalSgs = NumControlSgs + NumSoftmaxSgs;
+
+  CUTLASS_DEVICE
+  static constexpr SgRole sg_id_to_SgRole(int sg_id) {
+    if (sg_id == 0)
+      return SgRole::Load;
+    if (sg_id == 1)
+      return SgRole::MMA;
+    if (sg_id == 2)
+      return SgRole::Epilogue;
+    if (sg_id == 3)
+      return SgRole::Empty;
+    if (sg_id >= 4 && sg_id < 20)
+      return SgRole::Softmax;
+
+    return SgRole::Empty;
+  }
 
   // Kernel level shared memory storage
   struct SharedStorage {
@@ -104,20 +133,29 @@ public:
       EpilogueTensorStorage epilogue;
     };
     struct PipelineStorage {
-      using MainloopPipelineStorage = typename CollectiveMainloop::PipelineStorage;
-      using EpiloguePipelineStorage = typename CollectiveEpilogue::PipelineStorage;
+      typename CollectiveMainloop::PipelineQ::SharedStorage load_q;
+      typename CollectiveMainloop::PipelineK::SharedStorage load_k;
+      typename CollectiveMainloop::PipelineV::SharedStorage load_v;
+      typename CollectiveMainloop::PipelineS::SharedStorage mma_s;
+      typename CollectiveMainloop::PipelineO::SharedStorage mma_corr;
+      typename CollectiveMainloop::PipelineEpi::SharedStorage epi;
+
+      using MainloopPipelineStorage =
+          typename CollectiveMainloop::PipelineStorage;
 
       MainloopPipelineStorage mainloop;
-      EpiloguePipelineStorage epilogue;
     };
   };
 
-  static constexpr int TensorStorageSize = sizeof(typename SharedStorage::TensorStorage);
-  static constexpr int PipelineStorageSize = sizeof(typename SharedStorage::PipelineStorage);
+  static constexpr int TensorStorageSize =
+      sizeof(typename SharedStorage::TensorStorage);
+  static constexpr int PipelineStorageSize =
+      sizeof(typename SharedStorage::PipelineStorage);
 
   // Host side kernel arguments
   struct Arguments {
     ProblemShape problem_shape{};
+    bool is_causal = false;
     typename CollectiveMainloop::Arguments mainloop{};
     typename CollectiveSoftmaxEpilogue::Arguments softmax{};
     typename CollectiveEpilogue::Arguments epilogue{};
@@ -126,6 +164,7 @@ public:
   // Device side kernel params
   struct Params {
     ProblemShape problem_shape;
+    bool is_causal;
     typename CollectiveMainloop::Params mainloop;
     typename CollectiveSoftmaxEpilogue::Params softmax;
     typename CollectiveEpilogue::Params epilogue;
@@ -134,39 +173,55 @@ public:
 
   static Params to_underlying_arguments(Arguments const& args) {
     return {
-      args.problem_shape,
-      CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop),
-      CollectiveSoftmaxEpilogue::to_underlying_arguments(args.softmax),
-      CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue),
-      TileScheduler::to_underlying_arguments(args.problem_shape, KernelHardwareInfo{}, TileShape{})
-    };
+        args.problem_shape,
+        args.is_causal,
+        CollectiveMainloop::to_underlying_arguments(
+            args.problem_shape, args.mainloop),
+        CollectiveSoftmaxEpilogue::to_underlying_arguments(args.softmax),
+        CollectiveEpilogue::to_underlying_arguments(
+            args.problem_shape, args.epilogue),
+        TileScheduler::to_underlying_arguments(
+            args.problem_shape, KernelHardwareInfo{}, TileShape{})};
+  }
+
+  static bool can_implement(Arguments const& args) {
+    return CollectiveMainloop::can_implement(
+        args.problem_shape, TileShape{}, args.mainloop);
   }
 
   static dim3 get_grid_shape(Params const& params) {
-    return TileScheduler::template get_grid_shape<NumSGs>(params.scheduler);
+    return TileScheduler::template get_grid_shape<TotalSgs>(params.scheduler);
   }
 
   static dim3 get_block_shape() {
-    return dim3(SgSize, NumControlerWarps + NumSoftmaxWarps, 1);
+    return dim3(cutlass::NumThreadsPerWarp, TotalSgs, 1);
   }
 
   CUTLASS_DEVICE
-  void operator()(Params const &params) const {
+  void operator()(Params const& params) const {
     CollectiveMainloop collective_mainloop;
     CollectiveSoftmaxEpilogue collective_softmax(params.softmax);
     CollectiveEpilogue collective_epilogue{params.epilogue};
-    
+    TileScheduler tile_scheduler{params.scheduler};
+
     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     uint32_t sg_id = get_sg_id();
+
+    uint32_t worker_id = item.get_local_linear_id();
+    SgRole role = sg_id_to_SgRole(sg_id);
+
     bool lane_predicate = cute::elect_one_sync();
 
     // Allocate shared memory
-    auto slm_ptr = alloc_slm_buffer<uint8_t, TensorStorageSize>(item.get_group());
-    auto& shared_tensors = *reinterpret_cast<typename SharedStorage::TensorStorage*>(slm_ptr);
+    auto slm_ptr =
+        alloc_slm_buffer<uint8_t, TensorStorageSize>(item.get_group());
+    auto& shared_tensors =
+        *reinterpret_cast<typename SharedStorage::TensorStorage*>(slm_ptr);
 
     // Allocate pipeline storage
     auto abar_base = allocate_abar_bytes<0, PipelineStorageSize>();
-    auto& shared_pipelines = *reinterpret_cast<typename SharedStorage::PipelineStorage*>(abar_base);
+    auto& shared_pipelines =
+        *reinterpret_cast<typename SharedStorage::PipelineStorage*>(abar_base);
 
     // Allocate matrix descriptor
     auto tdesc_q = allocate_tdesc<0>();
@@ -174,139 +229,265 @@ public:
     auto tdesc_v = allocate_tdesc<2>();
     auto tdesc_o = allocate_tdesc<3>();
 
-    typename MainloopPipelineQ::Params pipeline_q_params;
-    pipeline_q_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytesQ;
-    if (sg_id == 0) {
-      pipeline_q_params.role = MainloopPipelineQ::ThreadCategory::Producer;
+    // from load Q to mma
+    typename CollectiveMainloop::PipelineQ::Params pipeline_load_q_params;
+    if (role == SgRole::Load) {
+      pipeline_load_q_params.role =
+          CollectiveMainloop::PipelineQ::ThreadCategory::Producer;
     }
-    else if (sg_id == 1) {
-      pipeline_q_params.role = MainloopPipelineQ::ThreadCategory::Consumer;
+    if (role == SgRole::MMA) {
+      pipeline_load_q_params.role =
+          CollectiveMainloop::PipelineQ::ThreadCategory::Consumer;
     }
-    pipeline_q_params.is_leader = lane_predicate && sg_id == 0;
-    pipeline_q_params.num_producers = 1;
-    pipeline_q_params.num_consumers = 1;
+    pipeline_load_q_params.transaction_bytes =
+        CollectiveMainloop::TmaTransactionBytesQ;
+    pipeline_load_q_params.is_leader = lane_predicate && (role == SgRole::Load);
+    pipeline_load_q_params.num_producers = 1;
+    pipeline_load_q_params.num_consumers = 1;
+    typename CollectiveMainloop::PipelineQ pipeline_load_q(
+        shared_pipelines.load_q, pipeline_load_q_params, ClusterShape{});
 
-    typename MainloopPipeline::Params pipeline_k_params;
-    pipeline_k_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
-    if (sg_id == 0) {
-      pipeline_k_params.role = MainloopPipeline::ThreadCategory::Producer;
+    // from load K to mma
+    typename CollectiveMainloop::PipelineK::Params pipeline_load_k_params;
+    if (role == SgRole::Load) {
+      pipeline_load_k_params.role =
+          CollectiveMainloop::PipelineK::ThreadCategory::Producer;
     }
-    else if (sg_id == 1) {
-      pipeline_k_params.role = MainloopPipeline::ThreadCategory::Consumer;
+    if (role == SgRole::MMA) {
+      pipeline_load_k_params.role =
+          CollectiveMainloop::PipelineK::ThreadCategory::Consumer;
     }
-    pipeline_k_params.is_leader = lane_predicate && sg_id == 0;
-    pipeline_k_params.num_producers = 1;
-    pipeline_k_params.num_consumers = 1;
+    pipeline_load_k_params.transaction_bytes =
+        CollectiveMainloop::TmaTransactionBytesK;
+    pipeline_load_k_params.is_leader = lane_predicate && (role == SgRole::Load);
+    pipeline_load_k_params.num_producers = 1;
+    pipeline_load_k_params.num_consumers = 1;
+    typename CollectiveMainloop::PipelineK pipeline_load_k(
+        shared_pipelines.load_k, pipeline_load_k_params, ClusterShape{});
 
-    typename MainloopPipeline::Params pipeline_v_params;
-    pipeline_v_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
-    if (sg_id == 0) {
-      pipeline_v_params.role = MainloopPipeline::ThreadCategory::Producer;
+    // from load V to mma
+    typename CollectiveMainloop::PipelineV::Params pipeline_load_v_params;
+    if (role == SgRole::Load) {
+      pipeline_load_v_params.role =
+          CollectiveMainloop::PipelineV::ThreadCategory::Producer;
     }
-    else if (sg_id == 1) {
-      pipeline_v_params.role = MainloopPipeline::ThreadCategory::Consumer;
+    if (role == SgRole::MMA) {
+      pipeline_load_v_params.role =
+          CollectiveMainloop::PipelineV::ThreadCategory::Consumer;
     }
-    pipeline_v_params.is_leader = lane_predicate && sg_id == 0;
-    pipeline_v_params.num_producers = 1;
-    pipeline_v_params.num_consumers = 1;
+    pipeline_load_v_params.transaction_bytes =
+        CollectiveMainloop::TmaTransactionBytesV;
+    pipeline_load_v_params.is_leader = lane_predicate && (role == SgRole::Load);
+    pipeline_load_v_params.num_producers = 1;
+    pipeline_load_v_params.num_consumers = 1;
+    typename CollectiveMainloop::PipelineV pipeline_load_v(
+        shared_pipelines.load_v, pipeline_load_v_params, ClusterShape{});
 
-    MainloopPipelineQ pipeline_q = MainloopPipelineQ(shared_pipelines.mainloop.storage_Q, pipeline_q_params, /*cluster_shape=*/Shape<_1, _1, _1>{});
-    MainloopPipeline pipeline_k = MainloopPipeline(shared_pipelines.mainloop.storage_K, pipeline_k_params, /*cluster_shape=*/Shape<_1, _1, _1>{});
-    MainloopPipeline pipeline_v = MainloopPipeline(shared_pipelines.mainloop.storage_V, pipeline_v_params, /*cluster_shape=*/Shape<_1, _1, _1>{});
-
-    typename MainloopPipeline::Params pipeline_s_params;
-    pipeline_s_params.transaction_bytes = 1; // 1 mma in s producer side
-    if (sg_id == 1) {
-      pipeline_s_params.role = MainloopPipeline::ThreadCategory::Producer;
+    // from mma (QK) to softmax
+    typename CollectiveMainloop::PipelineS::Params pipeline_mma_s_params;
+    if (role == SgRole::MMA) {
+      pipeline_mma_s_params.role =
+          CollectiveMainloop::PipelineS::ThreadCategory::Producer;
     }
-    else if (sg_id >= NumControlerWarps) {
-      pipeline_s_params.role = MainloopPipeline::ThreadCategory::Consumer;
+    if (role == SgRole::Softmax) {
+      pipeline_mma_s_params.role =
+          CollectiveMainloop::PipelineS::ThreadCategory::Consumer;
     }
-    pipeline_s_params.is_leader = lane_predicate && sg_id == 1;
-    pipeline_s_params.num_producers = 1;
-    pipeline_s_params.num_consumers = NumSoftmaxWarps * cutlass::NumThreadsPerWarp;
+    pipeline_mma_s_params.transaction_bytes = qk_mma_k_itr;
+    pipeline_mma_s_params.is_leader = lane_predicate && (role == SgRole::MMA);
+    pipeline_mma_s_params.num_producers = 1;
+    pipeline_mma_s_params.num_consumers =
+        NumSoftmaxSgs * cutlass::NumThreadsPerWarp;
+    typename CollectiveMainloop::PipelineS pipeline_mma_s(
+        shared_pipelines.mma_s, pipeline_mma_s_params, ClusterShape{});
 
-    typename MainloopPipeline::Params pipeline_p_params;
-    pipeline_p_params.transaction_bytes = 0; // no dma/mma in p producer side
-    if (sg_id >= NumControlerWarps) {
-      pipeline_p_params.role = MainloopPipeline::ThreadCategory::Producer;
+    // from mma (PV) to softmax
+    typename CollectiveMainloop::PipelineO::Params pipeline_mma_corr_params;
+    if (role == SgRole::MMA) {
+      pipeline_mma_corr_params.role =
+          CollectiveMainloop::PipelineO::ThreadCategory::Producer;
     }
-    else if (sg_id == 1) {
-      pipeline_p_params.role = MainloopPipeline::ThreadCategory::Consumer;
+    if (role == SgRole::Softmax) {
+      pipeline_mma_corr_params.role =
+          CollectiveMainloop::PipelineO::ThreadCategory::Consumer;
     }
-    pipeline_p_params.is_leader = 0; // no leader for softmax
-    pipeline_p_params.num_producers = NumSoftmaxWarps * cutlass::NumThreadsPerWarp;
-    pipeline_p_params.num_consumers = 1;
+    pipeline_mma_corr_params.transaction_bytes = pv_mma_k_itr;
+    pipeline_mma_corr_params.is_leader =
+        lane_predicate && (role == SgRole::MMA);
+    pipeline_mma_corr_params.num_producers = 1;
+    pipeline_mma_corr_params.num_consumers =
+        NumSoftmaxSgs * cutlass::NumThreadsPerWarp;
+    typename CollectiveMainloop::PipelineO pipeline_mma_corr(
+        shared_pipelines.mma_corr, pipeline_mma_corr_params, ClusterShape{});
 
-    MainloopPipeline pipeline_s = MainloopPipeline(shared_pipelines.mainloop.storage_S, pipeline_s_params, /*cluster_shape=*/Shape<_1, _1, _1>{});
-    MainloopPipeline pipeline_p = MainloopPipeline(shared_pipelines.mainloop.storage_P, pipeline_p_params, /*cluster_shape=*/Shape<_1, _1, _1>{});
+    // from softmax to epilogue
+    typename CollectiveMainloop::PipelineEpi::Params pipeline_epi_params;
+    if (role == SgRole::Softmax) {
+      pipeline_epi_params.role =
+          CollectiveMainloop::PipelineEpi::ThreadCategory::Producer;
+    }
+    if (role == SgRole::Epilogue) {
+      pipeline_epi_params.role =
+          CollectiveMainloop::PipelineEpi::ThreadCategory::Consumer;
+    }
+    pipeline_epi_params.transaction_bytes = 0;
+    pipeline_epi_params.is_leader = 0;
+    pipeline_epi_params.num_producers =
+        NumSoftmaxSgs * cutlass::NumThreadsPerWarp;
+    pipeline_epi_params.num_consumers = 1;
+    typename CollectiveMainloop::PipelineEpi pipeline_epi(
+        shared_pipelines.epi, pipeline_epi_params, ClusterShape{});
 
+    // KV tiles along seq_len_kv
+    int num_kv_tiles = cute::ceil_div(
+        params.problem_shape.seq_len_kv,
+        size<1>(typename CollectiveMainloop::TileShapeQK_MNK{}));
+
+    bool is_control_sg = syclex::is_control_sub_group();
     // Initialize abarriers
-    if (sg_id == 0) {
-      if (lane_predicate) {
-        shared_pipelines.mainloop.barrier_Q.init(1);
-        shared_pipelines.epilogue.barrier_O.init(/*arrival_count=*/1);
-        shared_pipelines.mainloop.barrier_O.init(/*arrival_count=*/1);
-        shared_pipelines.mainloop.barrier_O_empty.init(/*arrival_count=*/NumSoftmaxWarps * cutlass::NumThreadsPerWarp);
-
-        // TODO: Add async_gmma PISA with only .dtm.btm, without .atm
-        shared_pipelines.mainloop.barrier_q_dummy.init(/*arrival_count=*/1);
-
-        shared_pipelines.epilogue.barrier_O_final.init(/*arrival_count=*/NumSoftmaxWarps * cutlass::NumThreadsPerWarp);
+    if (is_control_sg) {
+      if (role == SgRole::MMA && lane_predicate) {
+        // TODO: add AMMA atom with different combinations of .dtm, .atm, and
+        // .btm
+        shared_pipelines.mainloop.barrier_dummy.init(1);
       }
     }
     item.barrier(sycl::access::fence_space::local_space);
 
-    if (sg_id == 0) { // Producer
-      TileScheduler tile_scheduler{params.scheduler};
-
-      PipelineStateQ smem_pipe_write_q = cutlass::make_producer_start_state<MainloopPipelineQ>();
-
-      PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
-      PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
-
-      bool is_first_wave = true, is_last_wave = false;
-      bool valid = tile_scheduler.is_valid();
-      while (valid) {
-        auto block_coord = tile_scheduler.get_block_coord();
-
-        // KV tiles along seq_len_kv
-        auto batch_coord = get<2>(block_coord); // batch_blk_idx
-        auto [seq_len_qo, seq_len_kv] = collective_mainloop.get_sequence_length_shape(params.problem_shape, batch_coord);
-        int num_kv_tiles = cute::ceil_div(seq_len_kv, size<1>(typename CollectiveMainloop::TileShapeQK_MNK{}));
-
-        ++tile_scheduler;
-        valid = tile_scheduler.is_valid();
-        is_last_wave = !valid;
-        auto block_coord_next = tile_scheduler.get_block_coord();
-
-        collective_mainloop.load(
-          params.mainloop,
-          shared_tensors.mainloop,
-          shared_pipelines.mainloop,
-          make_tuple(tdesc_q, tdesc_k, tdesc_v),
-          block_coord,
-          block_coord_next,
-          num_kv_tiles,
-          pipeline_q, smem_pipe_write_q,
-          pipeline_k, smem_pipe_write_k,
-          pipeline_v, smem_pipe_write_v,
-          is_first_wave, is_last_wave
-        );
-
-        is_first_wave = false;
-      }
+    // VarLen early-exit: skip work groups where Q tile is past batch's actual
+    // sequence length. All subgroups check the same condition.
+    if constexpr (IsVarLen) {
+      auto bc = tile_scheduler.get_block_coord();
+      int batch_idx = get<2>(bc);
+      int blk_m = get<0>(bc);
+      auto* cum_q = params.problem_shape.seq_len_qo.cumulative_length;
+      int actual_q_len = cum_q[batch_idx + 1] - cum_q[batch_idx];
+      constexpr int TileM = size<0>(typename CollectiveMainloop::TileShapeQK_MNK{});
+      if (blk_m * TileM * 2 >= actual_q_len) return;
     }
-    else if (sg_id == 1) { // MMA
-      TileScheduler tile_scheduler{params.scheduler};
 
-      PipelineStateQ smem_pipe_read_q;
+    if (is_control_sg) {
+      if (role == SgRole::Load && lane_predicate) {
+        typename CollectiveMainloop::PipelineQ::PipelineState
+            pipeline_load_q_producer_state = cutlass::make_producer_start_state<
+                typename CollectiveMainloop::PipelineQ>();
+        typename CollectiveMainloop::PipelineK::PipelineState
+            pipeline_load_k_producer_state = cutlass::make_producer_start_state<
+                typename CollectiveMainloop::PipelineK>();
+        typename CollectiveMainloop::PipelineV::PipelineState
+            pipeline_load_v_producer_state = cutlass::make_producer_start_state<
+                typename CollectiveMainloop::PipelineV>();
 
-      PipelineState smem_pipe_read_k;
-      PipelineState smem_pipe_read_v;
+        bool is_first_wave = true, is_last_wave = false;
+        bool valid = tile_scheduler.is_valid();
+        while (valid) {
+          auto block_coord = tile_scheduler.get_block_coord();
 
-      PipelineState smem_pipe_write_s = cutlass::make_producer_start_state<MainloopPipeline>();
-      PipelineState smem_pipe_read_p;
+          ++tile_scheduler;
+          valid = tile_scheduler.is_valid();
+          is_last_wave = !valid;
+          auto block_coord_next = tile_scheduler.get_block_coord();
+
+          collective_mainloop.load(
+              params.mainloop,
+              shared_tensors.mainloop,
+              shared_pipelines.mainloop,
+              make_tuple(tdesc_q, tdesc_k, tdesc_v),
+              block_coord,
+              num_kv_tiles,
+              pipeline_load_q,
+              pipeline_load_q_producer_state,
+              pipeline_load_k,
+              pipeline_load_k_producer_state,
+              pipeline_load_v,
+              pipeline_load_v_producer_state,
+              is_first_wave,
+              is_last_wave);
+
+          is_first_wave = false;
+        }
+      } else if (role == SgRole::MMA && lane_predicate) {
+        typename CollectiveMainloop::PipelineQ::PipelineState
+            pipeline_load_q_consumer_state;
+        typename CollectiveMainloop::PipelineK::PipelineState
+            pipeline_load_k_consumer_state;
+        typename CollectiveMainloop::PipelineV::PipelineState
+            pipeline_load_v_consumer_state;
+
+        typename CollectiveMainloop::PipelineS::PipelineState
+            pipeline_mma_s_producer_state = cutlass::make_producer_start_state<
+                typename CollectiveMainloop::PipelineS>();
+        typename CollectiveMainloop::PipelineO::PipelineState
+            pipeline_mma_corr_producer_state =
+                cutlass::make_producer_start_state<
+                    typename CollectiveMainloop::PipelineO>();
+
+        bool is_first_wave = true, is_last_wave = false;
+        bool valid = tile_scheduler.is_valid();
+        while (valid) {
+          auto block_coord = tile_scheduler.get_block_coord();
+
+          ++tile_scheduler;
+          valid = tile_scheduler.is_valid();
+          is_last_wave = !valid;
+
+          collective_mainloop.mma(
+              shared_tensors.mainloop,
+              shared_pipelines.mainloop,
+              block_coord,
+              num_kv_tiles,
+              pipeline_load_q,
+              pipeline_load_q_consumer_state,
+              pipeline_load_k,
+              pipeline_load_k_consumer_state,
+              pipeline_load_v,
+              pipeline_load_v_consumer_state,
+              pipeline_mma_s,
+              pipeline_mma_s_producer_state,
+              pipeline_mma_corr,
+              pipeline_mma_corr_producer_state,
+              is_first_wave,
+              is_last_wave);
+
+          is_first_wave = false;
+        }
+      } else if (role == SgRole::Epilogue && lane_predicate) {
+        typename CollectiveMainloop::PipelineEpi::PipelineState
+            pipeline_epi_consumer_state;
+
+        bool valid = tile_scheduler.is_valid();
+        while (valid) {
+          auto block_coord = tile_scheduler.get_block_coord();
+
+          ++tile_scheduler;
+          valid = tile_scheduler.is_valid();
+
+          collective_epilogue.store(
+              params.epilogue,
+              shared_tensors.epilogue,
+              make_tuple(tdesc_o),
+              block_coord,
+              pipeline_epi,
+              pipeline_epi_consumer_state);
+        }
+      }
+    } else {
+      typename CollectiveMainloop::PipelineS::PipelineState
+          pipeline_mma_s_consumer_state;
+      typename CollectiveMainloop::PipelineO::PipelineState
+          pipeline_mma_corr_consumer_state;
+
+      typename CollectiveMainloop::PipelineEpi::PipelineState
+          pipeline_epi_producer_state = cutlass::make_producer_start_state<
+              typename CollectiveMainloop::PipelineEpi>();
+
+      constexpr uint32_t total_rows_per_wi =
+          CollectiveSoftmaxEpilogue::TotalRowsPerThread;
+      constexpr int NumStageQO = CollectiveMainloop::NumStageQO;
+
+      ElementS max_reg[NumStageQO][total_rows_per_wi];
+      ElementAccum sum_reg[NumStageQO][total_rows_per_wi];
+      ElementAccum exp_reg[total_rows_per_wi];
 
       bool is_first_wave = true, is_last_wave = false;
       bool valid = tile_scheduler.is_valid();
@@ -316,117 +497,60 @@ public:
         ++tile_scheduler;
         valid = tile_scheduler.is_valid();
         is_last_wave = !valid;
-        auto block_coord_next = tile_scheduler.get_block_coord();
 
-        bool is_valid_q = true;
-        auto blk_m_coord = get<1>(block_coord); // seq_len_blk_idx
-        auto batch_coord = get<2>(block_coord); // batch_blk_idx
-        auto [seq_len_qo, seq_len_kv] = collective_mainloop.get_sequence_length_shape(params.problem_shape, batch_coord);
-        if (blk_m_coord * get<0>(TileShapeQK_MNK{}) >= seq_len_qo) is_valid_q = false;
+        // Per-batch actual KV length for K-remainder masking.
+        // In paged mode, cu_seqlens_k already points to seqused_k
+        // (per-batch lengths) via flash_api.cpp, so read directly.
+        // In VarLen non-paged mode, cu_seqlens_k is cumulative, so
+        // subtract adjacent entries.
+        int actual_kv_len;
+        int actual_q_len;
+        if constexpr (IsVarLen) {
+          int batch_idx = get<2>(block_coord);
+          auto* cum_q =
+              params.problem_shape.seq_len_qo.cumulative_length;
+          actual_q_len = cum_q[batch_idx + 1] - cum_q[batch_idx];
+          auto* cum_k =
+              params.problem_shape.seq_len_kv.cumulative_length;
+          if constexpr (IsPaged) {
+            actual_kv_len = cum_k[batch_idx];
+          } else {
+            actual_kv_len = cum_k[batch_idx + 1] - cum_k[batch_idx];
+          }
+        } else {
+          actual_kv_len = int(params.problem_shape.seq_len_kv);
+          actual_q_len = int(params.problem_shape.seq_len_qo);
+        }
 
-        int num_kv_tiles = cute::ceil_div(seq_len_kv, size<1>(typename CollectiveMainloop::TileShapeQK_MNK{}));
-
-        bool is_valid_q_next = true;
-        auto blk_m_coord_next = get<1>(block_coord_next); // seq_len_blk_idx
-        auto batch_coord_next = get<2>(block_coord_next); // batch_blk_idx
-        auto [seq_len_qo_next, seq_len_kv_next] = collective_mainloop.get_sequence_length_shape(params.problem_shape, batch_coord_next);
-        if (blk_m_coord_next * get<0>(TileShapeQK_MNK{}) >= seq_len_qo_next) is_valid_q_next = false;
-
-        collective_mainloop.mma(
-          params.mainloop,
-          shared_tensors.mainloop,
-          shared_tensors.epilogue,
-          shared_pipelines.mainloop,
-          num_kv_tiles,
-          pipeline_q, smem_pipe_read_q,
-          pipeline_k, smem_pipe_read_k,
-          pipeline_v, smem_pipe_read_v,
-          pipeline_s, smem_pipe_write_s,
-          pipeline_p, smem_pipe_read_p,
-          collective_softmax,
-          is_first_wave, is_last_wave,
-          is_valid_q, is_valid_q_next
-        );
-
-        is_first_wave = false;
-      }
-    } 
-    else if (sg_id == 2) { // ADMA store
-      TileScheduler tile_scheduler{params.scheduler};
-      uint32_t phase = 0;
-
-      bool valid = tile_scheduler.is_valid();
-      while (valid) {
-        auto block_coord = tile_scheduler.get_block_coord();
-
-        ++tile_scheduler;
-        valid = tile_scheduler.is_valid();
-
-        collective_epilogue.store(
-          params.epilogue,
-          shared_tensors.epilogue,
-          shared_pipelines.epilogue,
-          make_tuple(tdesc_o),
-          block_coord,
-          phase
-        );
-      }
-    }
-    else if (sg_id >= NumControlerWarps) { // Softmax
-      TileScheduler tile_scheduler{params.scheduler};
-
-      PipelineState smem_pipe_read_s;
-      PipelineState smem_pipe_write_p = cutlass::make_producer_start_state<MainloopPipeline>();
-
-      constexpr uint32_t total_rows_per_wi = CollectiveSoftmaxEpilogue::TotalRowsPerThread;
-
-      Tensor max_reg = make_tensor<ElementS>(Shape<Int<total_rows_per_wi>>{});
-      Tensor exp_reg = make_tensor<ElementAccum>(Shape<Int<total_rows_per_wi>>{});
-      Tensor sum_reg = make_tensor<ElementAccum>(Shape<Int<total_rows_per_wi>>{});
-
-      bool is_first_wave = true, is_last_wave = false;
-      bool valid = tile_scheduler.is_valid();
-      while (valid) {
-        auto block_coord = tile_scheduler.get_block_coord();
-
-        ++tile_scheduler;
-        valid = tile_scheduler.is_valid();
-        is_last_wave = !valid;
-        auto block_coord_next = tile_scheduler.get_block_coord();
-
-        bool is_valid_q = true;
-        auto blk_m_coord = get<1>(block_coord); // seq_len_blk_idx
-        auto batch_coord = get<2>(block_coord); // batch_blk_idx
-        auto [seq_len_qo, seq_len_kv] = collective_mainloop.get_sequence_length_shape(params.problem_shape, batch_coord);
-        if (blk_m_coord * get<0>(TileShapeQK_MNK{}) >= seq_len_qo) is_valid_q = false;
-
-        int num_kv_tiles = cute::ceil_div(seq_len_kv, size<1>(typename CollectiveMainloop::TileShapeQK_MNK{}));
-
-        bool is_valid_q_next = true;
-        auto blk_m_coord_next = get<1>(block_coord_next); // seq_len_blk_idx
-        auto batch_coord_next = get<2>(block_coord_next); // batch_blk_idx
-        auto [seq_len_qo_next, seq_len_kv_next] = collective_mainloop.get_sequence_length_shape(params.problem_shape, batch_coord_next);
-        if (blk_m_coord_next * get<0>(TileShapeQK_MNK{}) >= seq_len_qo_next) is_valid_q_next = false;
+        // Causal offset: for chunked prefill where seq_q < seq_kv,
+        // q[i] should attend to k[0..i+offset] where offset = kv_len - q_len
+        int causal_offset = actual_kv_len - actual_q_len;
 
         collective_mainloop.softmax(
-          params.mainloop,
-          shared_tensors.mainloop,
-          shared_tensors.epilogue,
-          shared_pipelines.mainloop,
-          shared_pipelines.epilogue,
-          num_kv_tiles,
-          pipeline_s, smem_pipe_read_s,
-          pipeline_p, smem_pipe_write_p,
-          collective_softmax,
-          max_reg, exp_reg, sum_reg,
-          is_first_wave, is_last_wave,
-          is_valid_q, is_valid_q_next
-        );
+            collective_softmax,
+            shared_tensors.mainloop,
+            shared_tensors.epilogue,
+            num_kv_tiles,
+            worker_id - cutlass::NumThreadsPerWarp * NumControlSgs,
+            pipeline_mma_s,
+            pipeline_mma_s_consumer_state,
+            pipeline_mma_corr,
+            pipeline_mma_corr_consumer_state,
+            pipeline_epi,
+            pipeline_epi_producer_state,
+            max_reg,
+            exp_reg,
+            sum_reg,
+            is_first_wave,
+            is_last_wave,
+            block_coord,
+            params.is_causal,
+            actual_kv_len,
+            causal_offset);
 
         is_first_wave = false;
       }
     }
   }
-
 };
 } // namespace cutlass::flash_attention::kernel

@@ -213,7 +213,7 @@ message(STATUS "FetchContent base directory: ${FETCHCONTENT_BASE_DIR}")
 # when loaded by Python.
 set(CMAKE_INSTALL_RPATH "$ORIGIN")
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wno-unused-command-line-argument" )
 
 if(VLLM_GPU_LANG STREQUAL "SYCL")
   #
@@ -280,7 +280,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   else()
     set(XE3_AOT_DEVICES "cri-a0")
   endif()
-  set(XE4_AOT_DEVICES "xe4")
+  set(XE4_AOT_DEVICES "jgs-a0")
   if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
     set(AOT_DEVICES ${XE3_AOT_DEVICES})
   endif()

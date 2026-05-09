@@ -42,6 +42,8 @@ struct XeFlashIndividualTileScheduler {
 
   struct Params {
     dim3 grid;
+    int q_num_heads;
+    int kv_num_heads;
     FastDivmod divmod_num_heads;
   };
 
@@ -53,12 +55,16 @@ struct XeFlashIndividualTileScheduler {
 
   template<class ProblemSize, class TileShape>
   static Params to_underlying_arguments(ProblemSize const& problem_size, KernelHardwareInfo hw_info, TileShape const& tile_shape) {
-    //problem_size = [batch, num_heads, seq_len_qo, seq_len_kv, head_size_qk, head_size_vo]
-    dim3 grid(size(ceil_div(problem_size.head_size_vo, shape<1>(tile_shape))),
-              size(ceil_div((int)problem_size.seq_len_qo, shape<0>(tile_shape))),
-              size(problem_size.batch * problem_size.num_heads));
+    // problem_size = [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, head_size_qk, head_size_vo]
+    dim3 grid(size(ceil_div(problem_size.seq_len_qo, shape<0>(tile_shape) * 2)),
+              size(ceil_div(problem_size.head_size_vo, shape<1>(tile_shape))),
+              size(problem_size.batch * problem_size.num_heads_q));
 
-    return Params{grid, {problem_size.num_heads}};
+    return Params{
+        grid,
+        problem_size.num_heads_q,
+        problem_size.num_heads_kv,
+        {problem_size.num_heads_q}};
   }
 
   template <int Num_SGs>
@@ -73,10 +79,17 @@ struct XeFlashIndividualTileScheduler {
 
   CUTLASS_DEVICE
   auto get_block_coord() {
-    int batch_idx = BlockIdxZ();
-    int head_idx;
-    params.divmod_num_heads(batch_idx, head_idx, batch_idx);
-    return make_coord(BlockIdxX(), BlockIdxY(), batch_idx, head_idx);
+    int block_decode = BlockIdxZ();
+    int batch_idx, q_head_idx, kv_head_idx;
+
+    batch_idx = block_decode / params.q_num_heads;
+    q_head_idx = block_decode % params.q_num_heads;
+
+    int heads_per_group = params.q_num_heads / params.kv_num_heads;
+    kv_head_idx = q_head_idx / heads_per_group;
+
+    return make_coord(
+        BlockIdxX(), BlockIdxY(), batch_idx, q_head_idx, kv_head_idx);
   }
 
   CUTLASS_DEVICE
@@ -87,15 +100,14 @@ struct XeFlashIndividualTileScheduler {
 
 };
 
-
 struct XeFlashPersistentTileScheduler {
-
   struct Params {
     int num_blocks;
     FastDivmod divmod_seq_len_block;
     FastDivmod divmod_head_size_block;
     FastDivmod divmod_num_heads;
-
+    int q_num_heads;
+    int kv_num_heads;
     KernelHardwareInfo hw_info;
   };
 
@@ -103,34 +115,48 @@ struct XeFlashPersistentTileScheduler {
   Params params;
 
   CUTLASS_DEVICE
-  XeFlashPersistentTileScheduler(Params const& params) : block_idx(BlockIdxX()), params(params) {}
+  XeFlashPersistentTileScheduler(Params const& params)
+      : block_idx(BlockIdxX()), params(params) {}
 
-  template<class ProblemSize, class TileShape>
+  template <class ProblemSize, class TileShape>
   static Params to_underlying_arguments(
-      ProblemSize const& problem_size, KernelHardwareInfo hw_info,
+      ProblemSize const& problem_size,
+      KernelHardwareInfo hw_info,
       TileShape const& tile_shape) {
     using namespace cute;
     // Get SM count if needed, otherwise use user supplied SM count
     int sm_count = hw_info.sm_count;
     if (sm_count <= 0) {
-      CUTLASS_TRACE_HOST("  WARNING: Arguments do not include a valid SM count.\n"
+      CUTLASS_TRACE_HOST(
+          "  WARNING: Arguments do not include a valid SM count.\n"
           "  For optimal performance, populate the arguments KernelHardwareInfo struct with the SM count.");
-      sm_count = KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+      sm_count = KernelHardwareInfo::query_device_multiprocessor_count(
+          hw_info.device_id);
     }
 
-    CUTLASS_TRACE_HOST("to_underlying_arguments(): Setting persistent grid SM count to " << sm_count);
+    CUTLASS_TRACE_HOST(
+        "to_underlying_arguments(): Setting persistent grid SM count to "
+        << sm_count);
     hw_info.sm_count = sm_count;
 
-    //problem_size = [batch, num_heads, seq_len_qo, seq_len_kv, head_size_qk, head_size_vo]
-    int num_head_size_blocks = size(ceil_div(shape<5>(problem_size), shape<1>(tile_shape)));
-    int num_seq_len_blocks = size(ceil_div(shape<2>(problem_size), shape<0>(tile_shape)));
-    int num_blocks = num_seq_len_blocks * num_head_size_blocks * size(shape<0>(problem_size) * shape<1>(problem_size));
+    // problem_size = [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv,
+    // head_size_qk, head_size_vo]
+    int num_head_size_blocks =
+        size(ceil_div(shape<6>(problem_size), shape<1>(tile_shape)));
+    int num_seq_len_blocks = size(ceil_div(
+        shape<3>(problem_size),
+        shape<0>(tile_shape) * 2 /* TODO use NumQStage*/));
+    int num_blocks = num_seq_len_blocks * num_head_size_blocks *
+        size(shape<0>(problem_size) * shape<1>(problem_size));
 
-    return Params {
-      num_blocks,
-      {num_seq_len_blocks}, {num_head_size_blocks}, {shape<1>(problem_size)},
-      hw_info
-    };
+    return Params{
+        num_blocks,
+        {num_seq_len_blocks},
+        {num_head_size_blocks},
+        {shape<1>(problem_size)},
+        shape<1>(problem_size),
+        shape<2>(problem_size),
+        hw_info};
   }
 
   template <int Num_SGs>
@@ -138,13 +164,7 @@ struct XeFlashPersistentTileScheduler {
     auto queue = compat::get_default_queue();
     auto dev = queue.get_device();
     const size_t maxSubgroups =
-      dev.template get_info<sycl::info::device::max_num_sub_groups>();
-    printf("sm_count: "); print(params.hw_info.sm_count); printf("\n");
-    printf("maxSubgroups: "); print(maxSubgroups); printf("\n");
-    
-    // TODO (Codeplay): revert this back to std::min(params.num_blocks, params.hw_info.sm_count)
-    // once performance issue is fixed.
-    // dim3 grid(std::min(params.num_blocks, ceil_div(params.hw_info.sm_count * maxSubgroups, Num_SGs)), 1, 1);
+        dev.template get_info<sycl::info::device::max_num_sub_groups>();
 
     // Directly make wg count to be equal to sm count
     dim3 grid(std::min(params.num_blocks, params.hw_info.sm_count), 1, 1);
@@ -160,11 +180,20 @@ struct XeFlashPersistentTileScheduler {
   auto get_block_coord() {
     using namespace cute;
     int block_decode = block_idx;
-    int seq_len_block, head_size_block, bidh;
+    int seq_len_block, head_size_block;
     params.divmod_head_size_block(block_decode, head_size_block, block_decode);
     params.divmod_seq_len_block(block_decode, seq_len_block, block_decode);
-    params.divmod_num_heads(block_decode, bidh, block_decode);
-    return make_coord(head_size_block, seq_len_block, block_decode, bidh);
+
+    int batch_idx, q_head_idx, kv_head_idx;
+
+    batch_idx = block_decode / params.q_num_heads;
+    q_head_idx = block_decode % params.q_num_heads;
+
+    int heads_per_group = params.q_num_heads / params.kv_num_heads;
+    kv_head_idx = q_head_idx / heads_per_group;
+
+    return make_coord(
+        seq_len_block, head_size_block, batch_idx, q_head_idx, kv_head_idx);
   }
 
   CUTLASS_DEVICE
