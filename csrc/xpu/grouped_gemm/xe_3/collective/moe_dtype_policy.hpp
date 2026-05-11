@@ -161,7 +161,7 @@ class moe_policy_base {
   using GmemTiledCopyScaleA = void;
   using GmemTiledCopyScaleB = void;
 
-  static constexpr int PipelineStages = 2;
+  static constexpr int PipelineStages = 4;
   using EpilogueDispatchPolicy = cutlass::epilogue::MoE16Group;
   using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
       float_t,
@@ -173,13 +173,15 @@ class moe_policy_base {
   static constexpr int BlockSize = -1;
 };
 
+// BF16 / FP16 policies
+
 class moe_bf16_policy : public moe_policy_base {
  public:
   using ElementA = cutlass::bfloat16_t;
   using ElementB = cutlass::bfloat16_t;
   using ElementOutput = cutlass::bfloat16_t;
 
-  using TileShape = Shape<_128, _128, _32>;
+  using TileShape = Shape<_256, _256, _32>;
   using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
@@ -195,7 +197,7 @@ class moe_fp16_policy : public moe_policy_base {
   using ElementB = cutlass::half_t;
   using ElementOutput = cutlass::half_t;
 
-  using TileShape = Shape<_128, _128, _32>;
+  using TileShape = Shape<_256, _256, _32>;
   using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
@@ -205,10 +207,32 @@ class moe_fp16_policy : public moe_policy_base {
   CALL_GENERATE_GEMM();
 };
 
+class moe_bf16_mid_policy : public moe_bf16_policy {
+ public:
+  using TileShape = Shape<_128, _128, _32>;
+  using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_fp16_mid_policy : public moe_fp16_policy {
+ public:
+  using TileShape = Shape<_128, _128, _32>;
+  using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
 class moe_bf16_decode_policy : public moe_bf16_policy {
  public:
-  using TileShape = Shape<_16, _64, _32>;
-  using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
+  using TileShape = Shape<_16, _128, _32>;
+  using SGLayout = Layout<Shape<_1, _8, _1>, Stride<_8, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
       Layout<TileShape>,
@@ -218,8 +242,8 @@ class moe_bf16_decode_policy : public moe_bf16_policy {
 
 class moe_fp16_decode_policy : public moe_fp16_policy {
  public:
-  using TileShape = Shape<_16, _64, _32>;
-  using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
+  using TileShape = Shape<_16, _128, _32>;
+  using SGLayout = Layout<Shape<_1, _8, _1>, Stride<_8, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
       Layout<TileShape>,
@@ -227,6 +251,7 @@ class moe_fp16_decode_policy : public moe_fp16_policy {
   CALL_GENERATE_GEMM();
 };
 
+// MXFP8
 class moe_mxfp8_policy : public moe_policy_base {
  public:
   static constexpr bool NeedScale = true;
@@ -240,7 +265,7 @@ class moe_mxfp8_policy : public moe_policy_base {
   using ElementScaleA = typename ElementType::ScaleFactorType;
   using ElementScaleB = typename ElementType::ScaleFactorType;
   using StrideScale = cute::Stride<_1, int64_t, int64_t>;
-  using TileShape = Shape<_256, _256, _32>;
+  using TileShape = Shape<_256, _256, _64>;
   using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 
   using TiledMma = typename TiledMMAHelper<
@@ -252,6 +277,7 @@ class moe_mxfp8_policy : public moe_policy_base {
   CALL_GENERATE_GEMM();
 };
 
+// MXFP4
 class moe_mxfp4_policy : public moe_policy_base {
  public:
   static constexpr bool NeedScale = true;
@@ -268,7 +294,7 @@ class moe_mxfp4_policy : public moe_policy_base {
 
   using StrideScale = cute::Stride<_1, int64_t, int64_t>;
 
-  using TileShape = Shape<_256, _256, _64>;
+  using TileShape = Shape<_256, _256, _128>;
   using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
@@ -279,6 +305,7 @@ class moe_mxfp4_policy : public moe_policy_base {
   CALL_GENERATE_GEMM();
 };
 
+// FP8 block-scaled
 class moe_fp8block_policy : public moe_policy_base {
  public:
   static constexpr bool NeedScale = true;
@@ -294,7 +321,7 @@ class moe_fp8block_policy : public moe_policy_base {
   using StrideScale = cute::Stride<_1, int64_t, int64_t>;
 
   using TileShape = Shape<_128, _128, _32>;
-  using SGLayout = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+  using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
       Layout<TileShape>,
@@ -302,6 +329,28 @@ class moe_fp8block_policy : public moe_policy_base {
 
   using GEMMDispatchPolicy =
       cutlass::gemm::MainloopFP8BlockGroup<PipelineStages>;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_fp8block_mid_policy : public moe_fp8block_policy {
+ public:
+  using TileShape = Shape<_32, _128, _32>;
+  using SGLayout = Layout<Shape<_2, _8, _1>, Stride<_8, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_fp8block_decode_policy : public moe_fp8block_policy {
+ public:
+  using TileShape = Shape<_16, _128, _32>;
+  using SGLayout = Layout<Shape<_1, _8, _1>, Stride<_8, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
   CALL_GENERATE_GEMM();
 };
 

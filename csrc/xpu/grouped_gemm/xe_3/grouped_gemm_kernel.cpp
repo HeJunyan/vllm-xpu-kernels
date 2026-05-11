@@ -281,12 +281,16 @@ void kernel_functor(
       int64_t groups);
 
 INSTANTIATE_KERNEL(moe_bf16_policy)
+INSTANTIATE_KERNEL(moe_bf16_mid_policy)
 INSTANTIATE_KERNEL(moe_bf16_decode_policy)
 INSTANTIATE_KERNEL(moe_fp16_policy)
+INSTANTIATE_KERNEL(moe_fp16_mid_policy)
 INSTANTIATE_KERNEL(moe_fp16_decode_policy)
 INSTANTIATE_KERNEL(moe_mxfp4_policy)
 INSTANTIATE_KERNEL(moe_mxfp8_policy)
 INSTANTIATE_KERNEL(moe_fp8block_policy)
+INSTANTIATE_KERNEL(moe_fp8block_mid_policy)
+INSTANTIATE_KERNEL(moe_fp8block_decode_policy)
 
 }  // namespace grouped_gemm
 }  // namespace gpu::cutlass_kernel
