@@ -469,6 +469,11 @@ struct CollectiveMma<
     Tensor scaler = make_tensor_like(accum);
     int M = shape<0>(mainloop.mA_mkl);
     int K = shape<1>(mainloop.mA_mkl);
+    int K_groups = cute::ceil_div(K, GROUP_K);
+    int n_scale_idx = int(n_coord / 128);
+    constexpr int acc_m0 = decltype(size<0>(accum))::value;
+    constexpr int acc_m1 = decltype(size<1>(accum))::value;
+    constexpr int sg_m_rows = acc_m0 * acc_m1;
     for (int k_tile = k_start_idx; k_tile < k_tile_count + k_start_idx;
          k_tile++, prefetch_k++) {
       barrier_arrive(barrier_scope);
@@ -484,20 +489,31 @@ struct CollectiveMma<
       reorder(tArA, tCrA);
       reorder(tBrB, tCrB);
 
+      int k_group_idx = int(k_tile * SG_K / GROUP_K);
+      float scaleB = mainloop.ptr_SB[n_scale_idx * K_groups + k_group_idx];
+      float combined_scale[sg_m_rows];
+      CUTLASS_PRAGMA_UNROLL
+      for (int i1 = 0; i1 < acc_m1; ++i1) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i0 = 0; i0 < acc_m0; ++i0) {
+          int row = i1 * acc_m0 + i0;
+          combined_scale[row] =
+              mainloop.ptr_SA[(m_coord + row) * K_groups + k_group_idx] *
+              scaleB;
+        }
+      }
+
       cute::gemm(tiled_mma, tCrA, tCrB, scaler);
 
-      int index_SB = int(n_coord / 128) * cute::ceil_div(K, GROUP_K) +
-                     int(k_tile * SG_K / GROUP_K);
-      float scaleB = mainloop.ptr_SB[index_SB];
-      for (int i0 = 0; i0 < size<0>(accum); ++i0) {
-        for (int i1 = 0; i1 < size<1>(accum); ++i1) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i0 = 0; i0 < acc_m0; ++i0) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i1 = 0; i1 < acc_m1; ++i1) {
+          int row = i1 * acc_m0 + i0;
+          CUTLASS_PRAGMA_UNROLL
           for (int i2 = 0; i2 < size<2>(accum); ++i2) {
-            int index_SA = (m_coord + i1 * size<0>(accum) + i0) *
-                               cute::ceil_div(K, GROUP_K) +
-                           int(k_tile * SG_K / GROUP_K);
-            float scaleA = mainloop.ptr_SA[index_SA];
             accum[make_coord(i0, i1, i2)] +=
-                scaler[make_coord(i0, i1, i2)] * scaleA * scaleB;
+                scaler[make_coord(i0, i1, i2)] * combined_scale[row];
           }
         }
       }
