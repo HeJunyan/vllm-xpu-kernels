@@ -318,9 +318,10 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
   # when building.
   if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
-    # update on WW12 for CRI, this commit id is latest from v0.1.0_next branch
+    # Bumped to v0.1.0_next tip that includes PR #444 (arbitrary M/N support
+    # in block-scaled GEMM via the tuple-based scalar scale-load variant).
     set(CUTLASS_REVISION
-        "41d3a5eeee5a699c78e465fb0b57a463ebedc6b4"
+        "9b2efe37371e735ce4e38039c75f8b889d09c679"
         CACHE STRING "CUTLASS revision to use")
   elseif(BUILD_ON_SIMULATOR_JGS)
     # update on WW11 by Yizhou, this commit id is latest from master_next branch

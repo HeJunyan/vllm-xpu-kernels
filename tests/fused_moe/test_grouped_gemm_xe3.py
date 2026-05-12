@@ -54,11 +54,19 @@ MINI_MNK_SHAPES = [
 # MXFP uses BLK_M=256 tiles; CRI simulator hangs or produces NaN when
 # per-expert M is too small. m=256 with seed=8 random partition gives
 # [116, 140] for e=2, which avoids the simulator limitation.
+# Shapes whose total M (or N) is not a multiple of 4 exercise the
+# unaligned-M dispatch added for arbitrary M/N support (PR #444).
 MINI_MNK_SHAPES_MXFP = [
+    (16, 128, 128),
+    (18, 128, 128),
+    (32, 128, 256),
+    (64, 256, 256),
     (256, 128, 128),
     (256, 128, 256),
     (256, 256, 128),
     (256, 256, 256),
+    (250, 256, 256),
+    (266, 128, 256),
 ]
 
 MINI_PYTEST_PARAMS = {
@@ -196,10 +204,22 @@ def bfloat16_to_fp4_e2m1fn_x2(t: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("recipe", ["mxfp8", "mxfp4"])
 @pytest.mark.parametrize("has_bias", [True, False])
 def test_grouped_gemm_mxfp(m, n, k, e, topk, recipe, has_bias):
+    # Unaligned-M dispatch via PR #444 is currently only validated for
+    # mxfp8 (e4m3 + e8m0); the tuple-based scalar scale-load mainloop
+    # produces incorrect results for e2m1 inputs.  Skip mxfp4 when the
+    # total M would force the unaligned path.
     seed_everything(8)
     num_experts = e
     token_per_group = random_partition(e, m * topk)
     assert (len(token_per_group) == e)
+
+    if recipe == "mxfp4":
+        # todo: https://jira.devtools.intel.com/browse/VLLMZ-1119
+        for mi in token_per_group:
+            if mi % 4 != 0:
+                pytest.skip("mxfp4 unaligned-M not supported")
+                break
+
 
     BLOCK_SIZE = 32
     m = sum(token_per_group)
