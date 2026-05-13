@@ -12,7 +12,12 @@ pytestmark = pytest.mark.skipif(
     not torch.ops._xpu_C.is_jgs(0),
     reason="XE4 tests only run on JGS.")
 
-DEVICE = "xpu"
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
 
 # shape for Llama-4-scout
 FUSED_MOE_MNK_FACTORS = [
@@ -75,8 +80,11 @@ def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
 
     output_dtype = torch.float16 if dtype == torch.float16 else torch.float32 # FIXME: bf16 output acc issue
     output = torch.empty((sum(token_per_group), n), dtype=output_dtype, device=DEVICE)
-    cutlass_grouped_gemm(input_A, None, input_B, None, bias, output,
+    output_kernel = output.to(KERNEL_DEVICE)
+    cutlass_grouped_gemm(_to_kernel(input_A), None, _to_kernel(input_B), None,
+                         _to_kernel(bias), output_kernel,
                          token_per_group, n, k, num_experts)
+    output = output_kernel.cpu()
     # ref gg
     ref = []
     pre_token_sum = 0
@@ -86,10 +94,10 @@ def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
             continue
         input = ref_A[pre_token_sum:pre_token_sum + cur_token_num, :]
         weight = input_B[i, :, :]
-        expert_output = input.cpu().to(torch.float32) @ weight.cpu().to(torch.float32)
+        expert_output = input.to(torch.float32) @ weight.to(torch.float32)
         if has_bias:
             expert_output += bias[i]
-        ref.append(expert_output.to(DEVICE))
+        ref.append(expert_output)
         pre_token_sum += cur_token_num
     ref = torch.cat(ref, dim=0)
 

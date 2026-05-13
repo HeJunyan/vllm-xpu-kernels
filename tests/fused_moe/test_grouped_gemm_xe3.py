@@ -26,7 +26,12 @@ pytestmark = pytest.mark.skipif(
     not torch.ops._xpu_C.is_cri(0) and not torch.ops._xpu_C.is_nvl_p(0),
     reason="XE3 tests only run on CRI or NVL_P.")
 
-DEVICE = "xpu"
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
 
 # shape for Llama-4-scout
 FUSED_MOE_MNK_FACTORS = [
@@ -127,8 +132,11 @@ def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
     # output offset
     total_m = sum(token_per_group)
     output = torch.zeros((total_m, n), dtype=dtype, device=DEVICE)
-    cutlass_grouped_gemm(input_A, None, input_B, None, bias, output,
+    output_kernel = output.to(KERNEL_DEVICE)
+    cutlass_grouped_gemm(_to_kernel(input_A), None, _to_kernel(input_B), None,
+                         _to_kernel(bias), output_kernel,
                          token_per_group, n, k, num_experts)
+    output = output_kernel.cpu()
     # ref gg
     ref = []
     pre_token_sum = 0
@@ -278,8 +286,11 @@ def test_grouped_gemm_mxfp(m, n, k, e, topk, recipe, has_bias):
     else:
         bias = None
     output = torch.zeros((m, n), dtype=torch.float32, device=DEVICE)
-    cutlass_grouped_gemm(A, A_scale_k, B, B_scale, bias, output,
+    output_kernel = output.to(KERNEL_DEVICE)
+    cutlass_grouped_gemm(_to_kernel(A), _to_kernel(A_scale_k), _to_kernel(B),
+                         _to_kernel(B_scale), _to_kernel(bias), output_kernel,
                          token_per_group, n, k, num_experts)
+    output = output_kernel.cpu()
     # ref gg
     if recipe == "mxfp8":
         A_dq = A.float().reshape(-1, BLOCK_SIZE) * (A_scale.reshape(
@@ -379,8 +390,12 @@ def test_grouped_gemm_fp8block(m, n, k, e, topk, recipe, has_bias):
         bias = None
 
     output = torch.zeros((m, n), dtype=torch.float32, device=DEVICE)
-    cutlass_grouped_gemm(a_fp8, a_scales, b_fp8, b_scales, bias, output,
+    output_kernel = output.to(KERNEL_DEVICE)
+    cutlass_grouped_gemm(_to_kernel(a_fp8), _to_kernel(a_scales),
+                         _to_kernel(b_fp8), _to_kernel(b_scales),
+                         _to_kernel(bias), output_kernel,
                          token_per_group, n, k, num_experts)
+    output = output_kernel.cpu()
 
     # ref gg
     ref = []

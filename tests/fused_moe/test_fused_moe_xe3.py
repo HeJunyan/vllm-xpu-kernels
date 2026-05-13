@@ -19,7 +19,12 @@ pytestmark = pytest.mark.skipif(
     not torch.ops._xpu_C.is_cri(0) and not torch.ops._xpu_C.is_nvl_p(0),
     reason="XE3 tests only run on CRI or NVL_P.")
 
-DEVICE = "xpu"
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
 
 # shape for Llama-4-scout
 FUSED_MOE_MNK_FACTORS = [
@@ -320,19 +325,20 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
                             expert_indices, topk, "silu", e)
     kernel_w13, kernel_w2 = to_kernel_weight_layout(recipe, w13, w2)
 
-    output = xpu_fused_moe(hidden_states=hidden_states,
-                           w13=kernel_w13,
-                           w13_scales=w13_scales,
-                           w13_bias=w13_bias,
-                           w2=kernel_w2,
-                           w2_scales=w2_scales,
-                           w2_bias=w2_bias,
-                           topk_weights=expert_scores,
-                           topk_ids=expert_indices,
+    output = xpu_fused_moe(hidden_states=_to_kernel(hidden_states),
+                           w13=_to_kernel(kernel_w13),
+                           w13_scales=_to_kernel(w13_scales),
+                           w13_bias=_to_kernel(w13_bias),
+                           w2=_to_kernel(kernel_w2),
+                           w2_scales=_to_kernel(w2_scales),
+                           w2_bias=_to_kernel(w2_bias),
+                           topk_weights=_to_kernel(expert_scores),
+                           topk_ids=_to_kernel(expert_indices),
                            n_experts_per_token=topk,
                            activation="silu",
                            num_experts=e,
                            act_quant=recipe not in ["bf16", "fp16"])
+    output = output.cpu()
 
     if data_dtype == torch.float16:
         rtol = 1e-2
