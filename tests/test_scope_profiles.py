@@ -705,8 +705,8 @@ _QWEN3_30B_A3B_PROFILE = {
                 [(8, 8)],
                 [(12, 12)],
                 [(16, 16)],
-                [(1024, 1024)],
-                [(4096, 4096)],
+                [(3500, 3500)],
+                [(5000, 5000)],
             ],
             "num_heads": [(QWEN3_30B_NUM_HEADS, QWEN3_30B_NUM_KV_HEADS)],
             "head_size": [QWEN3_30B_HEAD_DIM],
@@ -719,11 +719,9 @@ _QWEN3_30B_A3B_PROFILE = {
                 [(1, 42)] * 4,         # case1: input=10+output=32, bs=4
                 [(1, 2048)] * 16,      # case2: input=1k+output=1k, bs=16
                 # decode context-length sweep (bs=16)
-                [(1, 1024)] * 16,
-                [(1, 2048)] * 16,
-                [(1, 3072)] * 16,
+                [(1, 3500)] * 16,
                 [(1, 4096)] * 16,
-                [(1, 5120)] * 16,
+                [(1, 5000)] * 16,
                 # decode batches (max_num_seqs=16, decreasing)
                 [(1, 5120)] * 1,
                 [(1, 5120)] * 2,
@@ -974,8 +972,8 @@ _QWEN3_235B_A22B_PROFILE = {
                 [(8, 8)],
                 [(12, 12)],
                 [(16, 16)],
-                [(1024, 1024)],
-                [(4096, 4096)],
+                [(3500, 3500)],
+                [(5000, 5000)],
             ],
             "num_heads": [(QWEN3_235B_NUM_HEADS, QWEN3_235B_NUM_KV_HEADS)],
             "head_size": [QWEN3_235B_HEAD_DIM],
@@ -988,11 +986,9 @@ _QWEN3_235B_A22B_PROFILE = {
                 [(1, 42)] * 4,         # case1: input=10+output=32, bs=4
                 [(1, 2048)] * 16,      # case2: input=1k+output=1k, bs=16
                 # decode context-length sweep (bs=16)
-                [(1, 1024)] * 16,
-                [(1, 2048)] * 16,
-                [(1, 3072)] * 16,
+                [(1, 3500)] * 16,
                 [(1, 4096)] * 16,
-                [(1, 5120)] * 16,
+                [(1, 5000)] * 16,
                 # decode batches (max_num_seqs=16, decreasing)
                 [(1, 5120)] * 1,
                 [(1, 5120)] * 2,
