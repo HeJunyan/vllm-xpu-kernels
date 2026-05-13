@@ -110,6 +110,8 @@ bool is_pvc(int64_t device_index);
 
 bool is_cri(int64_t device_index);
 
+bool is_nvl_p(int64_t device_index);
+
 bool is_jgs(int64_t device_index);
 
 void exponential_2d_(

@@ -78,6 +78,11 @@ static inline bool is_cri(at::DeviceIndex device_index = -1) {
          syclex::architecture::intel_gpu_cri;
 }
 
+static inline bool is_nvl_p(at::DeviceIndex device_index = -1) {
+  return get_device_architecture(device_index) ==
+         syclex::architecture::intel_gpu_nvl_p;
+}
+
 static inline bool is_jgs(at::DeviceIndex device_index = -1) {
   return get_device_architecture(device_index) ==
          syclex::architecture::intel_gpu_jgs;

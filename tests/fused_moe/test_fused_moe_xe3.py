@@ -16,8 +16,8 @@ from vllm_xpu_kernels.fused_moe_interface import (quant_fp8_act,
                                                   xpu_fused_moe)
 
 pytestmark = pytest.mark.skipif(
-    not torch.ops._xpu_C.is_cri(0),
-    reason="XE3 tests only run on CRI.")
+    not torch.ops._xpu_C.is_cri(0) and not torch.ops._xpu_C.is_nvl_p(0),
+    reason="XE3 tests only run on CRI or NVL_P.")
 
 DEVICE = "xpu"
 
@@ -233,6 +233,8 @@ def ref_fused_moe(recipe,
                          ["bf16", "fp16", "mxfp8", "mxfp4", "fp8block"])
 @pytest.mark.parametrize("has_bias", [True, False])
 def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
+    if recipe == "mxfp4" and torch.ops._xpu_C.is_nvl_p(0):
+        pytest.skip(reason="MXFP4 is not supported on NVL_P")
     if topk > e:
         pytest.skip(f"topk={topk} > num_experts={e}")
 

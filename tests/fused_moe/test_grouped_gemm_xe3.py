@@ -23,8 +23,8 @@ if torch.xpu.is_available() and torch.ops._xpu_C.is_cri(0):
     del _a, _b, _o
 
 pytestmark = pytest.mark.skipif(
-    not torch.ops._xpu_C.is_cri(0),
-    reason="XE3 tests only run on CRI.")
+    not torch.ops._xpu_C.is_cri(0) and not torch.ops._xpu_C.is_nvl_p(0),
+    reason="XE3 tests only run on CRI or NVL_P.")
 
 DEVICE = "xpu"
 
@@ -204,6 +204,8 @@ def bfloat16_to_fp4_e2m1fn_x2(t: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("recipe", ["mxfp8", "mxfp4"])
 @pytest.mark.parametrize("has_bias", [True, False])
 def test_grouped_gemm_mxfp(m, n, k, e, topk, recipe, has_bias):
+    if recipe == "mxfp4" and torch.ops._xpu_C.is_nvl_p(0):
+        pytest.skip(reason="MXFP4 is not supported on NVL_P")
     # Unaligned-M dispatch via PR #444 is currently only validated for
     # mxfp8 (e4m3 + e8m0); the tuple-based scalar scale-load mainloop
     # produces incorrect results for e2m1 inputs.  Skip mxfp4 when the
