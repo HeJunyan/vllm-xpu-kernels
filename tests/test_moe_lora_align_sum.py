@@ -7,6 +7,14 @@ import torch
 
 import tests.register_ops as ops
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
+
 # override pytest parameters when enable mini pytest
 MINI_PYTEST_PARAMS = {
     "default": {
@@ -37,7 +45,7 @@ def sample_data(num_experts, max_loras, num_tokens, topk_num):
             topk_ids[i, j] = pool[j]
         token_lora_mapping[i] = random.randint(0, max_loras - 1)
 
-    return topk_ids.to("xpu"), token_lora_mapping.to("xpu")
+    return topk_ids.to(KERNEL_DEVICE), token_lora_mapping.to(KERNEL_DEVICE)
 
 
 @pytest.mark.parametrize("num_tokens", [100, 200, 1024, 4096])  # 81920
@@ -62,38 +70,43 @@ def test_moe_lora_align_block_size(num_tokens, topk_num, num_experts,
         (max_loras * max_num_tokens_padded, ),
         topk_ids.numel(),
         dtype=torch.int32,
-        device="xpu",
+        device=DEVICE,
     )
     expert_ids = torch.full((max_loras * max_num_m_blocks, ),
                             num_experts,
                             dtype=torch.int32,
-                            device="xpu")
+                            device=DEVICE)
     num_tokens_post_pad = torch.zeros((max_loras, ),
                                       dtype=torch.int32,
-                                      device="xpu")
+                                      device=DEVICE)
     adapter_enabled = torch.ones((max_loras + 1, ),
                                  dtype=torch.int32,
-                                 device="xpu")
-    lora_ids = torch.arange(max_loras + 2, dtype=torch.int32, device="xpu")
+                                 device=DEVICE)
+    lora_ids = torch.arange(max_loras + 2, dtype=torch.int32, device=DEVICE)
     # call kernel
+    sorted_token_ids_k = sorted_token_ids.to(KERNEL_DEVICE)
+    expert_ids_k = expert_ids.to(KERNEL_DEVICE)
+    num_tokens_post_pad_k = num_tokens_post_pad.to(KERNEL_DEVICE)
+    adapter_enabled_k = adapter_enabled.to(KERNEL_DEVICE)
+    lora_ids_k = lora_ids.to(KERNEL_DEVICE)
+
     ops.moe_lora_align_block_size(
-        topk_ids,
-        token_lora_mapping,
+        _to_kernel(topk_ids),
+        _to_kernel(token_lora_mapping),
         num_experts,
         block_size,
         max_loras,
         max_num_tokens_padded,
         max_num_m_blocks,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        adapter_enabled,
-        lora_ids,
+        sorted_token_ids_k,
+        expert_ids_k,
+        num_tokens_post_pad_k,
+        adapter_enabled_k,
+        lora_ids_k,
     )
 
-    # verify values
-    expert_ids = expert_ids.view(max_loras, -1)
-    sorted_token_ids = sorted_token_ids.view(max_loras, -1, block_size)
+    sorted_token_ids = sorted_token_ids_k.cpu()
+    expert_ids = expert_ids_k.cpu()
 
     for lora_idx in range(max_loras):
         for token_idx in range(sorted_token_ids.size(1)):

@@ -5,6 +5,13 @@ import torch
 from tests.ops.swiglustep_and_mul_op import SwigluStepAndMul
 from tests.utils import opcheck, seed_everything
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
 DTYPES = [torch.half, torch.bfloat16, torch.float]
 NUM_TOKENS = [7, 83, 2048]  # Arbitrary values for testing
 D = [512, 13824]  # Arbitrary values for testing
@@ -51,13 +58,15 @@ def test_swiglustep_and_mul(
     device: str,
 ) -> None:
     seed_everything(seed)
-    torch.set_default_device(device)
+    torch.xpu.set_device(device)
     x = torch.randn(num_tokens, 2 * d, dtype=dtype)
 
     layer = SwigluStepAndMul()
 
-    out = layer(x)
     ref_out = layer.forward_native(x)
+    layer_k = layer.to(KERNEL_DEVICE)
+    out = layer_k(_to_kernel(x))
+    out = out.cpu()
 
     rtol = {torch.float16: 2e-3, torch.bfloat16: 2e-2, torch.float: 1.3e-6}
 
@@ -71,6 +80,6 @@ def test_swiglustep_and_mul(
 
     d = x.shape[-1] // 2
     output_shape = (x.shape[:-1] + (d, ))
-    out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+    out_k = torch.empty(output_shape, dtype=x.dtype, device=KERNEL_DEVICE)
     fn = torch.ops._C.swiglustep_and_mul
-    opcheck(fn, (out, x, layer.limit))
+    opcheck(fn, (out_k, _to_kernel(x), layer_k.limit))

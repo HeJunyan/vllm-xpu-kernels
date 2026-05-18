@@ -5,6 +5,14 @@ import torch
 
 from tests.register_ops import topk_per_row_decode, topk_per_row_prefill
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
+
 # This file is same as
 # https://github.com/vllm-project/vllm/blob/main/tests/kernels/test_top_k_per_row.py
 # with modification of testing XPU platform. Here just for quick testing, in
@@ -47,7 +55,7 @@ def create_random_logits(
         logits = torch.randn(row_starts.shape[0],
                              max(row_ends),
                              dtype=dtype,
-                             device="xpu")
+                             device=DEVICE)
     elif data_generation == "10LSBits":
         top_22_bits_mask = 0xFFFFFC00
         last_10_bits_mask = 0x000003FF
@@ -58,7 +66,7 @@ def create_random_logits(
             2**10,
             (row_starts.shape[0], max(row_ends)),
             dtype=torch.int32,
-            device="xpu",
+            device=DEVICE,
         )
         # Combine: fixed top 22 bits with random last 10 bits
         logits_bits = (fixed_top_22_bits & top_22_bits_mask) | (
@@ -73,8 +81,8 @@ def create_random_logits(
 def create_row_boundaries(
         seq_len: int, vocab_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Create row start and end indices for testing."""
-    row_starts = torch.zeros(seq_len, dtype=torch.int32, device="xpu")
-    row_ends = torch.arange(1, seq_len + 1, device="xpu", dtype=torch.int32)
+    row_starts = torch.zeros(seq_len, dtype=torch.int32, device=DEVICE)
+    row_ends = torch.arange(1, seq_len + 1, device=DEVICE, dtype=torch.int32)
     return row_starts, row_ends
 
 
@@ -125,8 +133,8 @@ def compare_top_k_results(
         if len(xpu_only_values) != len(torch_only_values):
             return False
         if not torch.allclose(
-                torch.tensor(xpu_only_values, device="xpu"),
-                torch.tensor(torch_only_values, device="xpu"),
+                torch.tensor(xpu_only_values, device=DEVICE),
+                torch.tensor(torch_only_values, device=DEVICE),
                 rtol=tolerance,
                 atol=tolerance,
         ):
@@ -145,30 +153,32 @@ def test_top_k_per_row(
     """
     Test top_k_per_row.
     """
-    torch.set_default_device("xpu")
-    device = "xpu"
+    device = KERNEL_DEVICE
     torch.xpu.memory.empty_cache()
 
-    # Create test data
+    # Create test data on CPU
     vocab_size = 20000
     row_starts, row_ends = create_row_boundaries(num_rows, vocab_size)
     logits = create_random_logits(row_starts, row_ends, torch.float32, 42,
                                   "random")
 
-    # Create output tensors
-    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    # Create output tensors on kernel device
+    indices_k = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
 
     # Run XPU implementation
     topk_per_row_prefill(
-        logits,
-        row_starts,
-        row_ends,
-        indices,
+        _to_kernel(logits),
+        _to_kernel(row_starts),
+        _to_kernel(row_ends),
+        indices_k,
         num_rows,
         top_k,
     )
 
-    # Run reference implementation
+    # Get results on CPU
+    indices = indices_k.cpu()
+
+    # Run reference implementation (on CPU)
     torch_indices = logits.topk(min(top_k, max(row_ends)), dim=-1)[1]
     mask_lo = torch_indices >= 0
     mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
@@ -191,37 +201,39 @@ def _run_top_k_per_row_decode_test(
     """
     Helper function to run top_k_per_row_decode test with given parameters.
     """
-    torch.set_default_device("xpu")
-    device = "xpu"
+    device = KERNEL_DEVICE
 
-    # Create test data
+    # Create test data on CPU
     num_rows = batch_size * next_n
     seq_lens = torch.randint(vocab_size, (batch_size, ),
                              dtype=torch.int32,
-                             device=device)
-    row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
-    row_indices = torch.arange(num_rows, device=device) // next_n
-    next_n_offset = torch.arange(num_rows, device=device) % next_n
+                             device=DEVICE)
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device=DEVICE)
+    row_indices = torch.arange(num_rows, device=DEVICE) // next_n
+    next_n_offset = torch.arange(num_rows, device=DEVICE) % next_n
     row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
     logits = create_random_logits(row_starts, row_ends, torch.float32, 42,
                                   data_generation)
 
-    # Create output tensors
-    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    # Create output tensors on kernel device
+    indices_k = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
 
     # Run XPU implementation
     topk_per_row_decode(
-        logits,
+        _to_kernel(logits),
         next_n,
-        seq_lens,
-        indices,
+        _to_kernel(seq_lens),
+        indices_k,
         num_rows,
         top_k,
     )
 
     torch.xpu.synchronize()
 
-    # Run reference implementation
+    # Get results on CPU
+    indices = indices_k.cpu()
+
+    # Run reference implementation (on CPU)
     torch_indices = logits.topk(min(top_k, max(row_ends)), dim=-1)[1]
     mask_lo = torch_indices >= 0
     mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0

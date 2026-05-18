@@ -10,6 +10,13 @@ from tests.lora.utils import (PunicaTensors, assert_close,
                               generate_data_for_nslices)
 from tests.utils import format_tc, seed_everything
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
 MINI_PYTEST_PARAMS = {
     "test_kernels": {
         "batches": [1],
@@ -422,7 +429,6 @@ def test_kernels(
     """
     Tests LoRA kernels.
     """
-    torch.set_default_device(device)
     torch.xpu.set_device(device)
     seed_everything(seed)
 
@@ -475,7 +481,6 @@ def test_kernels_hidden_size(
     """
     Tests SGMV and LoRA kernels.
     """
-    torch.set_default_device(device)
     torch.xpu.set_device(device)
     seed_everything(seed)
 
@@ -529,7 +534,6 @@ def test_kernels_mixed_precision(
     Tests LoRA kernels with mixed precision:
     input=float32, weight=float16/bfloat16.
     """
-    torch.set_default_device(device)
     torch.xpu.set_device(device)
     seed_everything(seed)
 

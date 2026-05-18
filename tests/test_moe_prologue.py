@@ -6,7 +6,12 @@ import torch
 import vllm_xpu_kernels._moe_C  # noqa: F401
 from tests.utils import seed_everything
 
-DEVICE = "xpu"
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
 
 # shape for Llama-4-scout
 FUSED_MOE_MNK_FACTORS = [
@@ -208,14 +213,14 @@ def test_prologue(m, n, k, e, topk, recipe):
 
     workspace = torch.zeros(map_offset,
                             dtype=torch.uint8,
-                            device=hidden_states.device)
+                            device=KERNEL_DEVICE)
     if topk_ids.dtype == torch.int32:
         topk_ids = topk_ids.to(torch.int64)
     torch.ops._moe_C.fused_moe_prologue(
-        input=hidden_states,
-        input_scales=scales,
-        token_selected_experts=topk_ids,
-        token_final_scales=topk_weights,
+        input=_to_kernel(hidden_states),
+        input_scales=_to_kernel(scales),
+        token_selected_experts=_to_kernel(topk_ids),
+        token_final_scales=_to_kernel(topk_weights),
         workspace=workspace,
         hidden_size=hidden_size,
         inter_size=inter_size,
@@ -227,15 +232,15 @@ def test_prologue(m, n, k, e, topk, recipe):
     expert_first_token_offset = workspace[
         ws_map["expert_first_token_offset"][1]:
         ws_map["expert_first_token_offset"][1] +
-        expert_first_token_offset_size].view(torch.int64)
+        expert_first_token_offset_size].view(torch.int64).cpu()
     expand_input = workspace[ws_map["overlapped_gemm1_gemm2_inputs"][1]:
                              ws_map["overlapped_gemm1_gemm2_inputs"][1] +
                              permuted_data_size].view(
                                  hidden_states.dtype).view(
-                                     num_moe_inputs, hidden_size)
+                                     num_moe_inputs, hidden_size).cpu()
     expand_scales = workspace[
         ws_map["permuted_act_scales"][1]:ws_map["permuted_act_scales"][1] +
-        permuted_act_scales_size]
+        permuted_act_scales_size].cpu()
     if scales is not None:
         if scale_dtype == torch.float32:
             expand_scales = expand_scales.view(torch.float32)
@@ -244,7 +249,7 @@ def test_prologue(m, n, k, e, topk, recipe):
 
     torch.testing.assert_close(
         ref_expert_offset.cpu(),
-        expert_first_token_offset[1:1 + ref_expert_offset.numel()].cpu(),
+        expert_first_token_offset[1:1 + ref_expert_offset.numel()],
         rtol=0,
         atol=0)
     if data_dtype is not torch.float4_e2m1fn_x2:

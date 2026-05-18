@@ -10,6 +10,13 @@ from tests.ops.activation_op import (FastGELU, FatreluAndMul, GeluAndMul,
                                      Relu2NoMul, SiluAndMul)
 from tests.utils import opcheck, seed_everything
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
 DTYPES = [torch.half, torch.bfloat16, torch.float]
 NUM_TOKENS = [7, 83, 2048]  # Arbitrary values for testing
 D = [512, 13824]  # Arbitrary values for testing
@@ -45,7 +52,7 @@ def test_act_and_mul(
     device: str,
 ) -> None:
     seed_everything(seed)
-    torch.set_default_device(device)
+    torch.xpu.set_device(device)
     x = torch.randn(num_tokens, 2 * d, dtype=dtype)
     if activation == "silu_and_mul":
         layer = SiluAndMul()
@@ -63,8 +70,10 @@ def test_act_and_mul(
         threshold = random.uniform(0, 1)
         layer = FatreluAndMul(threshold)
         fn = torch.ops._C.fatrelu_and_mul
-    out = layer(x)
     ref_out = layer.forward_native(x)
+    layer_k = layer.to(KERNEL_DEVICE)
+    out = layer_k(_to_kernel(x))
+    out = out.cpu()
 
     if activation == "fatrelu":
         torch.testing.assert_close(out, ref_out, atol=0.0, rtol=0.0)
@@ -73,11 +82,11 @@ def test_act_and_mul(
 
     d = x.shape[-1] // 2
     output_shape = (x.shape[:-1] + (d, ))
-    out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+    out_k = torch.empty(output_shape, dtype=x.dtype, device=KERNEL_DEVICE)
     if activation == "fatrelu":
-        opcheck(fn, (out, x, threshold))
+        opcheck(fn, (out_k, _to_kernel(x), threshold))
     else:
-        opcheck(fn, (out, x))
+        opcheck(fn, (out_k, _to_kernel(x)))
 
 
 @pytest.mark.parametrize("activation",
@@ -100,16 +109,18 @@ def test_activation(
     device: str,
 ) -> None:
     seed_everything(seed)
-    torch.set_default_device(device)
+    torch.xpu.set_device(device)
     x = torch.randn(num_tokens, d, dtype=dtype)
     layer = activation[0]()
     fn = activation[1]
-    out = layer(x)
     ref_out = layer.forward_native(x)
+    layer_k = layer.to(KERNEL_DEVICE)
+    out = layer_k(_to_kernel(x))
+    out = out.cpu()
     torch.testing.assert_close(out,
                                ref_out,
                                atol=get_default_atol(out),
                                rtol=get_default_rtol(out))
 
-    out = torch.empty_like(x)
-    opcheck(fn, (out, x))
+    out_k = torch.empty_like(x).to(KERNEL_DEVICE)
+    opcheck(fn, (out_k, _to_kernel(x)))

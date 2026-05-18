@@ -12,13 +12,20 @@ import torch
 from tests.ops.rotary_embedding_op import RotaryEmbedding
 from tests.utils import opcheck
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
 
 def rotary_embedding_opcheck(rot,
                              positions: torch.Tensor,
                              query: torch.Tensor,
                              key: Optional[torch.Tensor] = None,
                              offsets: Optional[torch.Tensor] = None):
-    cos_sin_cache = rot.cos_sin_cache.to(query.device, dtype=query.dtype)
+    cos_sin_cache = rot.cos_sin_cache.to(KERNEL_DEVICE, dtype=query.dtype)
 
     # ops.rotary_embedding()/batched_rotary_embedding()
     # are in-place operations that update the query and key tensors.
@@ -27,8 +34,8 @@ def rotary_embedding_opcheck(rot,
             "batched_rotary_embedding is not implemented yet.")
     else:
         opcheck(torch.ops._C.rotary_embedding,
-                (positions, query, key, rot.head_size, cos_sin_cache,
-                 rot.is_neox_style))
+                (_to_kernel(positions), _to_kernel(query), _to_kernel(key),
+                 rot.head_size, cos_sin_cache, rot.is_neox_style))
 
 
 #override pytest parameters when enable mini pytest
@@ -60,7 +67,7 @@ def test_rotary_embedding_opcheck(device, max_position, is_neox_style,
 
     positions = torch.randint(0,
                               max_position, (batch_size, seq_len),
-                              device=device)
+                              device=DEVICE)
     head_stride = head_size + (64 if head_stride_is_contiguous else 0)
 
     query = torch.randn(batch_size,
@@ -68,7 +75,7 @@ def test_rotary_embedding_opcheck(device, max_position, is_neox_style,
                         num_heads,
                         head_stride,
                         dtype=torch.float32,
-                        device=device)
+                        device=DEVICE)
     key = torch.randn_like(query) if use_key else None
     query = query[..., :head_size]
     key = key[..., :head_size] if use_key else None

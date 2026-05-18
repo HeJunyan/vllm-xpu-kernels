@@ -10,6 +10,14 @@ import torch
 import vllm_xpu_kernels._C  # noqa: F401 – registers torch.ops._C.*
 from tests.ops.layernorm_op import RMSNorm
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
+
 DTYPES = [torch.half, torch.bfloat16]
 # XPU FP8 default is e4m3fn; INT8 is always tested
 QUANT_DTYPES = [torch.float8_e4m3fn, torch.int8]
@@ -128,13 +136,19 @@ def _ops_per_token_quant(
     scale_ub: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     x = x.contiguous()
-    out = torch.empty_like(x, dtype=quant_dtype)
+    x_k = _to_kernel(x)
+    out_k = torch.empty_like(x_k, dtype=quant_dtype)
     num_tokens = x.numel() // x.shape[-1]
-    scales = torch.empty(num_tokens, dtype=torch.float32, device=x.device)
+    scales_k = torch.empty(num_tokens, dtype=torch.float32, device=KERNEL_DEVICE)
+    residual_k = None
     if residual is not None:
-        residual = residual.clone().contiguous()
-    torch.ops._C.rms_norm_dynamic_per_token_quant(out, x, weight, scales, EPS,
-                                                  scale_ub, residual)
+        residual_k = residual.clone().contiguous().to(KERNEL_DEVICE)
+    torch.ops._C.rms_norm_dynamic_per_token_quant(
+        out_k, x_k, _to_kernel(weight), scales_k, EPS, _to_kernel(scale_ub),
+        residual_k)
+    out = out_k.cpu()
+    scales = scales_k.cpu()
+    residual = residual_k.cpu() if residual_k is not None else None
     return out, scales, residual
 
 
@@ -146,26 +160,31 @@ def _ops_per_group_quant(
     residual: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     x = x.contiguous()
-    out = torch.empty_like(x, dtype=quant_dtype)
+    x_k = _to_kernel(x)
+    out_k = torch.empty_like(x_k, dtype=quant_dtype)
     num_tokens = x.numel() // x.shape[-1]
     num_groups = x.shape[-1] // group_size
-    scales = torch.empty(num_tokens,
-                         num_groups,
-                         dtype=torch.float32,
-                         device=x.device)
+    scales_k = torch.empty(num_tokens,
+                           num_groups,
+                           dtype=torch.float32,
+                           device=KERNEL_DEVICE)
+    residual_k = None
     if residual is not None:
-        residual = residual.clone().contiguous()
+        residual_k = residual.clone().contiguous().to(KERNEL_DEVICE)
     torch.ops._C.rms_norm_per_block_quant(
-        out,
-        x,
-        weight,
-        scales,
+        out_k,
+        x_k,
+        _to_kernel(weight),
+        scales_k,
         EPS,
         None,  # scale_ub (not used for per-block)
-        residual,
+        residual_k,
         group_size,
         False,  # is_scale_transposed
     )
+    out = out_k.cpu()
+    scales = scales_k.cpu()
+    residual = residual_k.cpu() if residual_k is not None else None
     return out, scales, residual
 
 
@@ -187,7 +206,6 @@ def test_rms_norm_dynamic_per_token_quant(
     device: str,
 ) -> None:
     torch.manual_seed(seed)
-    torch.set_default_device("xpu")
     torch.xpu.set_device(device)
 
     layer = RMSNorm(hidden_size, eps=EPS).to(dtype=dtype)
@@ -265,7 +283,6 @@ def test_rms_norm_per_block_quant(
             group_size {group_size}")
 
     torch.manual_seed(seed)
-    torch.set_default_device("xpu")
     torch.xpu.set_device(device)
 
     layer = RMSNorm(hidden_size, eps=EPS).to(dtype=dtype)
@@ -315,9 +332,11 @@ def _ops_rms_norm_static_fp8_quant(
     x: torch.Tensor,
     scale: torch.Tensor,
 ) -> torch.Tensor:
-    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    torch.ops._C.rms_norm_static_fp8_quant(out, x, weight, scale, EPS)
-    return out
+    x_k = _to_kernel(x)
+    out_k = torch.empty_like(x_k, dtype=torch.float8_e4m3fn)
+    torch.ops._C.rms_norm_static_fp8_quant(out_k, x_k, _to_kernel(weight),
+                                           _to_kernel(scale), EPS)
+    return out_k.cpu()
 
 
 def _ops_fused_add_rms_norm_static_fp8_quant(
@@ -326,12 +345,14 @@ def _ops_fused_add_rms_norm_static_fp8_quant(
     residual: torch.Tensor,
     scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    out = torch.empty(x.shape[-1], dtype=torch.float8_e4m3fn,
-                      device=x.device).expand_as(x).contiguous()
-    residual = residual.clone().contiguous()
-    torch.ops._C.fused_add_rms_norm_static_fp8_quant(out, x, residual, weight,
-                                                     scale, EPS)
-    return out, residual
+    x_k = _to_kernel(x)
+    residual_k = residual.clone().contiguous().to(KERNEL_DEVICE)
+    out_k = torch.empty(x.shape[-1],
+                        dtype=torch.float8_e4m3fn,
+                        device=KERNEL_DEVICE).expand_as(x_k).contiguous()
+    torch.ops._C.fused_add_rms_norm_static_fp8_quant(
+        out_k, x_k, residual_k, _to_kernel(weight), _to_kernel(scale), EPS)
+    return out_k.cpu(), residual_k.cpu()
 
 
 def _ref_static_fp8_quant(
@@ -361,7 +382,6 @@ def test_rms_norm_static_fp8_quant(
     strided_input: bool,
 ) -> None:
     torch.manual_seed(seed)
-    torch.set_default_device("xpu")
     torch.xpu.set_device(device)
 
     layer = RMSNorm(hidden_size, eps=EPS).to(dtype=dtype)
@@ -409,7 +429,6 @@ def test_fused_add_rms_norm_static_fp8_quant(
     strided_input: bool,
 ) -> None:
     torch.manual_seed(seed)
-    torch.set_default_device("xpu")
     torch.xpu.set_device(device)
 
     layer = RMSNorm(hidden_size, eps=EPS).to(dtype=dtype)

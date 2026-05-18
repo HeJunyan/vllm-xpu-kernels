@@ -7,6 +7,13 @@ import torch
 from tests.ops.layernorm_op import RMSNorm
 from tests.utils import opcheck
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
 DTYPES = [torch.half, torch.bfloat16]
 NUM_TOKENS = [1, 7, 83, 4096]  # Arbitrary values for testing
 # TODO: add back  5120, 5124, 5125, 5126, 8192, 8199 after ci env issue fixed
@@ -47,8 +54,6 @@ def test_rms_norm(
     device: str,
     strided_input: bool,
 ) -> None:
-    # Note: torch.set_default_device("xpu:1") not works.
-    torch.set_default_device("xpu")
     torch.xpu.set_device(device)
     layer = RMSNorm(hidden_size).to(dtype=dtype)
     layer.weight.data.normal_(mean=1.0, std=0.1)
@@ -64,7 +69,12 @@ def test_rms_norm(
     # NOTE(woosuk): The reference implementation should be executed first
     # because the custom kernel is in-place.
     ref_out = layer.forward_native(x, residual)
-    out = layer(x, residual)
+    layer_k = layer.to(KERNEL_DEVICE)
+    out = layer_k(_to_kernel(x), _to_kernel(residual))
+    if isinstance(out, tuple):
+        out = (out[0].cpu(), out[1].cpu())
+    else:
+        out = out.cpu()
     # NOTE(woosuk): LayerNorm operators (including RMS) typically have larger
     # numerical errors than other operators because they involve reductions.
     # Therefore, we use a larger tolerance.
@@ -77,10 +87,10 @@ def test_rms_norm(
 
     if residual is not None:
         opcheck(torch.ops._C.fused_add_rms_norm,
-                (x, residual, layer.weight.data, layer.variance_epsilon))
+                (_to_kernel(x), _to_kernel(residual), layer_k.weight.data, layer_k.variance_epsilon))
     else:
         opcheck(torch.ops._C.rms_norm,
-                (out, x, layer.weight.data, layer.variance_epsilon))
+                (out.to(KERNEL_DEVICE), _to_kernel(x), layer_k.weight.data, layer_k.variance_epsilon))
 
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
@@ -101,7 +111,6 @@ def test_rms_norm_uncontigous(
     seed: int,
 ) -> None:
     torch.manual_seed(seed)
-    torch.set_default_device("xpu")
     torch.xpu.set_device(device)
 
     hidden_size = (num_q_heads + 2 * num_kv_heads) * head_dim
@@ -113,10 +122,12 @@ def test_rms_norm_uncontigous(
 
     layer = RMSNorm(head_dim).to(dtype=dtype)
     ref_out = layer.forward_native(q_by_head)
-    out = layer(q_by_head)
+    layer_k = layer.to(KERNEL_DEVICE)
+    out = layer_k(_to_kernel(q_by_head))
+    out = out.cpu()
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
     opcheck(
         torch.ops._C.rms_norm,
-        (out, q_by_head, layer.weight.data, layer.variance_epsilon),
+        (out.to(KERNEL_DEVICE), _to_kernel(q_by_head), layer_k.weight.data, layer_k.variance_epsilon),
     )

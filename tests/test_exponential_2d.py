@@ -10,7 +10,8 @@ import vllm_xpu_kernels._xpu_C  # noqa: F401
 
 BATCH_SIZE = [1, 4, 16]
 VOCAB_SIZE = [100, 1000, 10000]
-DEVICE = "xpu"
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
 
 # CI/mini scope parameter overrides
 MINI_PYTEST_PARAMS = {
@@ -22,6 +23,10 @@ MINI_PYTEST_PARAMS = {
         "lambda_param": [1.0],
     },
 }
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
 
 
 class ExponentialDistributionTester:
@@ -174,7 +179,9 @@ def test_exponential_2d_comprehensive(batch_size, vocab_size, seed, offset,
                           vocab_size,
                           dtype=torch.float,
                           device=DEVICE)
-    torch.ops._xpu_C.exponential_2d_(samples, seeds, lambda_param)
+    samples_kernel = _to_kernel(samples)
+    torch.ops._xpu_C.exponential_2d_(samples_kernel, seeds, lambda_param)
+    samples.copy_(samples_kernel.cpu())
 
     assert samples.shape == (
         batch_size, vocab_size
@@ -243,7 +250,9 @@ def test_exponential_2d_reproducibility(batch_size, vocab_size, seed, offset,
                            vocab_size,
                            dtype=torch.float,
                            device=DEVICE)
-    torch.ops._xpu_C.exponential_2d_(samples1, seeds1, lambda_param)
+    samples1_kernel = _to_kernel(samples1)
+    torch.ops._xpu_C.exponential_2d_(samples1_kernel, seeds1, lambda_param)
+    samples1.copy_(samples1_kernel.cpu())
 
     seeds2 = torch.tensor([seed, offset],
                           dtype=torch.int64,
@@ -252,7 +261,9 @@ def test_exponential_2d_reproducibility(batch_size, vocab_size, seed, offset,
                            vocab_size,
                            dtype=torch.float,
                            device=DEVICE)
-    torch.ops._xpu_C.exponential_2d_(samples2, seeds2, lambda_param)
+    samples2_kernel = _to_kernel(samples2)
+    torch.ops._xpu_C.exponential_2d_(samples2_kernel, seeds2, lambda_param)
+    samples2.copy_(samples2_kernel.cpu())
 
     assert torch.allclose(
         samples1, samples2), "Same seeds should produce identical results"
@@ -264,7 +275,9 @@ def test_exponential_2d_reproducibility(batch_size, vocab_size, seed, offset,
                            vocab_size,
                            dtype=torch.float,
                            device=DEVICE)
-    torch.ops._xpu_C.exponential_2d_(samples3, seeds3, lambda_param)
+    samples3_kernel = _to_kernel(samples3)
+    torch.ops._xpu_C.exponential_2d_(samples3_kernel, seeds3, lambda_param)
+    samples3.copy_(samples3_kernel.cpu())
 
     assert not torch.allclose(
         samples1, samples3), "Different seeds should produce different results"
@@ -286,7 +299,9 @@ def test_exponential_2d_edge_cases(batch_size, vocab_size, seed, offset,
                           vocab_size,
                           dtype=torch.float,
                           device=DEVICE)
-    torch.ops._xpu_C.exponential_2d_(samples, seeds, lambda_param)
+    samples_kernel = _to_kernel(samples)
+    torch.ops._xpu_C.exponential_2d_(samples_kernel, seeds, lambda_param)
+    samples.copy_(samples_kernel.cpu())
 
     assert torch.all(
         samples > 0), f"All samples should be positive for λ={lambda_param}"

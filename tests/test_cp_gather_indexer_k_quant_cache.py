@@ -7,7 +7,12 @@ from tests import register_ops as ops
 
 eps = 1e-4
 
-DEVICE = "xpu"
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
 BATCH_SEQ_LENS = [[1], [3], [6], [3, 4], [5, 4], [4, 3], [4, 4], [7, 8, 5]]
 # (head_dim, quant_block_size) valid combinations
 HEAD_DIM_QUANT_BLOCK_PARAMS = ([(hd, 128) for hd in [128, 256, 512]] +
@@ -145,8 +150,11 @@ def test_cp_gather_indexer_k_quant_cache_correctness(batch_seq_lens,
     kv_cache = torch.zeros((total_blocks, block_size, cache_stride),
                            dtype=torch.uint8,
                            device=DEVICE)
-    ops.indexer_k_quant_and_cache(k, kv_cache, slot_mapping, quant_block_size,
+    kv_cache_kernel = kv_cache.to(KERNEL_DEVICE)
+    ops.indexer_k_quant_and_cache(_to_kernel(k), kv_cache_kernel,
+                                  _to_kernel(slot_mapping), quant_block_size,
                                   scale_fmt)
+    kv_cache = kv_cache_kernel.cpu()
 
     dst_k_ref = torch.zeros((num_tokens, head_dim),
                             dtype=torch.uint8,
@@ -162,8 +170,12 @@ def test_cp_gather_indexer_k_quant_cache_correctness(batch_seq_lens,
                                         block_table, cu_seq_lens)
 
     # Run XPU kernel
-    ops.cp_gather_indexer_k_quant_cache(kv_cache, dst_k_xpu, dst_s_xpu,
-                                        block_table, cu_seq_lens)
+    dst_k_xpu_kernel = _to_kernel(dst_k_xpu)
+    dst_s_xpu_kernel = _to_kernel(dst_s_xpu)
+    ops.cp_gather_indexer_k_quant_cache(_to_kernel(kv_cache), dst_k_xpu_kernel, dst_s_xpu_kernel,
+                                        _to_kernel(block_table), _to_kernel(cu_seq_lens))
+    dst_k_xpu.copy_(dst_k_xpu_kernel.cpu())
+    dst_s_xpu.copy_(dst_s_xpu_kernel.cpu())
 
     # Compare token by token for clear diagnostics
     all_fp8_match = True

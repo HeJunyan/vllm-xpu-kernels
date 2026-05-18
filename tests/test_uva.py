@@ -7,6 +7,14 @@ import torch
 
 import vllm_xpu_kernels._C  # noqa: F401
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
+
 XPU_DEVICES = [
     f"xpu:{i}" for i in range(1 if torch.xpu.device_count() == 1 else 2)
 ]
@@ -24,7 +32,6 @@ MINI_PYTEST_PARAMS = {
 
 @pytest.mark.parametrize("device", XPU_DEVICES)
 def test_cpu_write(device):
-    torch.set_default_device(device)
     cpu_tensor = torch.zeros(10,
                              10,
                              device="cpu",
@@ -49,7 +56,6 @@ def test_cpu_write(device):
 
 @pytest.mark.parametrize("device", XPU_DEVICES)
 def test_gpu_write(device):
-    torch.set_default_device(device)
     cpu_tensor = torch.zeros(10,
                              10,
                              device="cpu",
@@ -74,7 +80,6 @@ def test_gpu_write(device):
 
 @pytest.mark.parametrize("device", XPU_DEVICES)
 def test_view_lifetime_after_owner_drop(device):
-    torch.set_default_device(device)
     cpu_tensor = torch.arange(100,
                               dtype=torch.int32,
                               device="cpu",

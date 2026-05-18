@@ -19,9 +19,16 @@ _is_mini_scope = (_test_scope == "mini" or os.getenv(
     "XPU_KERNEL_PYTEST_PROFILER", "").strip().upper() == "MINI")
 SKIP_TEST_FOR_MINI_SCOPE = _is_mini_scope
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
 
 def as_float32_tensor(x: Union[float, torch.tensor]) -> torch.tensor:
-    return torch.as_tensor(x, dtype=torch.float32, device="xpu")
+    return torch.as_tensor(x, dtype=torch.float32, device=DEVICE)
 
 
 def ref_dynamic_per_tensor_fp8_quant(x, fp8_dtype=torch.float8_e5m2):
@@ -254,11 +261,13 @@ def test_dynamic_per_tensor_fp8_quant(
 ) -> None:
     seed_everything(seed)
 
-    x = torch.rand(num_tokens, hidden_size, dtype=dtype, device="xpu")
+    x = torch.rand(num_tokens, hidden_size, dtype=dtype, device=DEVICE)
 
     ref_out, ref_scale = ref_dynamic_per_tensor_fp8_quant(x, fp8_dtype)
 
-    ops_out, ops_scale = scaled_fp8_quant(x, fp8_dtype=fp8_dtype)
+    ops_out, ops_scale = scaled_fp8_quant(_to_kernel(x), fp8_dtype=fp8_dtype)
+    ops_out = ops_out.cpu()
+    ops_scale = ops_scale.cpu()
 
     torch.testing.assert_close(ref_scale, ops_scale)
     torch.testing.assert_close(ref_out.to(dtype=torch.float32),
@@ -282,17 +291,19 @@ def test_dynamic_per_token_fp8_quant(
 ) -> None:
     seed_everything(seed)
 
-    x = (torch.rand(num_tokens, hidden_size, dtype=dtype, device="xpu") + 1e-6
+    x = (torch.rand(num_tokens, hidden_size, dtype=dtype, device=DEVICE) + 1e-6
          )  # avoid nans
 
     scale_ub = torch.mean(x).to(dtype=torch.float32,
-                                device="xpu") if scale_ub else None
+                                device=DEVICE) if scale_ub else None
     ref_out, ref_scales = ref_dynamic_per_token_quant(x, fp8_dtype, scale_ub)
 
-    ops_out, ops_scales = scaled_fp8_quant(x,
-                                           scale_ub=scale_ub,
+    ops_out, ops_scales = scaled_fp8_quant(_to_kernel(x),
+                                           scale_ub=_to_kernel(scale_ub),
                                            use_per_token_if_dynamic=True,
                                            fp8_dtype=fp8_dtype)
+    ops_out = ops_out.cpu()
+    ops_scales = ops_scales.cpu()
 
     torch.testing.assert_close(ref_scales, ops_scales)
     assert_close_percentage(
@@ -322,16 +333,18 @@ def test_per_block_fp8_quant(
     x = (torch.rand(num_tokens_block_quant,
                     hidden_size_block_quant,
                     dtype=dtype,
-                    device="xpu") + 1e-6)  # avoid nans
+                    device=DEVICE) + 1e-6)  # avoid nans
 
     ref_out, ref_scales = ref_per_block_quant(x, 1, group_size)
 
     ops_out, ops_scales = per_token_group_quant_fp8(
-        x,
+        _to_kernel(x),
         group_size=group_size,
         dtype=torch.float8_e4m3fn,
         use_ue8m0=False,
         column_major_scales=column_major_scale)
+    ops_out = ops_out.cpu()
+    ops_scales = ops_scales.cpu()
 
     assert torch.allclose(ref_out.float(),
                           ops_out.float(),
@@ -361,16 +374,18 @@ def test_per_block_mxfp8_quant(
     x = (torch.rand(num_tokens_block_quant,
                     hidden_size_block_quant,
                     dtype=mxfp8_hp_dtypes,
-                    device="xpu") + 1e-6)  # avoid nans
+                    device=DEVICE) + 1e-6)  # avoid nans
 
     ref_scales, ref_out = to_mxfp(x)
 
     ops_out, ops_scales = per_token_group_quant_fp8(
-        x,
+        _to_kernel(x),
         group_size=32,
         dtype=torch.float8_e4m3fn,
         use_ue8m0=True,
         column_major_scales=column_major_scale)
+    ops_out = ops_out.cpu()
+    ops_scales = ops_scales.cpu()
 
     assert torch.allclose(ref_out.float(),
                           ops_out.float(),
@@ -397,10 +412,13 @@ def test_fp8_quant_large(seed: int, fp8_dtype: torch.dtype) -> None:
     hidden_size = 1152  # Smallest hidden_size to reproduce the error
     dtype = torch.bfloat16
 
-    x = torch.rand(num_tokens, hidden_size, dtype=dtype, device="xpu")
+    x = torch.rand(num_tokens, hidden_size, dtype=dtype, device=DEVICE)
     ref_out, scale = ref_dynamic_per_tensor_fp8_quant(x, fp8_dtype)
 
-    ops_out, _ = scaled_fp8_quant(x, scale, fp8_dtype=fp8_dtype)
+    ops_out, _ = scaled_fp8_quant(_to_kernel(x),
+                                  _to_kernel(scale),
+                                  fp8_dtype=fp8_dtype)
+    ops_out = ops_out.cpu()
 
     # Minimize memory footprint in this test by freeing x and upconverting
     # the outputs in place. (torch.allclose does not support fp8)
@@ -440,15 +458,19 @@ def test_static_fp8_quant_group_2d(
 
     seed_everything(seed)
 
-    x = torch.rand(num_tokens, hidden_size, dtype=dtype, device="xpu")
-    ref_out, scale = scaled_quantize(x,
+    x = torch.rand(num_tokens, hidden_size, dtype=dtype, device=DEVICE)
+    ref_out, scale = scaled_quantize(_to_kernel(x),
                                      group_shape,
                                      fp8_dtype,
                                      compute_dtype=torch.float32)
-    ops_out, ops_scale = scaled_fp8_quant(x,
-                                          scale=scale,
+    ref_out = ref_out.cpu()
+    scale = scale.cpu()
+    ops_out, ops_scale = scaled_fp8_quant(_to_kernel(x),
+                                          scale=_to_kernel(scale),
                                           fp8_dtype=fp8_dtype,
                                           group_shape=group_shape)
+    ops_out = ops_out.cpu()
+    ops_scale = ops_scale.cpu()
     torch.testing.assert_close(scale, ops_scale)
     torch.testing.assert_close(ref_out.float(),
                                ops_out.float(),
@@ -476,18 +498,22 @@ def test_static_fp8_quant_1d_scale(
     """Test static FP8 quantization with 1D scale (per-token or per-channel)."""
     seed_everything(seed)
 
-    x = torch.rand(num_tokens, hidden_size, dtype=dtype, device="xpu")
-    ref_out, scale_2d = scaled_quantize(x,
+    x = torch.rand(num_tokens, hidden_size, dtype=dtype, device=DEVICE)
+    ref_out, scale_2d = scaled_quantize(_to_kernel(x),
                                         group_shape,
                                         fp8_dtype,
                                         compute_dtype=torch.float32)
+    ref_out = ref_out.cpu()
+    scale_2d = scale_2d.cpu()
 
     # Flatten scale to 1D for testing 1D scale path
     scale_1d = scale_2d.flatten()
-    ops_out, ops_scale = scaled_fp8_quant(x,
-                                          scale=scale_1d,
+    ops_out, ops_scale = scaled_fp8_quant(_to_kernel(x),
+                                          scale=_to_kernel(scale_1d),
                                           fp8_dtype=fp8_dtype,
                                           group_shape=group_shape)
+    ops_out = ops_out.cpu()
+    ops_scale = ops_scale.cpu()
 
     torch.testing.assert_close(scale_1d, ops_scale)
     torch.testing.assert_close(ref_out.float(),

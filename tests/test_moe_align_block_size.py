@@ -12,6 +12,14 @@ from tests.ops.moe_align_block_size_ops import (batched_moe_align_block_size,
                                                 moe_align_block_size)
 from tests.utils import opcheck, round_up, seed_everything
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
+
 NUM_TOKENS = [1, 3, 256, 2256, 4096]
 NUM_EXPERTS = [32, 160, 256, 257]
 TOP_KS = [1, 2, 16, 32]
@@ -115,26 +123,26 @@ def torch_moe_align_block_size(
         max_num_tokens_padded = topk_ids.numel() * block_size
 
     flattened_token_indices = torch.arange(topk_ids.numel(),
-                                           device=topk_ids.device,
+                                           device=DEVICE,
                                            dtype=torch.int32)
-    flattened_expert_ids = topk_ids.flatten()
+    flattened_expert_ids = topk_ids.flatten().cpu()
     sorted_expert_ids, sort_indices = torch.sort(flattened_expert_ids,
                                                  stable=True)
     sorted_token_indices = flattened_token_indices[sort_indices]
 
     expert_token_counts = torch.zeros(num_experts,
                                       dtype=torch.int64,
-                                      device=topk_ids.device)
+                                      device=DEVICE)
     for expert_id in range(num_experts):
         mask = sorted_expert_ids == expert_id
         expert_token_counts[expert_id] = mask.sum()
 
     expert_padded_counts = torch.zeros(num_experts,
                                        dtype=torch.int64,
-                                       device=topk_ids.device)
+                                       device=DEVICE)
     for expert_id in range(num_experts):
         original_count = expert_token_counts[expert_id]
-        if expert_map is not None and expert_map[expert_id] == -1:
+        if expert_map is not None and expert_map[expert_id].cpu() == -1:
             continue
         if original_count > 0:
             expert_padded_counts[expert_id] = (
@@ -144,17 +152,17 @@ def torch_moe_align_block_size(
         (max_num_tokens_padded, ),
         topk_ids.numel(),
         dtype=torch.int32,
-        device=topk_ids.device,
+        device=DEVICE,
     )
     max_num_blocks = (max_num_tokens_padded + block_size - 1) // block_size
     expert_ids = torch.zeros(max_num_blocks,
                              dtype=torch.int32,
-                             device=topk_ids.device)
+                             device=DEVICE)
 
     current_pos = 0
     current_block = 0
     for expert_id in range(num_experts):
-        if expert_map is not None and expert_map[expert_id] == -1:
+        if expert_map is not None and expert_map[expert_id].cpu() == -1:
             continue
 
         expert_mask = sorted_expert_ids == expert_id
@@ -168,7 +176,7 @@ def torch_moe_align_block_size(
             expert_blocks_needed = expert_padded_counts[expert_id] // block_size
             expert_id_new = expert_id
             if expert_map is not None:
-                expert_id_new = expert_map[expert_id]
+                expert_id_new = expert_map[expert_id].cpu()
             expert_ids[current_block:current_block +
                        expert_blocks_needed] = (expert_id_new)
 
@@ -178,7 +186,7 @@ def torch_moe_align_block_size(
     total_padded_tokens = expert_padded_counts.sum()
     num_tokens_post_pad = torch.tensor([total_padded_tokens],
                                        dtype=torch.int32,
-                                       device=topk_ids.device)
+                                       device=DEVICE)
 
     return sorted_token_ids, expert_ids, num_tokens_post_pad
 
@@ -191,18 +199,22 @@ def torch_moe_align_block_size(
 def test_moe_align_block_size(m: int, topk: int, num_experts: int,
                               block_size: int, pad_sorted_ids: bool):
     """Test moe_align_block_size without expert mapping"""
-    topk_ids = torch.zeros((m, topk), device="xpu", dtype=torch.int32)
+    topk_ids = torch.zeros((m, topk), device=DEVICE, dtype=torch.int32)
     for i in range(m):
-        experts = torch.randperm(num_experts, device="xpu")[:topk]
+        experts = torch.randperm(num_experts, device=DEVICE)[:topk]
         topk_ids[i] = experts
 
     actual_sorted_ids, actual_expert_ids, actual_num_tokens =\
         moe_align_block_size(
-            topk_ids=topk_ids,
+            topk_ids=_to_kernel(topk_ids),
             block_size=block_size,
             num_experts=num_experts,
             pad_sorted_ids=pad_sorted_ids,
         )
+    actual_sorted_ids = actual_sorted_ids.cpu()
+    actual_expert_ids = actual_expert_ids.cpu()
+    actual_num_tokens = actual_num_tokens.cpu()
+
     golden_sorted_ids, golden_expert_ids, golden_num_tokens = (
         torch_moe_align_block_size(
             topk_ids=topk_ids,
@@ -254,14 +266,14 @@ def test_moe_align_block_size_with_expert_map(m: int, topk: int,
                                               num_experts: int,
                                               block_size: int):
     """Test moe_align_block_size with expert mapping (EP scenario)"""
-    topk_ids = torch.zeros((m, topk), device="xpu", dtype=torch.int32)
+    topk_ids = torch.zeros((m, topk), device=DEVICE, dtype=torch.int32)
     for i in range(m):
-        experts = torch.randperm(num_experts, device="xpu")[:topk]
+        experts = torch.randperm(num_experts, device=DEVICE)[:topk]
         topk_ids[i] = experts
 
     expert_map = torch.full((num_experts, ),
                             -1,
-                            device="xpu",
+                            device=DEVICE,
                             dtype=torch.int32)
     local_experts = list(range(0, num_experts, 2))
     for i, expert_id in enumerate(local_experts):
@@ -269,12 +281,16 @@ def test_moe_align_block_size_with_expert_map(m: int, topk: int,
 
     actual_sorted_ids, actual_expert_ids, actual_num_tokens = (
         moe_align_block_size(
-            topk_ids=topk_ids,
+            topk_ids=_to_kernel(topk_ids),
             block_size=block_size,
             num_experts=num_experts,
-            expert_map=expert_map,
+            expert_map=_to_kernel(expert_map),
             ignore_invalid_experts=True,
         ))
+    actual_sorted_ids = actual_sorted_ids.cpu()
+    actual_expert_ids = actual_expert_ids.cpu()
+    actual_num_tokens = actual_num_tokens.cpu()
+
     golden_sorted_ids, golden_expert_ids, golden_num_tokens = (
         torch_moe_align_block_size(
             topk_ids=topk_ids,
@@ -310,16 +326,19 @@ def test_moe_align_block_size_deterministic(m: int, topk: int,
     torch.manual_seed(42)
     topk_ids = torch.randint(0,
                              num_experts, (m, topk),
-                             device="xpu",
+                             device=DEVICE,
                              dtype=torch.int32)
 
     # expect the results to be reproducible
     results = []
     for _ in range(5):
         sorted_ids, expert_ids, num_tokens = moe_align_block_size(
-            topk_ids=topk_ids, block_size=block_size, num_experts=num_experts)
+            topk_ids=_to_kernel(topk_ids),
+            block_size=block_size,
+            num_experts=num_experts)
         results.append(
-            (sorted_ids.clone(), expert_ids.clone(), num_tokens.clone()))
+            (sorted_ids.cpu().clone(), expert_ids.cpu().clone(),
+             num_tokens.cpu().clone()))
 
     for i in range(1, len(results)):
         assert torch.equal(
@@ -351,9 +370,11 @@ def test_batched_moe_align_block_size(
 
         # Round up so each batch can be split to blocks evenly.
         Msum = round_up(max_tokens_per_batch, block_size) * E
-        ref_sorted_ids = torch.empty((Msum, ), dtype=torch.int32)
-        ref_expert_ids = torch.empty((Msum // block_size, ), dtype=torch.int32)
-        ref_num_tokens_post_pad = torch.empty((1, ), dtype=torch.int32)
+        ref_sorted_ids = torch.empty((Msum, ), dtype=torch.int32, device=DEVICE)
+        ref_expert_ids = torch.empty((Msum // block_size, ), dtype=torch.int32,
+                                     device=DEVICE)
+        ref_num_tokens_post_pad = torch.empty((1, ), dtype=torch.int32,
+                                              device=DEVICE)
 
         # Initialize
         sentinel = E * max_tokens_per_batch
@@ -383,9 +404,9 @@ def test_batched_moe_align_block_size(
             nt_ceil_sum += ceil_expert_nt
 
         return (
-            ref_sorted_ids.to("xpu"),
-            ref_expert_ids.to("xpu"),
-            ref_num_tokens_post_pad.to("xpu"),
+            ref_sorted_ids.to(KERNEL_DEVICE),
+            ref_expert_ids.to(KERNEL_DEVICE),
+            ref_num_tokens_post_pad.to(KERNEL_DEVICE),
         )
 
     # Compute expert_num_tokens
@@ -407,7 +428,10 @@ def test_batched_moe_align_block_size(
 
     # outputs
     sorted_ids, expert_ids, num_tokens_post_pad = batched_moe_align_block_size(
-        max_tokens_per_batch, block_size, expert_num_tokens.to("xpu"))
+        max_tokens_per_batch, block_size, _to_kernel(expert_num_tokens))
+    sorted_ids = sorted_ids.cpu()
+    expert_ids = expert_ids.cpu()
+    num_tokens_post_pad = num_tokens_post_pad.cpu()
 
     assert ref_sorted_ids.size() == sorted_ids.size(), (
         f"{ref_sorted_ids.size()} vs {sorted_ids.size()}")
@@ -416,9 +440,11 @@ def test_batched_moe_align_block_size(
     assert ref_num_tokens_post_pad.size() == num_tokens_post_pad.size(), (
         f"{ref_num_tokens_post_pad.size()} vs {num_tokens_post_pad.size()}")
 
-    torch.testing.assert_close(ref_sorted_ids, sorted_ids, atol=0, rtol=0)
-    torch.testing.assert_close(ref_expert_ids, expert_ids, atol=0, rtol=0)
-    torch.testing.assert_close(ref_num_tokens_post_pad,
+    torch.testing.assert_close(ref_sorted_ids.cpu(), sorted_ids, atol=0,
+                               rtol=0)
+    torch.testing.assert_close(ref_expert_ids.cpu(), expert_ids, atol=0,
+                               rtol=0)
+    torch.testing.assert_close(ref_num_tokens_post_pad.cpu(),
                                num_tokens_post_pad,
                                atol=0,
                                rtol=0)
@@ -434,44 +460,44 @@ def test_moe_align_block_size_opcheck(ep_size):
         local_num_experts = num_experts // ep_size
         expert_ids = torch.randint(0,
                                    num_experts, (local_num_experts, ),
-                                   device="xpu",
+                                   device=DEVICE,
                                    dtype=torch.int32)
         expert_map = torch.full((num_experts, ),
                                 -1,
-                                device="xpu",
+                                device=DEVICE,
                                 dtype=torch.int32)
         expert_map[expert_ids] = torch.arange(local_num_experts,
-                                              device="xpu",
+                                              device=DEVICE,
                                               dtype=torch.int32)
 
     topk_ids = torch.randint(0,
                              num_experts, (3, 4),
                              dtype=torch.int32,
-                             device="xpu")
+                             device=DEVICE)
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     sorted_ids = torch.empty((max_num_tokens_padded, ),
                              dtype=torch.int32,
-                             device=topk_ids.device)
+                             device=DEVICE)
     sorted_ids.fill_(topk_ids.numel())
     max_num_m_blocks = max_num_tokens_padded // block_size
-    expert_ids = torch.empty((max_num_m_blocks, ),
-                             dtype=torch.int32,
-                             device=topk_ids.device)
+    expert_ids_out = torch.empty((max_num_m_blocks, ),
+                                 dtype=torch.int32,
+                                 device=DEVICE)
     num_tokens_post_pad = torch.empty((1),
                                       dtype=torch.int32,
-                                      device=topk_ids.device)
+                                      device=DEVICE)
 
     opcheck(
         torch.ops._moe_C.moe_align_block_size,
         (
-            topk_ids,
+            _to_kernel(topk_ids),
             num_experts,
             block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            expert_map,
+            sorted_ids.to(KERNEL_DEVICE),
+            expert_ids_out.to(KERNEL_DEVICE),
+            num_tokens_post_pad.to(KERNEL_DEVICE),
+            _to_kernel(expert_map),
         ),
     )
 
@@ -489,30 +515,30 @@ def test_batched_moe_align_block_size_opcheck(
         high=max_tokens_per_batch,
         size=(num_experts, ),
         dtype=torch.int32,
-        device="xpu",
+        device=DEVICE,
     )
 
     max_num_tokens_padded = num_experts * max(max_tokens_per_batch, block_size)
     sorted_ids = torch.empty((max_num_tokens_padded, ),
                              dtype=torch.int32,
-                             device="xpu")
+                             device=DEVICE)
 
     assert max_num_tokens_padded % block_size == 0
     max_num_m_blocks = max_num_tokens_padded // block_size
     expert_ids = torch.empty((max_num_m_blocks, ),
                              dtype=torch.int32,
-                             device="xpu")
+                             device=DEVICE)
 
-    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device="xpu")
+    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=DEVICE)
 
     opcheck(
         torch.ops._moe_C.batched_moe_align_block_size,
         (
             max_tokens_per_batch,
             block_size,
-            expert_num_tokens,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
+            _to_kernel(expert_num_tokens),
+            sorted_ids.to(KERNEL_DEVICE),
+            expert_ids.to(KERNEL_DEVICE),
+            num_tokens_post_pad.to(KERNEL_DEVICE),
         ),
     )

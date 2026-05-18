@@ -11,6 +11,14 @@ from tests.ops.mx_utils import (FP4_EBITS, FP4_MBITS, _floatx_unpacked_to_f32,
 from tests.ops.mxfp4_quant_op import per_token_group_quant_mxfp4
 from tests.utils import format_tc
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
+
 DTYPES = [torch.float, torch.bfloat16, torch.half]
 
 NUM_TOKENS = [1, 2, 4, 8]
@@ -71,7 +79,7 @@ def test_per_block_mxfp4_quant(
 ) -> None:
     seed_everything(seed)
 
-    x = (torch.rand(num_tokens, hidden_size, dtype=dtype, device="xpu") + 1e-6
+    x = (torch.rand(num_tokens, hidden_size, dtype=dtype, device=DEVICE) + 1e-6
          )  # avoid all-zero groups which can produce degenerate scales
 
     # Reference: to_mxfp operates on float32 or bfloat16.
@@ -82,15 +90,17 @@ def test_per_block_mxfp4_quant(
 
     # Kernel output – both return float4_e2m1fn_x2 + float8_e8m0fnu.
     ops_out, ops_scales = per_token_group_quant_mxfp4(
-        x,
+        _to_kernel(x),
         group_size=MXFP4_GROUP_SIZE,
         column_major_scales=column_major_scale,
     )
+    ops_out = ops_out.cpu()
+    ops_scales = ops_scales.cpu()
 
     # 1. Compare UE8M0-rounded scales.
     torch.testing.assert_close(
         ref_scales.float(),
-        ops_scales.cpu().float(),
+        ops_scales.float(),
         atol=1e-5,
         rtol=1e-5,
         msg="MXFP4 UE8M0 scales do not match the reference",
@@ -99,8 +109,8 @@ def test_per_block_mxfp4_quant(
     # 2. Compare dequantised outputs.
     ref_dequant = dequantize_mxfp4(ref_out, ref_scales.float(),
                                    MXFP4_GROUP_SIZE)
-    ops_dequant = dequantize_mxfp4(ops_out.cpu(),
-                                   ops_scales.cpu().float(), MXFP4_GROUP_SIZE)
+    ops_dequant = dequantize_mxfp4(ops_out,
+                                   ops_scales.float(), MXFP4_GROUP_SIZE)
     torch.testing.assert_close(
         ref_dequant,
         ops_dequant,
@@ -123,20 +133,23 @@ def test_mxfp4_known_values() -> None:
 
     for val in fp4_values:
         # Build a [1, 32] tensor: first element = val, rest near 0.
-        x = torch.zeros(1, 32, dtype=torch.float32, device="xpu")
+        x = torch.zeros(1, 32, dtype=torch.float32, device=DEVICE)
         x[0, 0] = val if val > 0 else 0.5  # avoid all-zero → use 0.5 as probe
 
         ref_scales, ref_out = to_mxfp(x.cpu(), block_size=32, format="mxfp4")
 
-        ops_out, ops_scales = per_token_group_quant_mxfp4(x, group_size=32)
+        ops_out, ops_scales = per_token_group_quant_mxfp4(
+            _to_kernel(x), group_size=32)
+        ops_out = ops_out.cpu()
+        ops_scales = ops_scales.cpu()
 
         torch.testing.assert_close(ref_scales.float(),
-                                   ops_scales.cpu().float(),
+                                   ops_scales.float(),
                                    atol=1e-5,
                                    rtol=1e-5)
 
         # Both are float4_e2m1fn_x2; compare via uint8 view.
         torch.testing.assert_close(ref_out.view(torch.uint8),
-                                   ops_out.cpu().view(torch.uint8),
+                                   ops_out.view(torch.uint8),
                                    atol=0.2,
                                    rtol=0.2)

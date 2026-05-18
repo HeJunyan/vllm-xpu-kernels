@@ -6,6 +6,14 @@ from tests.ops.fp8_quant_op import scaled_fp8_quant
 from tests.ops.mx_utils import from_blocked_format, to_mxfp
 from tests.register_ops import fp8_gemm, fp8_gemm_w8a16
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
+
 BATCHES = [1, 2, 8]
 OUT_DTYPES = [torch.float16, torch.bfloat16]
 MNK_FACTORS = [
@@ -65,12 +73,12 @@ def test_fp8_gemm_w8a16(fp8_dtype, out_dtype, trans_wei, is_mbk, batch,
     m, n, k = mnk_factors
 
     input = torch.randn(
-        [batch, m, k], dtype=out_dtype, device=torch.device("xpu")) / 10.0
+        [batch, m, k], dtype=out_dtype, device=DEVICE) / 10.0
     if trans_wei:
-        weight = torch.ones([n, k], dtype=out_dtype).xpu()
+        weight = torch.ones([n, k], dtype=out_dtype).to(DEVICE)
     else:
-        weight = torch.ones([k, n], dtype=out_dtype).xpu()
-    scale_wei = torch.tensor(4.0).xpu()
+        weight = torch.ones([k, n], dtype=out_dtype).to(DEVICE)
+    scale_wei = torch.tensor(4.0).to(DEVICE)
 
     weight_fp8, _ = scaled_fp8_quant(weight,
                                      scale_wei,
@@ -88,11 +96,12 @@ def test_fp8_gemm_w8a16(fp8_dtype, out_dtype, trans_wei, is_mbk, batch,
     if is_mbk:
         input = input.transpose(0, 1)
     output_fp8 = fp8_gemm_w8a16(
-        input,
-        weight_fp8.transpose(0, 1) if trans_wei else weight_fp8,
-        scale_wei,
-        torch.Tensor(),
-    )
+        _to_kernel(input),
+        _to_kernel(
+            weight_fp8.transpose(0, 1) if trans_wei else weight_fp8),
+        _to_kernel(scale_wei),
+        _to_kernel(torch.Tensor()),
+    ).cpu()
     output_fp8 = output_fp8.transpose(0, 1) if is_mbk else output_fp8
 
     torch.testing.assert_close(output_fp8, output_ref, atol=5e-2, rtol=5e-2)
@@ -110,11 +119,11 @@ def test_fp8_gemm_per_tensor(fp8_dtype, out_dtype, is_nt, batch, mnk_factors):
     m, n, k = mnk_factors
 
     input = torch.randn(
-        [batch, m, k], dtype=out_dtype, device=torch.device("xpu")) / 10.0
-    weight = torch.randn([n, k], dtype=out_dtype).xpu() / 10.0
+        [batch, m, k], dtype=out_dtype, device=DEVICE) / 10.0
+    weight = torch.randn([n, k], dtype=out_dtype).to(DEVICE) / 10.0
 
-    scale_src = torch.tensor(4.0).xpu()
-    scale_wei = torch.tensor(4.0).xpu()
+    scale_src = torch.tensor(4.0).to(DEVICE)
+    scale_wei = torch.tensor(4.0).to(DEVICE)
 
     input_fp8, _ = scaled_fp8_quant(input.reshape(-1, k),
                                     scale_src,
@@ -132,13 +141,13 @@ def test_fp8_gemm_per_tensor(fp8_dtype, out_dtype, is_nt, batch, mnk_factors):
         weight_fp8 = weight_fp8.contiguous()
 
     output_fp8 = fp8_gemm(
-        input_fp8,
-        weight_fp8,
+        _to_kernel(input_fp8),
+        _to_kernel(weight_fp8),
         out_dtype,
-        scale_src,
-        scale_wei,
-        torch.Tensor(),
-    )
+        _to_kernel(scale_src),
+        _to_kernel(scale_wei),
+        _to_kernel(torch.Tensor()),
+    ).cpu()
 
     torch.testing.assert_close(output_fp8, output_ref, atol=6e-2, rtol=6e-2)
 
@@ -155,8 +164,8 @@ def test_fp8_gemm_per_channel(fp8_dtype, out_dtype, is_nt, batch, mnk_factors):
     m, n, k = mnk_factors
 
     input = torch.randn(
-        [batch, m, k], dtype=out_dtype, device=torch.device("xpu")) / 10.0
-    weight = torch.randn([n, k], dtype=out_dtype).xpu() / 10.0
+        [batch, m, k], dtype=out_dtype, device=DEVICE) / 10.0
+    weight = torch.randn([n, k], dtype=out_dtype).to(DEVICE) / 10.0
 
     input_fp8, scale_src_fp8 = scaled_fp8_quant(input.reshape(-1, k),
                                                 use_per_token_if_dynamic=True,
@@ -175,13 +184,13 @@ def test_fp8_gemm_per_channel(fp8_dtype, out_dtype, is_nt, batch, mnk_factors):
         weight_fp8 = weight_fp8.contiguous()
 
     output_fp8 = fp8_gemm(
-        input_fp8,
-        weight_fp8,
+        _to_kernel(input_fp8),
+        _to_kernel(weight_fp8),
         out_dtype,
-        scale_src_fp8,
-        scale_wei_fp8,
-        torch.Tensor(),
-    )
+        _to_kernel(scale_src_fp8),
+        _to_kernel(scale_wei_fp8),
+        _to_kernel(torch.Tensor()),
+    ).cpu()
 
     torch.testing.assert_close(output_fp8, output_ref, atol=6e-2, rtol=6e-2)
 
@@ -200,8 +209,8 @@ def test_fp8_gemm_w8a16_per_channel(fp8_dtype, out_dtype, is_nt, is_mbk, batch,
     m, n, k = mnk_factors
 
     input = torch.randn(
-        [batch, m, k], dtype=out_dtype, device=torch.device("xpu")) / 10.0
-    weight = torch.randn([n, k], dtype=out_dtype).xpu() / 10.0
+        [batch, m, k], dtype=out_dtype, device=DEVICE) / 10.0
+    weight = torch.randn([n, k], dtype=out_dtype).to(DEVICE) / 10.0
 
     weight_fp8, scale_wei_fp8 = scaled_fp8_quant(weight,
                                                  use_per_token_if_dynamic=True,
@@ -220,11 +229,11 @@ def test_fp8_gemm_w8a16_per_channel(fp8_dtype, out_dtype, is_nt, is_mbk, batch,
     if is_mbk:
         input = input.transpose(0, 1)
     output_fp8 = fp8_gemm_w8a16(
-        input,
-        weight_fp8_t,
-        scale_wei_flat,
-        torch.Tensor(),
-    )
+        _to_kernel(input),
+        _to_kernel(weight_fp8_t),
+        _to_kernel(scale_wei_flat),
+        _to_kernel(torch.Tensor()),
+    ).cpu()
     output_fp8 = output_fp8.transpose(0, 1) if is_mbk else output_fp8
 
     torch.testing.assert_close(output_fp8, output_ref, atol=5e-2, rtol=5e-2)
@@ -245,8 +254,8 @@ def _convert_to_mxfp8_with_hp_ref(t):
 @pytest.mark.parametrize("out_dtype", OUT_DTYPES)
 def test_mxfp8_gemm(mnk_factors, out_dtype):
     m, n, k = mnk_factors
-    inputs = torch.randn((m, k), dtype=out_dtype).xpu() * 0.01
-    weights = torch.randn((n, k), dtype=out_dtype).xpu() * 0.01
+    inputs = torch.randn((m, k), dtype=out_dtype).to(DEVICE) * 0.01
+    weights = torch.randn((n, k), dtype=out_dtype).to(DEVICE) * 0.01
 
     # Reference: to_mxfp operates on float32 or bfloat16.
     if out_dtype == torch.half:
@@ -258,13 +267,13 @@ def test_mxfp8_gemm(mnk_factors, out_dtype):
         weights)
 
     output = fp8_gemm(
-        inputs_lp,
-        weights_lp.transpose(0, 1),
+        _to_kernel(inputs_lp),
+        _to_kernel(weights_lp.transpose(0, 1)),
         out_dtype,
-        inputs_scale,
-        weights_scale,
-        torch.Tensor(),
-    )
+        _to_kernel(inputs_scale),
+        _to_kernel(weights_scale),
+        _to_kernel(torch.Tensor()),
+    ).cpu()
 
     output_ref = torch.matmul(inputs_hp.to(out_dtype),
                               weights_hp.to(out_dtype).t())

@@ -8,6 +8,13 @@ import torch.nn.functional as F
 import tests.register_ops as ops
 from tests.utils import seed_everything
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
 DTYPES = [torch.half, torch.bfloat16]
 FP8_DTYPES = [torch.float8_e4m3fn, torch.float8_e5m2]
 NUM_TOKENS = [1, 7, 83, 512]
@@ -56,18 +63,20 @@ def test_silu_and_mul_quant(
     device: str,
 ) -> None:
     seed_everything(seed)
-    torch.set_default_device(device)
+    torch.xpu.set_device(device)
 
     x = torch.randn(num_tokens, hidden_size * 2, dtype=dtype)
-    scale = torch.tensor([0.5], dtype=torch.float32, device=device)
+    scale = torch.tensor([0.5], dtype=torch.float32)
 
     # Reference
-    ref_out = ref_silu_and_mul_quant(x, scale, fp8_dtype)
+    x_cpu = x
+    scale_cpu = scale
+    ref_out = ref_silu_and_mul_quant(x_cpu, scale_cpu, fp8_dtype)
 
     # Fused kernel
     d = x.shape[-1] // 2
-    out = torch.empty(num_tokens, d, dtype=fp8_dtype, device=device)
-    ops.silu_and_mul_quant(out, x, scale)
+    out = torch.empty(num_tokens, d, dtype=fp8_dtype, device=KERNEL_DEVICE)
+    ops.silu_and_mul_quant(out, _to_kernel(x), _to_kernel(scale))
 
     assert out.dtype == fp8_dtype
     assert out.shape == ref_out.shape
@@ -93,22 +102,22 @@ def test_silu_and_mul_quant_vs_separate(
     device: str,
 ) -> None:
     seed_everything(seed)
-    torch.set_default_device(device)
+    torch.xpu.set_device(device)
 
     x = torch.randn(num_tokens, hidden_size * 2, dtype=dtype)
-    scale = torch.tensor([0.5], dtype=torch.float32, device=device)
+    scale = torch.tensor([0.5], dtype=torch.float32)
 
     # Separate ops
     d = x.shape[-1] // 2
-    silu_mul_out = torch.empty(num_tokens, d, dtype=dtype, device=device)
-    ops.silu_and_mul(silu_mul_out, x)
+    silu_mul_out = torch.empty(num_tokens, d, dtype=dtype, device=KERNEL_DEVICE)
+    ops.silu_and_mul(silu_mul_out, _to_kernel(x))
 
-    separate_out = torch.empty(num_tokens, d, dtype=fp8_dtype, device=device)
-    ops.static_scaled_fp8_quant(separate_out, silu_mul_out, scale)
+    separate_out = torch.empty(num_tokens, d, dtype=fp8_dtype, device=KERNEL_DEVICE)
+    ops.static_scaled_fp8_quant(separate_out, silu_mul_out, _to_kernel(scale))
 
     # Fused kernel
-    fused_out = torch.empty(num_tokens, d, dtype=fp8_dtype, device=device)
-    ops.silu_and_mul_quant(fused_out, x, scale)
+    fused_out = torch.empty(num_tokens, d, dtype=fp8_dtype, device=KERNEL_DEVICE)
+    ops.silu_and_mul_quant(fused_out, _to_kernel(x), _to_kernel(scale))
 
     assert fused_out.dtype == fp8_dtype
     assert fused_out.shape == separate_out.shape

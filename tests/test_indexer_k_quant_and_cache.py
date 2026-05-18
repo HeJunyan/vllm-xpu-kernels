@@ -7,7 +7,8 @@ from tests import register_ops as ops
 
 eps = 1e-4
 
-DEVICE = "xpu"
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
 NUM_TOKENS = [1, 8, 17, 64]
 HEAD_DIMS = [128, 256, 512]
 QUANT_BLOCK_SIZES = [128]
@@ -28,6 +29,10 @@ MINI_PYTEST_PARAMS = {
         "dtype": [torch.float32],
     },
 }
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
 
 
 def _pytorch_group_quant(
@@ -162,8 +167,10 @@ def test_indexer_k_quant_and_cache(num_tokens, head_dim, quant_block_size,
 
     ref_indexer_k_quant_and_cache(k, kv_cache_ref, slot_mapping,
                                   quant_block_size, scale_fmt)
-    ops.indexer_k_quant_and_cache(k, kv_cache_xpu, slot_mapping,
+    kv_cache_xpu_kernel = _to_kernel(kv_cache_xpu)
+    ops.indexer_k_quant_and_cache(_to_kernel(k), kv_cache_xpu_kernel, _to_kernel(slot_mapping),
                                   quant_block_size, scale_fmt)
+    kv_cache_xpu.copy_(kv_cache_xpu_kernel.cpu())
 
     for block_idx in range(num_blocks):
         block_ref = kv_cache_ref[block_idx].view(-1)

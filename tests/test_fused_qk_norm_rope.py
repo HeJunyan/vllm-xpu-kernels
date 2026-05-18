@@ -7,6 +7,14 @@ import torch
 import vllm_xpu_kernels._C  # noqa: F401 - registers torch.ops._C ops
 from tests.utils import opcheck
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
+
 DTYPES = [torch.half, torch.bfloat16]
 IS_NEOX = [True, False]
 EPS_VALUES = [1e-5, 1e-6]
@@ -134,7 +142,6 @@ def test_fused_qk_norm_rope(
     seed: int,
 ) -> None:
     torch.manual_seed(seed)
-    torch.set_default_device("xpu")
     torch.xpu.set_device(device)
 
     num_heads_q, num_heads_kv = head_config
@@ -142,24 +149,24 @@ def test_fused_qk_norm_rope(
     max_position = 4096
 
     total_dim = (num_heads_q + 2 * num_heads_kv) * head_dim
-    qkv_base = torch.randn(num_tokens, total_dim, dtype=dtype, device=device)
+    qkv_base = torch.randn(num_tokens, total_dim, dtype=dtype, device=DEVICE)
     qkv_fused = qkv_base.clone()
     positions = torch.randint(0,
                               max_position, (num_tokens, ),
                               dtype=torch.long,
-                              device=device)
+                              device=DEVICE)
 
-    q_weight = torch.empty(head_dim, dtype=dtype, device=device)
+    q_weight = torch.empty(head_dim, dtype=dtype, device=DEVICE)
     q_weight.normal_(mean=1.0, std=0.1)
-    k_weight = torch.empty(head_dim, dtype=dtype, device=device)
+    k_weight = torch.empty(head_dim, dtype=dtype, device=DEVICE)
     k_weight.normal_(mean=1.0, std=0.1)
 
     # Build cos_sin_cache: [max_position, rotary_dim]
     # Layout: [cos_0..cos_{rotary_dim/2-1}, sin_0..sin_{rotary_dim/2-1}]
     inv_freq = 1.0 / (10000.0**(
-        torch.arange(0, rotary_dim // 2, dtype=torch.float32, device=device) /
+        torch.arange(0, rotary_dim // 2, dtype=torch.float32, device=DEVICE) /
         (rotary_dim // 2)))
-    t = torch.arange(max_position, dtype=torch.float32, device=device)
+    t = torch.arange(max_position, dtype=torch.float32, device=DEVICE)
     freqs = torch.outer(t, inv_freq)
     cos_sin_cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
 
@@ -178,19 +185,21 @@ def test_fused_qk_norm_rope(
     )
 
     # Run fused kernel (in-place on qkv_fused)
+    qkv_fused_k = qkv_fused.to(KERNEL_DEVICE)
     torch.ops._C.fused_qk_norm_rope(
-        qkv_fused,
+        qkv_fused_k,
         num_heads_q,
         num_heads_kv,
         num_heads_kv,
         head_dim,
         eps,
-        q_weight,
-        k_weight,
-        cos_sin_cache,
+        _to_kernel(q_weight),
+        _to_kernel(k_weight),
+        _to_kernel(cos_sin_cache),
         is_neox,
-        positions,
+        _to_kernel(positions),
     )
+    qkv_fused = qkv_fused_k.cpu()
 
     if dtype == torch.float16:
         ATOL, RTOL = (2e-3, 2e-3)
@@ -216,7 +225,6 @@ def test_fused_qk_norm_rope_opcheck(
 ) -> None:
     """Validate the op schema and registration with opcheck."""
     torch.manual_seed(42)
-    torch.set_default_device("xpu")
     torch.xpu.set_device(device)
 
     num_heads_q, num_heads_kv = 16, 4
@@ -227,32 +235,32 @@ def test_fused_qk_norm_rope_opcheck(
     rotary_dim = head_dim
 
     total_dim = (num_heads_q + 2 * num_heads_kv) * head_dim
-    qkv = torch.randn(num_tokens, total_dim, dtype=dtype, device=device)
-    positions = torch.arange(num_tokens, dtype=torch.long, device=device)
+    qkv = torch.randn(num_tokens, total_dim, dtype=dtype, device=DEVICE)
+    positions = torch.arange(num_tokens, dtype=torch.long, device=DEVICE)
 
-    q_weight = torch.ones(head_dim, dtype=dtype, device=device)
-    k_weight = torch.ones(head_dim, dtype=dtype, device=device)
+    q_weight = torch.ones(head_dim, dtype=dtype, device=DEVICE)
+    k_weight = torch.ones(head_dim, dtype=dtype, device=DEVICE)
 
     inv_freq = 1.0 / (10000.0**(
-        torch.arange(0, rotary_dim // 2, dtype=torch.float32, device=device) /
+        torch.arange(0, rotary_dim // 2, dtype=torch.float32, device=DEVICE) /
         (rotary_dim // 2)))
-    t = torch.arange(max_position, dtype=torch.float32, device=device)
+    t = torch.arange(max_position, dtype=torch.float32, device=DEVICE)
     freqs = torch.outer(t, inv_freq)
     cos_sin_cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
 
     opcheck(
         torch.ops._C.fused_qk_norm_rope,
         (
-            qkv,
+            _to_kernel(qkv),
             num_heads_q,
             num_heads_kv,
             num_heads_kv,
             head_dim,
             eps,
-            q_weight,
-            k_weight,
-            cos_sin_cache,
+            _to_kernel(q_weight),
+            _to_kernel(k_weight),
+            _to_kernel(cos_sin_cache),
             is_neox,
-            positions,
+            _to_kernel(positions),
         ),
     )

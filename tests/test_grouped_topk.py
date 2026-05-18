@@ -6,6 +6,14 @@ from tests.ops.grouped_topk_op import (fused_grouped_topk,
                                        fused_grouped_topk_sycl, grouped_topk)
 from tests.utils import seed_everything
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
+
 #override pytest parameters when enable mini pytest
 MINI_PYTEST_PARAMS = {
     "default": {
@@ -34,11 +42,11 @@ def test_grouped_topk(n_token: int, n_hidden: int, n_expert: int, topk: int,
                       topk_group: int, scoring_func: str,
                       routed_scaling_factor: float, dtype: torch.dtype):
     seed_everything(0)
-    hidden_states = torch.randn((n_token, n_hidden), dtype=dtype, device="xpu")
-    gating_output = torch.randn((n_token, n_expert), dtype=dtype, device="xpu")
+    hidden_states = torch.randn((n_token, n_hidden), dtype=dtype, device=DEVICE)
+    gating_output = torch.randn((n_token, n_expert), dtype=dtype, device=DEVICE)
     e_score_correction_bias = torch.randn((n_expert, ),
                                           dtype=dtype,
-                                          device="xpu")
+                                          device=DEVICE)
 
     baseline_topk_weights, baseline_topk_ids = grouped_topk(
         hidden_states=hidden_states,
@@ -52,26 +60,30 @@ def test_grouped_topk(n_token: int, n_hidden: int, n_expert: int, topk: int,
         e_score_correction_bias=e_score_correction_bias)
 
     test_topk_weights, test_topk_ids = fused_grouped_topk(
-        hidden_states=hidden_states,
-        gating_output=gating_output,
+        hidden_states=_to_kernel(hidden_states),
+        gating_output=_to_kernel(gating_output),
         topk=topk,
         renormalize=renormalize,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
         scoring_func=scoring_func,
         routed_scaling_factor=routed_scaling_factor,
-        e_score_correction_bias=e_score_correction_bias)
+        e_score_correction_bias=_to_kernel(e_score_correction_bias))
+    test_topk_weights = test_topk_weights.cpu()
+    test_topk_ids = test_topk_ids.cpu()
 
     test_topk_weights_sycl, test_topk_ids_sycl = fused_grouped_topk_sycl(
-        hidden_states=hidden_states,
-        gating_output=gating_output,
+        hidden_states=_to_kernel(hidden_states),
+        gating_output=_to_kernel(gating_output),
         topk=topk,
         renormalize=renormalize,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
         scoring_func=scoring_func,
         routed_scaling_factor=routed_scaling_factor,
-        e_score_correction_bias=e_score_correction_bias)
+        e_score_correction_bias=_to_kernel(e_score_correction_bias))
+    test_topk_weights_sycl = test_topk_weights_sycl.cpu()
+    test_topk_ids_sycl = test_topk_ids_sycl.cpu()
 
     if renormalize:
         torch.testing.assert_close(baseline_topk_weights,

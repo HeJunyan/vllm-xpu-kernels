@@ -6,6 +6,14 @@ from tests.ops.mx_utils import (FP4_EBITS, FP4_MBITS, _floatx_unpacked_to_f32,
                                 from_blocked_format, to_mxfp, unpack_uint4)
 from tests.register_ops import fp4_gemm
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
+
 OUT_DTYPES = [torch.float16, torch.bfloat16]
 MNK_FACTORS = [
     (1, 32, 1024),
@@ -51,8 +59,8 @@ def _convert_to_mxfp4_with_hp_ref(t):
 def test_mxfp4_gemm(mnk_factors, out_dtype):
     m, n, k = mnk_factors
 
-    inputs = torch.randn((m, k), dtype=out_dtype).xpu() * 0.01
-    weights = torch.randn((n, k), dtype=out_dtype).xpu() * 0.01
+    inputs = torch.randn((m, k), dtype=out_dtype, device=DEVICE) * 0.01
+    weights = torch.randn((n, k), dtype=out_dtype, device=DEVICE) * 0.01
 
     # Reference: to_mxfp operates on float32 or bfloat16.
     if out_dtype is torch.half:
@@ -63,13 +71,13 @@ def test_mxfp4_gemm(mnk_factors, out_dtype):
         weights)
 
     output = fp4_gemm(
-        inputs_lp,
-        weights_lp.transpose(0, 1),
-        inputs_scale,
-        weights_scale,
+        _to_kernel(inputs_lp),
+        _to_kernel(weights_lp.transpose(0, 1)),
+        _to_kernel(inputs_scale),
+        _to_kernel(weights_scale),
         out_dtype,
-        torch.Tensor(),
-    )
+        _to_kernel(torch.Tensor()),
+    ).cpu()
 
     output_ref = torch.matmul(inputs_hp.to(out_dtype),
                               weights_hp.to(out_dtype).t())

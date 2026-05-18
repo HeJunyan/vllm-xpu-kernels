@@ -5,7 +5,12 @@ import torch
 import vllm_xpu_kernels._moe_C  # noqa: F401
 from tests.utils import format_tc, seed_everything
 
-DEVICE = "xpu"
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
 INPUT_LENGTHS = [1, 8, 1024, 8192]
 HIDDEN_SIZE = [128, 1024, 8192]
 NUM_EXPERTS = [16, 32, 128]
@@ -91,10 +96,13 @@ def test_moe_gather(input_len, hidden_size, num_experts, topk, ep_rank,
                                    expert_cumsum[-1]] = -1
 
     output = torch.empty((input_len, hidden_size), device=DEVICE, dtype=dtype)
-    torch.ops._moe_C.moe_gather(output, moe_output, expert_scores,
-                                unpermuted_row_to_permuted_row,
-                                expert_first_token_offset,
+    output_kernel = output.to(KERNEL_DEVICE)
+    torch.ops._moe_C.moe_gather(output_kernel, _to_kernel(moe_output),
+                                _to_kernel(expert_scores),
+                                _to_kernel(unpermuted_row_to_permuted_row),
+                                _to_kernel(expert_first_token_offset),
                                 num_experts_per_node)
+    output = output_kernel.cpu()
 
     ref_output = torch.empty((input_len, hidden_size),
                              device=DEVICE,

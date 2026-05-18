@@ -10,6 +10,14 @@ import torch
 from tests.register_ops import moe_sum
 from tests.utils import format_tc, opcheck
 
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
+
+
 TOP_KS = [2, 6]
 
 #override pytest parameters when enable mini pytest
@@ -28,12 +36,15 @@ MINI_PYTEST_PARAMS = {
                          [torch.float32, torch.float16, torch.bfloat16],
                          ids=format_tc)
 def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype):
-    input = torch.randn((m, topk, k), device="xpu", dtype=dtype)
-    actual = torch.empty((m, k), device="xpu", dtype=dtype)
+    input = torch.randn((m, topk, k), device=DEVICE, dtype=dtype)
+    actual = torch.empty((m, k), device=DEVICE, dtype=dtype)
 
     expected = input.sum(dim=1)
-    moe_sum(input, actual)
+    actual_k = actual.to(KERNEL_DEVICE)
+    moe_sum(_to_kernel(input), actual_k)
+    actual = actual_k.cpu()
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0)
 
-    opcheck(torch.ops._moe_C.moe_sum, (input, actual))
+    opcheck(torch.ops._moe_C.moe_sum,
+            (_to_kernel(input), torch.empty_like(actual).to(KERNEL_DEVICE)))

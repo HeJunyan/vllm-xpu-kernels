@@ -4,7 +4,8 @@ import torch
 
 from tests.register_ops import deepseek_scaling_rope
 
-DEVICE = torch.device("xpu")
+DEVICE = torch.device("cpu")
+KERNEL_DEVICE = torch.device("xpu")
 
 #override pytest parameters when enable mini pytest
 MINI_PYTEST_PARAMS = {
@@ -17,6 +18,10 @@ MINI_PYTEST_PARAMS = {
         "is_neox": [True],
     },
 }
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
 
 
 def _rotate_neox(x):
@@ -120,8 +125,10 @@ class TestTorchMethod:
         ref_query, ref_key = self.ref_deepseek_scaling_rope(
             positions, query, key, cos_sin_cache, rotary_dim, head_size,
             is_neox)
-        query_out, key_out = deepseek_scaling_rope(positions, query, key, None,
-                                                   cos_sin_cache, rotary_dim,
+        query_out, key_out = deepseek_scaling_rope(_to_kernel(positions), _to_kernel(query), _to_kernel(key), None,
+                                                   _to_kernel(cos_sin_cache), rotary_dim,
                                                    is_neox)
+        query_out = query_out.cpu() if query_out is not None else None
+        key_out = key_out.cpu() if key_out is not None else None
         torch.testing.assert_close(ref_query, query_out, atol=5e-3, rtol=1e-3)
         torch.testing.assert_close(ref_key, key_out, atol=5e-3, rtol=1e-3)

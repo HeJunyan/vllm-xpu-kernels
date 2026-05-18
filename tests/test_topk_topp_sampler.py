@@ -5,7 +5,8 @@ import torch
 from tests.ops.topk_topp_sampler_op import TopKTopPSampler
 from tests.utils import seed_everything
 
-DEVICE = "xpu"
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
 
 BATCH_SIZE = [1, 32, 1024]
 VOCAB_SIZE = [1024, 2048, 4096]
@@ -23,6 +24,10 @@ MINI_PYTEST_PARAMS = {
         "logprobs_mode": ["raw_logits"],
     },
 }
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZE)
@@ -62,11 +67,13 @@ def test_topk_topp(batch_size, vocab_size, k, p, logprobs_mode):
     topk_topp_sampler = TopKTopPSampler(logprobs_mode=logprobs_mode)
 
     random_sampled, logits_to_return = topk_topp_sampler.forward_xpu(
-        logits=logits,
+        logits=_to_kernel(logits),
         generators=generators,
-        k=top_k,
-        p=top_p,
+        k=_to_kernel(top_k),
+        p=_to_kernel(top_p),
     )
+    random_sampled = random_sampled.cpu() if random_sampled is not None else None
+    logits_to_return = logits_to_return.cpu() if logits_to_return is not None else None
 
     ref_random_sampled, ref_logits_to_return =\
         topk_topp_sampler.forward_native(
@@ -146,10 +153,10 @@ def test_topk_topp_infinite(
         logits.fill_(float(infinite_value))
 
     random_sampled, logits_to_return = topk_topp_sampler.forward_xpu(
-        logits=logits,
+        logits=_to_kernel(logits),
         generators=generators,
-        k=top_k,
-        p=top_p,
+        k=_to_kernel(top_k),
+        p=_to_kernel(top_p),
     )
 
     torch.xpu.synchronize()

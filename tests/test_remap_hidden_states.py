@@ -5,7 +5,8 @@ import torch
 import vllm_xpu_kernels._moe_C  # noqa: F401
 from tests.utils import seed_everything
 
-DEVICE = "xpu"
+DEVICE = "cpu"
+KERNEL_DEVICE = "xpu"
 NUM_ROWS = [32, 1024]
 HIDDEN_SIZE = [128]
 TOTAL_EXPERTS_NUM = [32, 128]
@@ -18,10 +19,6 @@ RECIPE_TO_DTYPE = {
     "mxfp4": (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu),
 }
 
-LOCAL_EXPERTS_NUM = [3, 8, 11]
-EP_RANK = [0, 1, 2, 3]
-EP_SIZE = [4]
-
 #override pytest parameters when enable mini pytest
 MINI_PYTEST_PARAMS = {
     "default": {
@@ -31,6 +28,10 @@ MINI_PYTEST_PARAMS = {
         "topk": [1],
     },
 }
+
+
+def _to_kernel(x):
+    return None if x is None else x.to(KERNEL_DEVICE)
 
 
 def ref_remap_hidden_states(hidden_states, scales, remapped_hidden_states,
@@ -179,10 +180,21 @@ def test_remap_hidden_states(num_rows, hidden_size, total_experts_num, topk,
                             ref_unpermuted_row_to_permuted_row, topk_ids,
                             total_experts_num, local_experts_num)
 
+    remapped_hidden_states_k = remapped_hidden_states.to(KERNEL_DEVICE)
+    remapped_scales_k = _to_kernel(remapped_scales)
+    expert_first_token_offset_k = expert_first_token_offset.to(KERNEL_DEVICE)
+    unpermuted_row_to_permuted_row_k = unpermuted_row_to_permuted_row.to(
+        KERNEL_DEVICE)
     torch.ops._moe_C.remap_hidden_states(
-        hidden_states, scales, remapped_hidden_states, remapped_scales,
-        expert_map, expert_first_token_offset, unpermuted_row_to_permuted_row,
-        topk_ids, total_experts_num, local_experts_num)
+        _to_kernel(hidden_states), _to_kernel(scales),
+        remapped_hidden_states_k, remapped_scales_k, _to_kernel(expert_map),
+        expert_first_token_offset_k, unpermuted_row_to_permuted_row_k,
+        _to_kernel(topk_ids), total_experts_num, local_experts_num)
+    remapped_hidden_states = remapped_hidden_states_k.cpu()
+    remapped_scales = remapped_scales_k.cpu(
+    ) if remapped_scales_k is not None else None
+    expert_first_token_offset = expert_first_token_offset_k.cpu()
+    unpermuted_row_to_permuted_row = unpermuted_row_to_permuted_row_k.cpu()
 
     if data_dtype is torch.float4_e2m1fn_x2:
         remapped_hidden_states = remapped_hidden_states.view(torch.uint8)
@@ -310,9 +322,11 @@ def test_remap_hidden_states_overflow(num_rows, hidden_size, total_experts_num,
     topk_ids = topk_ids.to(torch.int64)
 
     torch.ops._moe_C.remap_hidden_states(
-        hidden_states, scales, remapped_hidden_states, remapped_scales,
-        expert_map, expert_first_token_offset, unpermuted_row_to_permuted_row,
-        topk_ids, total_experts_num, local_experts_num)
+        _to_kernel(hidden_states), _to_kernel(scales),
+        _to_kernel(remapped_hidden_states), _to_kernel(remapped_scales),
+        _to_kernel(expert_map), _to_kernel(expert_first_token_offset),
+        _to_kernel(unpermuted_row_to_permuted_row), _to_kernel(topk_ids),
+        total_experts_num, local_experts_num)
 
     print("remapped_hidden_states", remapped_hidden_states, flush=True)
     print("remapped_scales", remapped_scales, flush=True)
@@ -344,7 +358,9 @@ def test_init_expert_map(local_experts_num, ep_rank, ep_size):
     ref_expert_map = expert_map.clone()
 
     ref_init_expert_map(ref_expert_map, local_experts_num, ep_rank, ep_size)
-    torch.ops._moe_C.init_expert_map(expert_map, local_experts_num, ep_rank,
+    expert_map_kernel = _to_kernel(expert_map)
+    torch.ops._moe_C.init_expert_map(expert_map_kernel, local_experts_num, ep_rank,
                                      ep_size)
+    expert_map.copy_(expert_map_kernel.cpu())
 
     torch.testing.assert_close(expert_map, ref_expert_map, rtol=0, atol=0)
