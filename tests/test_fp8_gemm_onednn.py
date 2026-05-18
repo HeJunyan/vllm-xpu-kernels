@@ -299,7 +299,7 @@ def test_mxfp8_gemm(mnk_factors, out_dtype):
         _to_kernel(weights_lp.transpose(0, 1)),
         out_dtype,
         _to_kernel(inputs_scale),
-        _to_kernel(weights_scale),
+        _to_kernel(weights_scale.t().contiguous()),
         _to_kernel(torch.Tensor()),
     ).cpu()
 
@@ -348,7 +348,7 @@ def test_fp8_gemm_per_block(fp8_dtype, dtype, is_nt, batch, group_size,
         weight_fp8,
         dtype,
         scale_src_fp8,
-        scale_wei_fp8,
+        scale_wei_fp8.t().contiguous(),
         torch.Tensor(),
     )
 
@@ -365,7 +365,7 @@ def test_fp8_gemm_w8a16_block(fp8_dtype, dtype, is_nt, batch, group_size,
                               mnk_factors):
     """Test fp8 w8a16 block quantization GEMM.
 
-    The weight is fp8 with per-block scale of shape [n/gs, k/gs].
+    The weight is fp8 with per-block scale of shape [k/gs, n/gs].
     The activation is fp16/bf16 (not quantized).
     """
     seed = 1234
@@ -398,7 +398,7 @@ def test_fp8_gemm_w8a16_block(fp8_dtype, dtype, is_nt, batch, group_size,
     output_fp8 = fp8_gemm_w8a16(
         input,
         weight_fp8,
-        scale_wei_fp8,
+        scale_wei_fp8.t().contiguous(),
         torch.Tensor(),
     )
 
