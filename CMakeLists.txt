@@ -213,7 +213,8 @@ message(STATUS "FetchContent base directory: ${FETCHCONTENT_BASE_DIR}")
 # when loaded by Python.
 set(CMAKE_INSTALL_RPATH "$ORIGIN")
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wno-unused-command-line-argument" )
+set(CMAKE_CXX_FLAGS
+    "${CMAKE_CXX_FLAGS} -Werror -Wno-unused-command-line-argument")
 
 if(VLLM_GPU_LANG STREQUAL "SYCL")
   #
@@ -254,7 +255,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   elseif(BUILD_ON_NVL)
     set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=intel_gpu_nvl_p)
   elseif(BUILD_ON_SIMULATOR_JGS)
-    set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=intel_gpu_jgs)
+    set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -no-ftz -fsycl-targets=pisa)
   elseif(AOT_DEVICES)
     set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=spir64_gen)
   endif()
@@ -271,11 +272,21 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   set(SYCL_DEVICE_LINK_FLAGS
       ${SYCL_DEVICE_LINK_FLAGS} -fsycl-max-parallel-link-jobs=16
       -Wno-sycl-target -flink-huge-device-code)
-  set(SYCL_DEVICE_LINK_FLAGS
-      ${SYCL_DEVICE_LINK_FLAGS}
-      "-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"
-  )
-  if (BUILD_ON_NVL)
+  if(BUILD_ON_SIMULATOR_JGS)
+    set(SYCL_DEVICE_LINK_FLAGS
+        ${SYCL_DEVICE_LINK_FLAGS}
+        -fsycl
+        -fsycl-targets=pisa
+        "-Xsze-intel-xe-features=+set-abarrier-arrive-lmc,+disable-misched,+null-dst"
+        "-Xsxe-enable-phi-uniform"
+        "-Xsxe-enable-texp-overlap")
+  else()
+    set(SYCL_DEVICE_LINK_FLAGS
+        ${SYCL_DEVICE_LINK_FLAGS}
+        "-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"
+    )
+  endif()
+  if(BUILD_ON_NVL)
     set(XE3_AOT_DEVICES "nvl-p,nvl-p-a0")
   else()
     set(XE3_AOT_DEVICES "cri-a0")
@@ -288,8 +299,16 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
     set(AOT_DEVICES ${XE4_AOT_DEVICES})
   endif()
   if(AOT_DEVICES)
-    list(APPEND SYCL_DEVICE_LINK_FLAGS -fsycl-targets=spir64_gen
-         -Xsycl-target-backend=spir64_gen)
+    if(BUILD_ON_SIMULATOR_JGS)
+      set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} -fsycl-targets=pisa)
+      set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} --offload-new-driver)
+      set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} --offload-arch=jgs)
+      set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} --pisa-fin-path=$ENV{CMPLR_ROOT}/bin/compiler)
+
+    else()
+      list(APPEND SYCL_DEVICE_LINK_FLAGS -fsycl-targets=spir64_gen
+           -Xsycl-target-backend=spir64_gen)
+    endif()
   endif()
 
   # Final link option be like: icpx -fsycl -fsycl-target=spir64_gen
@@ -299,6 +318,9 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   list(APPEND FINAL_LINK_OPTIONS ${SYCL_DEVICE_LINK_FLAGS})
   if(AOT_DEVICES)
     list(APPEND FINAL_LINK_OPTIONS "-device ${AOT_DEVICES}")
+    if(BUILD_ON_SIMULATOR_JGS)
+      list(APPEND FINAL_LINK_OPTIONS "-options -ze-intel-xe-features=+set-abarrier-arrive-lmc,+disable-misched,+null-dst")
+    endif()
   endif()
 
   set(VLLM_GPU_LINK_FLAGS ${FINAL_LINK_OPTIONS})
@@ -318,15 +340,17 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
   # when building.
   if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
-    # Bumped to v0.1.0_next tip that includes PR #444 (arbitrary M/N support
-    # in block-scaled GEMM via the tuple-based scalar scale-load variant).
+    # Bumped to v0.1.0_next tip that includes PR #444 (arbitrary M/N support in
+    # block-scaled GEMM via the tuple-based scalar scale-load variant).
     set(CUTLASS_REVISION
         "9b2efe37371e735ce4e38039c75f8b889d09c679"
         CACHE STRING "CUTLASS revision to use")
   elseif(BUILD_ON_SIMULATOR_JGS)
     # update on WW11 by Yizhou, this commit id is latest from master_next branch
     # TODO: switch to a release tag/version in future
-    set(CUTLASS_REVISION "ed1502f86b8baa7a84275c85597d06ecf5254d84" CACHE STRING "CUTLASS revision to use")
+    set(CUTLASS_REVISION
+        "ed1502f86b8baa7a84275c85597d06ecf5254d84"
+        CACHE STRING "CUTLASS revision to use")
   else()
     set(CUTLASS_REVISION
         "cd763790ad2f74d7294435ecf77682bac0062c3a"
@@ -701,7 +725,8 @@ endif()
 if(MOE_KERNELS_ENABLED)
   message(STATUS "Enabling _moe_C extension.")
   file(GLOB VLLM_MOE_EXT_SRC "csrc/moe/*.cpp")
-
+  list(REMOVE_ITEM VLLM_MOE_EXT_SRC
+       ${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/fused_grouped_topk.cpp)
   define_gpu_extension_target(
     _moe_C
     DESTINATION
