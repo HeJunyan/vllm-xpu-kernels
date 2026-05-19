@@ -92,7 +92,9 @@ void cutlass_chunk_prefill_interface(
         is_paged,
         is_causal,
         is_local,
-        is_sink);
+        is_sink,
+        softmax_lse,
+        is_prefill);
   }
 #endif
 #ifdef VLLM_XPU_ENABLE_XE4
@@ -217,7 +219,8 @@ void cutlass_paged_decode_interface(
         is_causal,
         is_local,
         is_sink,
-        num_kv_splits);
+        num_kv_splits,
+        is_prefill);
   }
 #endif
   else {
