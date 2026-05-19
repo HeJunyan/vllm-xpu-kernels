@@ -857,9 +857,6 @@ def test_varlen_with_softmax_lse(
 ) -> None:
     torch.set_default_device("xpu")
     torch.xpu.set_device("xpu:0")
-    if (is_casual and seq_lens[1][0]
-            == 5) and (os.getenv("SKIP_HANG_KERNEL") == "1"):
-        pytest.skip("skip casual for seqlen0 to avoid runtime hang on CI.")
     torch.manual_seed(4242)
 
     query_lens = [x[0] for x in seq_lens]
