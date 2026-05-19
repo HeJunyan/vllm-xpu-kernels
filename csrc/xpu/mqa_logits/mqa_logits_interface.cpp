@@ -5,7 +5,9 @@
 #include "utils.h"
 #include "mqa_logits_interface.h"
 
+#ifdef VLLM_XPU_ENABLE_XE2
 #include "xe_2/mqa_logits_xe2.h"
+#endif
 
 namespace {
 
@@ -134,6 +136,7 @@ torch::Tensor fp8_mqa_logits(
   const int64_t seq_len_kv = kv.size(0);
 
   if (vllm::xpu::is_xe2_arch()) {
+#ifdef VLLM_XPU_ENABLE_XE2
     return fp8_mqa_logits_xe2(
         q,
         kv,
@@ -145,6 +148,7 @@ torch::Tensor fp8_mqa_logits(
         num_heads,
         head_dim,
         seq_len_kv);
+#endif
   }
 
   TORCH_CHECK(false, "Only XE2 mqa logits kernel is supported currently.");
@@ -181,6 +185,7 @@ torch::Tensor fp8_paged_mqa_logits(
   auto kv_scales_f32 = kv_scale_u8.view(torch::kFloat);
 
   if (vllm::xpu::is_xe2_arch()) {
+#ifdef VLLM_XPU_ENABLE_XE2
     return fp8_paged_mqa_logits_xe2(
         q_fp8,
         kv_fp8,
@@ -196,6 +201,7 @@ torch::Tensor fp8_paged_mqa_logits(
         block_size,
         max_blocks,
         max_model_len);
+#endif
   }
 
   TORCH_CHECK(
