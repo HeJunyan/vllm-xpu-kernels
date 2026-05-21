@@ -80,7 +80,7 @@ inline T get_subgroup_prefix(
   group_aggregate = subgroup_aggregates[0];
 
   T subgroup_prefix;
-#pragma unroll
+#pragma unroll 1
   for (int subgroup_offset = 1; subgroup_offset < subgroup_range;
        ++subgroup_offset) {
     if (subgroup_id == subgroup_offset) {
@@ -117,7 +117,7 @@ inclusive_scan_over_subgroup(sycl::sub_group sg, T input, T& inclusive_output) {
   int STEPS = sycl::log2(static_cast<float>(sub_group_range));
 
   inclusive_output = input;
-#pragma unroll
+#pragma unroll 1
   for (int STEP = 0; STEP < STEPS; ++STEP) {
     inclusive_output =
         inclusive_scan_over_subgroup_step(sg, inclusive_output, (1 << STEP));

@@ -45,6 +45,9 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
     bool renormalize,
     double routed_scaling_factor);
 
+// https://jira.devtools.intel.com/browse/CMPLRLLVM-75455
+
+#ifndef VLLM_XPU_ENABLE_XE4
 std::tuple<torch::Tensor, torch::Tensor> fused_grouped_topk(
     const torch::Tensor& hidden_states,
     const torch::Tensor& gating_output,
@@ -55,6 +58,7 @@ std::tuple<torch::Tensor, torch::Tensor> fused_grouped_topk(
     const c10::string_view scoring_func,
     const double routed_scaling_factor,
     const c10::optional<torch::Tensor>& bias);
+#endif 
 
 void topk_softmax(
     torch::Tensor& topk_weights,
