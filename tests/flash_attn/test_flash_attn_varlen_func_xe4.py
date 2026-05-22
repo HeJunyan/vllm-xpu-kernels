@@ -131,7 +131,9 @@ def ref_paged_attn(query: torch.Tensor,
 MINI_PYTEST_PARAMS = {
     "test_varlen_with_paged_kv": {
         "seq_lens": [[(256, 512), (512, 1024)],
-                     [(256, 511), (256, 1020)]],
+                     [(256, 511), (256, 1023)],
+                     [(127, 512), (80, 1000)],
+                     [(1, 511), (129, 1024)]],
         "head_size": [128],
         "num_heads": [(2, 2), (8, 2)],
         "num_blocks": [4],

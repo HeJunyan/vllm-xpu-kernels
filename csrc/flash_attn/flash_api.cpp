@@ -198,6 +198,9 @@ std::vector<at::Tensor> mha_varlen_fwd(
 
   at::Tensor seqlens_k = is_paged ? *seqused_k : cu_seqlens_k;
   bool is_prefill_only = (!mix_batch && max_seqlen_q > 1) | !is_paged;
+#ifdef VLLM_XPU_ENABLE_XE4
+  is_prefill_only = is_prefill_only | vllm::xpu::is_xe4_arch();
+#endif
 
   if (is_prefill_only) {
     if (!out_.has_value()) {

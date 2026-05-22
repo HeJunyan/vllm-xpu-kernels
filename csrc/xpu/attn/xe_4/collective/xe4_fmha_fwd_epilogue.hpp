@@ -125,7 +125,7 @@ class CollectiveEpilogueAttention {
 
   template <typename TensorStorage, typename DescTuple, typename BlockCoord>
   CUTLASS_DEVICE void store(
-      Params const& params,
+      Params params, // by value: per-WG mutable copy (we may rebind gmem_ptr)
       TensorStorage& shared_tensors,
       DescTuple const& tdesc_tuple,
       BlockCoord const& block_coord,
@@ -150,12 +150,21 @@ class CollectiveEpilogueAttention {
     int o_tile_offset = 0;
     int tma_seq_q = int(seq_len_qo);
     int tma_l_q = int(batch) * num_heads_q;
+    int actual_q_len = tma_seq_q;
+    int o_row_offset = 0;
 
     if constexpr (IsVarLen) {
       blk_l_coord = num_heads_coord;
       auto* cum_q = seq_len_qo.cumulative_length;
-      o_tile_offset = cum_q[batch_coord] / size<0>(TileShapePV_MNK{});
-      tma_seq_q = cum_q[int(batch)]; // total_seqlen_q
+      // Per-batch element-level offset on output gmem ptr so that this WG's
+      // tile coord 0 maps to the start of THIS batch's row range. Combined
+      // with a per-WG hardware M-bound override (set below) this prevents
+      // OOB stages of one batch's WG from overwriting another batch's
+      // rows when q_len is not a multiple of NumStageQO * TileM.
+      o_row_offset = cum_q[batch_coord];
+      actual_q_len = cum_q[batch_coord + 1] - o_row_offset;
+      o_tile_offset = 0;
+      tma_seq_q = cum_q[int(batch)];
       tma_l_q = num_heads_q;
     } else {
       blk_l_coord = batch_coord * num_heads_q + num_heads_coord;
@@ -168,7 +177,22 @@ class CollectiveEpilogueAttention {
 
     // Initialize matrix descriptor
     auto [tdesc_o] = tdesc_tuple;
+    if constexpr (IsVarLen) {
+      auto base_ptr = params.tma_store_O.cache_.gmem_ptr_;
+      params.tma_store_O.cache_.set_gmem_ptr(
+          base_ptr + o_row_offset * num_heads_q * head_size_vo);
+    }
     params.tma_store_O.cache_.set_tensor_desc(tdesc_o);
+    if constexpr (IsVarLen) {
+      // Override per-WG hardware M-bound to actual_q_len so writes past this
+      // batch's last valid row are clipped by the TMA descriptor.
+      // Descriptor dim ordering for (M, N, L) with stride
+      // (num_heads*head_size, 1, head_size) is: dim0=N(head_size, stride 1),
+      // dim1=M(seq_q, stride num_heads*head_size), dim2=L(num_heads).
+      // tensordesc_set_dim_size<dim_num> writes index dim_num-1, so M is <2>.
+      tensordesc_set_dim_size<2>(
+          tdesc_o, static_cast<uint32_t>(actual_q_len));
+    }
 
     Tensor mO_mnl = params.tma_store_O.get_tma_tensor(
         make_shape(tma_seq_q, head_size_vo, tma_l_q)); // (M,N,L)

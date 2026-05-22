@@ -328,12 +328,13 @@ struct CollectiveMmaAttention {
     auto seq_len_qo = size<3>(problem_shape);
     auto tile_shape_qo = size<0>(tile_shape);
 
-    implementable = implementable && (seq_len_qo % (tile_shape_qo * 2) == 0);
-    if (!(seq_len_qo % (tile_shape_qo * 2) == 0)) {
+    // seq_len_qo no longer needs to be a multiple of (TileM * NumStageQO):
+    // OOB whole-tile early-out happens in xe4_fmha_fwd_kernel.hpp; OOB rows
+    // within a partial tile are handled per-row (no cross-row poisoning).
+    implementable = implementable && (seq_len_qo > 0);
+    if (!(seq_len_qo > 0)) {
       CUTLASS_TRACE_HOST(
-          "seq_len qo=" << seq_len_qo
-                        << " must be divisible by (tile_shape QO * 2)="
-                        << (tile_shape_qo * 2) << " for QO double buffering\n");
+          "seq_len qo=" << seq_len_qo << " must be positive\n");
     }
     return implementable;
   }
@@ -354,7 +355,7 @@ struct CollectiveMmaAttention {
 
   template <typename DescTuple, typename BlockCoord>
   CUTLASS_DEVICE void load(
-      Params const& params,
+      Params params, // by value: per-WG mutable copy (we may rebind gmem_ptr)
       TensorStorage& shared_tensors,
       PipelineStorage& shared_pipelines,
       DescTuple const& tdesc_tuple,
@@ -367,7 +368,9 @@ struct CollectiveMmaAttention {
       PipelineV& pipeline_v,
       PipelineV::PipelineState& pipeline_v_producer_state,
       bool is_first_wave,
-      bool is_last_wave) {
+      bool is_last_wave,
+      bool is_causal,
+      int causal_offset) {
     bool lane_predicate = cute::elect_one_sync();
     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     uint32_t worker_id = item.get_local_linear_id();
@@ -404,7 +407,10 @@ struct CollectiveMmaAttention {
 
       auto* cum_q = seq_len_qo.cumulative_length;
       int cum_q_start = cum_q[batch_coord];
-      q_tile_offset = cum_q_start / TileShapeM;
+      // Element-level per-batch offset on Q gmem ptr: see store() for the
+      // detailed rationale. q_tile_offset becomes 0 because tile coord 0 now
+      // refers to this batch's first row directly.
+      q_tile_offset = 0;
 
       tma_seq_q = params.total_seqlen_q;
       tma_l_q = num_heads_q;
@@ -425,7 +431,21 @@ struct CollectiveMmaAttention {
 
     // Initialize matrix descriptor
     auto [tdesc_q, tdesc_k, tdesc_v] = tdesc_tuple;
-    params.tma_load_Q.cache_.set_tensor_desc(tdesc_q);
+    if constexpr (IsVarLen) {
+      auto* cum_q = seq_len_qo.cumulative_length;
+      int cum_q_start = cum_q[batch_coord];
+      int actual_q_len = cum_q[batch_coord + 1] - cum_q_start;
+      auto base_q_ptr = params.tma_load_Q.cache_.gmem_ptr_;
+      params.tma_load_Q.cache_.set_gmem_ptr(
+          base_q_ptr + cum_q_start * num_heads_q * head_size_qk);
+      params.tma_load_Q.cache_.set_tensor_desc(tdesc_q);
+      // Override per-WG hardware M-bound to actual_q_len so loads past this
+      // batch's last valid row are clipped (return zero / no-write).
+      tensordesc_set_dim_size<2>(
+          tdesc_q, static_cast<uint32_t>(actual_q_len));
+    } else {
+      params.tma_load_Q.cache_.set_tensor_desc(tdesc_q);
+    }
     params.tma_load_K.cache_.set_tensor_desc(tdesc_k);
     params.tma_load_V.cache_.set_tensor_desc(tdesc_v);
 
@@ -533,10 +553,16 @@ struct CollectiveMmaAttention {
     ++pipeline_v_producer_state;
 
     int num_kv_tiles = num_kv_tiles_;
-    // Causal tile count uses local (within-batch) Q position
+    // Match softmax()'s causal-aware kv tile count to avoid producer/consumer
+    // pipeline mismatch when seq_len_qo is not a multiple of TileM*NumStageQO.
     int q1_local = NumStageQO * blk_m_coord + 1;
-    num_kv_tiles = q1_local * TileShapeM / TileShapeN + 1;
+    if (is_causal) {
+      num_kv_tiles =
+          (q1_local * TileShapeM + causal_offset) / TileShapeN + 1;
+    }
     num_kv_tiles = num_kv_tiles > 1 ? num_kv_tiles : 2;
+    num_kv_tiles =
+        num_kv_tiles < num_kv_tiles_ ? num_kv_tiles : num_kv_tiles_;
 
     for (int i = 1; i < num_kv_tiles; ++i) {
       pipeline_k.producer_acquire(pipeline_k_producer_state);
@@ -576,7 +602,9 @@ struct CollectiveMmaAttention {
       PipelineO& pipeline_corr,
       PipelineO::PipelineState& pipeline_corr_producer_state,
       bool is_first_wave,
-      bool is_last_wave) {
+      bool is_last_wave,
+      bool is_causal,
+      int causal_offset) {
     int thread_idx = static_cast<int>(ThreadIdxX());
 
     TiledMmaQK tiled_mma_qk;
@@ -623,8 +651,16 @@ struct CollectiveMmaAttention {
     constexpr int pv_mma_k_itr = size<2>(tOsP); // 4
 
     int num_kv_tiles = num_kv_tiles_;
-    num_kv_tiles = (2 * get<0>(block_coord) + 1) * TileShapeM / TileShapeN + 1;
+    // Match softmax()'s causal-aware kv tile count to avoid pipeline mismatch
+    // when seq_len_qo is not a multiple of TileM*NumStageQO.
+    int q1_local = 2 * get<0>(block_coord) + 1;
+    if (is_causal) {
+      num_kv_tiles =
+          (q1_local * TileShapeM + causal_offset) / TileShapeN + 1;
+    }
     num_kv_tiles = num_kv_tiles > 1 ? num_kv_tiles : 2;
+    num_kv_tiles =
+        num_kv_tiles < num_kv_tiles_ ? num_kv_tiles : num_kv_tiles_;
 
     // Compute the S1 and S2 for the first wave. Note, if not the first wave, S1
     // and S2 computation will be done in the end of the previous wave
@@ -1036,6 +1072,11 @@ struct CollectiveMmaAttention {
           ((2 * q_tile_local + 1) * TileShapeM + causal_offset) / TileShapeN + 1;
       num_kv_tiles_0 = num_kv_tiles_0 > 1 ? num_kv_tiles_0 : 2;
       num_kv_tiles_1 = num_kv_tiles_1 > 1 ? num_kv_tiles_1 : 2;
+      // Clamp to available KV tiles (producer never produces more than total).
+      num_kv_tiles_0 =
+          num_kv_tiles_0 < num_kv_tiles_ ? num_kv_tiles_0 : num_kv_tiles_;
+      num_kv_tiles_1 =
+          num_kv_tiles_1 < num_kv_tiles_ ? num_kv_tiles_1 : num_kv_tiles_;
     }
 
     if (is_first_wave) {
