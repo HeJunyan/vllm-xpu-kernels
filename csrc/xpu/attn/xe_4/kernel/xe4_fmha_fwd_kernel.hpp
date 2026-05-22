@@ -388,6 +388,29 @@ class GemmUniversalAttention {
           is_last_wave = !valid;
           auto block_coord_next = tile_scheduler.get_block_coord();
 
+          // Per-tile causal offset (varies per-batch in VarLen).
+          int load_causal_offset = 0;
+          if (params.is_causal) {
+            int load_actual_q_len, load_actual_kv_len;
+            if constexpr (IsVarLen) {
+              int batch_idx = get<2>(block_coord);
+              auto* cum_q =
+                  params.problem_shape.seq_len_qo.cumulative_length;
+              load_actual_q_len = cum_q[batch_idx + 1] - cum_q[batch_idx];
+              auto* cum_k =
+                  params.problem_shape.seq_len_kv.cumulative_length;
+              if constexpr (IsPaged) {
+                load_actual_kv_len = cum_k[batch_idx];
+              } else {
+                load_actual_kv_len = cum_k[batch_idx + 1] - cum_k[batch_idx];
+              }
+            } else {
+              load_actual_q_len = int(params.problem_shape.seq_len_qo);
+              load_actual_kv_len = int(params.problem_shape.seq_len_kv);
+            }
+            load_causal_offset = load_actual_kv_len - load_actual_q_len;
+          }
+
           collective_mainloop.load(
               params.mainloop,
               shared_tensors.mainloop,
@@ -402,7 +425,9 @@ class GemmUniversalAttention {
               pipeline_load_v,
               pipeline_load_v_producer_state,
               is_first_wave,
-              is_last_wave);
+              is_last_wave,
+              params.is_causal,
+              load_causal_offset);
 
           is_first_wave = false;
         }
@@ -431,6 +456,29 @@ class GemmUniversalAttention {
           valid = tile_scheduler.is_valid();
           is_last_wave = !valid;
 
+          // Per-tile causal offset (varies per-batch in VarLen).
+          int mma_causal_offset = 0;
+          if (params.is_causal) {
+            int mma_actual_q_len, mma_actual_kv_len;
+            if constexpr (IsVarLen) {
+              int batch_idx = get<2>(block_coord);
+              auto* cum_q =
+                  params.problem_shape.seq_len_qo.cumulative_length;
+              mma_actual_q_len = cum_q[batch_idx + 1] - cum_q[batch_idx];
+              auto* cum_k =
+                  params.problem_shape.seq_len_kv.cumulative_length;
+              if constexpr (IsPaged) {
+                mma_actual_kv_len = cum_k[batch_idx];
+              } else {
+                mma_actual_kv_len = cum_k[batch_idx + 1] - cum_k[batch_idx];
+              }
+            } else {
+              mma_actual_q_len = int(params.problem_shape.seq_len_qo);
+              mma_actual_kv_len = int(params.problem_shape.seq_len_kv);
+            }
+            mma_causal_offset = mma_actual_kv_len - mma_actual_q_len;
+          }
+
           collective_mainloop.mma(
               shared_tensors.mainloop,
               shared_pipelines.mainloop,
@@ -447,7 +495,9 @@ class GemmUniversalAttention {
               pipeline_mma_corr,
               pipeline_mma_corr_producer_state,
               is_first_wave,
-              is_last_wave);
+              is_last_wave,
+              params.is_causal,
+              mma_causal_offset);
 
           is_first_wave = false;
         }

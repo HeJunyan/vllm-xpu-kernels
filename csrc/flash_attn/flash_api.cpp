@@ -146,7 +146,14 @@ std::vector<at::Tensor> mha_varlen_fwd(
   bool is_local = (window_size_left != -1) | (window_size_right != -1);
   bool is_sink = softmax_sink_.has_value();
 
-  if (max_seqlen_q > 1 || !is_paged) {
+  // XE4 has no paged_decode kernel; route all paged ops through chunk_prefill
+  // on XE4 regardless of max_seqlen_q (the chunk_prefill path now handles
+  // single-row Q via the Q-residue mask).
+  bool force_chunk_prefill = false;
+#ifdef VLLM_XPU_ENABLE_XE4
+  force_chunk_prefill = vllm::xpu::is_xe4_arch();
+#endif
+  if (max_seqlen_q > 1 || !is_paged || force_chunk_prefill) {
     if (!out_.has_value()) {
       out = torch::empty_like(q);
     }
