@@ -16,7 +16,7 @@ void kernel_functor(
     void* ptr_B_scale,
     void* ptr_bias,
     void* ptr_D,
-    void* expert_first_token_offset,
+    void* rows_per_expert,
     int64_t N,
     int64_t K,
     int64_t groups);
@@ -31,7 +31,7 @@ inline at::Tensor grouped_gemm_func(
     const c10::optional<at::Tensor>& ptr_B_scale,
     const c10::optional<at::Tensor>& ptr_bias,
     at::Tensor& ptr_D,
-    at::Tensor& expert_first_token_offset,
+    at::Tensor& rows_per_expert,
     int64_t N,
     int64_t K,
     int64_t groups) {
@@ -49,7 +49,7 @@ inline at::Tensor grouped_gemm_func(
       ptr_B_scale ? ptr_B_scale->data_ptr() : nullptr, \
       ptr_bias ? ptr_bias->data_ptr() : nullptr,       \
       ptr_D.data_ptr(),                                \
-      expert_first_token_offset.data_ptr(),            \
+      rows_per_expert.data_ptr(),            \
       N,                                               \
       K,                                               \
       groups)

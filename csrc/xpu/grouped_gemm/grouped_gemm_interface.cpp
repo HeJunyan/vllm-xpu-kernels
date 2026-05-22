@@ -68,7 +68,7 @@ torch::Tensor cutlass_grouped_gemm_interface(
         ptr_B_scale,
         ptr_bias,
         ptr_D,
-        expert_first_token_offset,
+        rows_per_expert,
         N,
         K,
         num_experts);
@@ -84,7 +84,7 @@ torch::Tensor cutlass_grouped_gemm_interface(
         ptr_B_scale,
         ptr_bias,
         ptr_D,
-        expert_first_token_offset,
+        rows_per_expert,
         N,
         K,
         num_experts);

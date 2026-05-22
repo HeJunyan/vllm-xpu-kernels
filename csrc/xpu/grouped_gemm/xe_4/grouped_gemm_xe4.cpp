@@ -10,18 +10,14 @@ torch::Tensor cutlass_grouped_gemm_xe4(
     const c10::optional<at::Tensor>& ptr_B_scale,
     const c10::optional<at::Tensor>& ptr_bias,
     torch::Tensor ptr_D,
-    torch::Tensor expert_first_token_offset,
+    torch::Tensor rows_per_expert,
     int64_t N,
     int64_t K,
     int64_t num_experts) {
   auto ptr_bias_ = ptr_bias;
   if (ptr_bias.has_value()) {
-    auto expert_token_count = (expert_first_token_offset.slice(
-                                   0, 1, expert_first_token_offset.size(0)) -
-                               expert_first_token_offset.slice(0, 0, -1))
-                                  .to(torch::kInt64);
     ptr_bias_ =
-        ptr_bias->repeat_interleave(expert_token_count, 0).to(torch::kFloat32);
+        ptr_bias->repeat_interleave(rows_per_expert, 0).to(torch::kFloat32);
   }
   return gpu::cutlass_kernel::grouped_gemm_func(
       ptr_A,
@@ -30,7 +26,7 @@ torch::Tensor cutlass_grouped_gemm_xe4(
       ptr_B_scale,
       ptr_bias_,
       ptr_D,
-      expert_first_token_offset,
+      rows_per_expert,
       N,
       K,
       num_experts);

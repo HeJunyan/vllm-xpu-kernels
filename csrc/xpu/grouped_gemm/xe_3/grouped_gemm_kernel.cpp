@@ -118,7 +118,7 @@ struct GroupedGemmRunner {
   /// Populates a Gemm::Arguments structure from the given commandline options
   typename Gemm::Arguments args_from_options(
       const cutlass::KernelHardwareInfo& hw_info,
-      int64_t const* expert_first_token_offset,
+      int const* rows_per_expert,
       const ElementA* ptr_A,
       const ElementScaleA* ptr_A_scale,
       const ElementB* ptr_B,
@@ -152,7 +152,7 @@ struct GroupedGemmRunner {
           cutlass::gemm::GemmUniversalMode::kGrouped,
           {ptr_A, ptr_B},
           {fusion_args, ptr_C, ptr_D},
-          expert_first_token_offset,
+          rows_per_expert,
           N,
           K,
           groups,
@@ -163,7 +163,7 @@ struct GroupedGemmRunner {
           cutlass::gemm::GemmUniversalMode::kGrouped,
           {ptr_A, ptr_B, ptr_A_scale, ptr_B_scale, block_size},
           {fusion_args, ptr_C, ptr_D},
-          expert_first_token_offset,
+          rows_per_expert,
           N,
           K,
           groups,
@@ -177,7 +177,7 @@ struct GroupedGemmRunner {
   cutlass::Status
   run(sycl::queue& stream,
       const cutlass::KernelHardwareInfo& hw_info,
-      int64_t const* expert_first_token_offset,
+      int const* rows_per_expert,
       const ElementA* ptr_A,
       const ElementScaleA* ptr_A_scale,
       const ElementB* ptr_B,
@@ -192,7 +192,7 @@ struct GroupedGemmRunner {
 
     auto arguments = args_from_options(
         hw_info,
-        expert_first_token_offset,
+        rows_per_expert,
         ptr_A,
         ptr_A_scale,
         ptr_B,
@@ -227,7 +227,7 @@ void kernel_functor(
     void* ptr_B_scale,
     void* ptr_bias,
     void* ptr_D,
-    void* expert_first_token_offset,
+    void* rows_per_expert,
     int64_t N,
     int64_t K,
     int64_t groups) {
@@ -252,7 +252,7 @@ void kernel_functor(
   runner.run(
       stream,
       hw_info,
-      reinterpret_cast<const int64_t*>(expert_first_token_offset),
+      reinterpret_cast<const int*>(rows_per_expert),
       reinterpret_cast<const typename moe_policy::ElementA*>(ptr_A),
       reinterpret_cast<const typename moe_policy::ElementScaleA*>(ptr_A_scale),
       reinterpret_cast<const typename moe_policy::ElementB*>(ptr_B),
@@ -275,7 +275,7 @@ void kernel_functor(
       void* ptr_B_scale,                \
       void* ptr_bias,                   \
       void* ptr_D,                      \
-      void* expert_first_token_offset,  \
+      void* rows_per_expert,           \
       int64_t N,                        \
       int64_t K,                        \
       int64_t groups);

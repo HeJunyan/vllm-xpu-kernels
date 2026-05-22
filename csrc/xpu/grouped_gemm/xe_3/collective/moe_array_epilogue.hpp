@@ -494,15 +494,16 @@ class CollectiveEpilogue<
   CUTLASS_DEVICE auto update_tensor_shape_stride(
       int32_t const& next_group,
       ProblemShape_MNKL const& problem_shape_mnkl,
-      const int64_t* expert_first_token_offset) {
+      int64_t expert_first_token_offset) {
     auto [M, N, K, L] = problem_shape_mnkl;
+
 
     TensorC mC_mnl;
     TensorD mD_mnl;
     if constexpr (is_source_supported) {
       ElementC const* ptr_C_curr_batch =
           reinterpret_cast<ElementC const*>(params.ptr_C) +
-          expert_first_token_offset[next_group] * N;
+          expert_first_token_offset * N;
       mC_mnl = make_tensor(
           make_gmem_ptr(ptr_C_curr_batch),
           make_layout(
@@ -512,7 +513,7 @@ class CollectiveEpilogue<
 
     if constexpr (is_destination_supported) {
       ElementD* ptr_D_curr_batch = reinterpret_cast<ElementD*>(params.ptr_D) +
-                                   expert_first_token_offset[next_group] * N;
+                                   expert_first_token_offset * N;
       mD_mnl = make_tensor(
           make_gmem_ptr(ptr_D_curr_batch),
           make_layout(

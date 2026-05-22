@@ -63,10 +63,10 @@ def random_partition(size_a: int, target: int):
 def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
     seed_everything(7)
     num_experts = e
-    token_per_group = random_partition(e, m * topk)
-    assert (len(token_per_group) == e)
+    rows_per_expert = random_partition(e, m * topk)
+    assert (len(rows_per_expert) == e)
     # input
-    input_A = torch.randn((sum(token_per_group), k),
+    input_A = torch.randn((sum(rows_per_expert), k),
                           dtype=dtype,
                           device=DEVICE).contiguous() / 10
     ref_A = input_A
@@ -79,17 +79,17 @@ def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
         bias = None
 
     output_dtype = torch.float16 if dtype == torch.float16 else torch.float32 # FIXME: bf16 output acc issue
-    output = torch.empty((sum(token_per_group), n), dtype=output_dtype, device=DEVICE)
+    output = torch.empty((sum(rows_per_expert), n), dtype=output_dtype, device=DEVICE)
     output_kernel = output.to(KERNEL_DEVICE)
     cutlass_grouped_gemm(_to_kernel(input_A), None, _to_kernel(input_B), None,
                          _to_kernel(bias), output_kernel,
-                         token_per_group, n, k, num_experts)
+                         rows_per_expert, n, k, num_experts)
     output = output_kernel.cpu()
     # ref gg
     ref = []
     pre_token_sum = 0
     for i in range(num_experts):
-        cur_token_num = token_per_group[i]
+        cur_token_num = rows_per_expert[i]
         if cur_token_num == 0:
             continue
         input = ref_A[pre_token_sum:pre_token_sum + cur_token_num, :]

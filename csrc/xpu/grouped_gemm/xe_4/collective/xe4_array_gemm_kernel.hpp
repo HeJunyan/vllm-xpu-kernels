@@ -81,7 +81,7 @@ class XE4GemmUniversal {
   struct Arguments {
     typename CollectiveMainloop::Arguments mainloop{};
     typename CollectiveEpilogue::Arguments epilogue{};
-    const int64_t* expert_first_token_offset{nullptr};
+    const int* rows_per_expert{nullptr};
     int64_t N;
     int64_t K;
     int64_t groups;
@@ -94,7 +94,7 @@ class XE4GemmUniversal {
     typename CollectiveEpilogue::Params epilogue;
     KernelHardwareInfo hw_info{};
     TileSchedulerParams scheduler{};
-    const int64_t* expert_first_token_offset{nullptr};
+    const int* rows_per_expert{nullptr};
     int64_t N;
     int64_t K;
     int64_t groups;
@@ -114,7 +114,7 @@ class XE4GemmUniversal {
             args.epilogue),
         hw_info,
         scheduler,
-        args.expert_first_token_offset,
+        args.rows_per_expert,
         args.N,
         args.K,
         args.groups};
@@ -153,7 +153,7 @@ class XE4GemmUniversal {
 
     TileScheduler scheduler{
         params.scheduler,
-        params.expert_first_token_offset,
+        params.rows_per_expert,
         params.N,
         params.K,
         params.groups};
@@ -164,6 +164,14 @@ class XE4GemmUniversal {
 
     bool did_group_change = true;
     int32_t curr_group = -1;
+    int64_t expert_first_token_offset = 0;
+    int32_t offset_group = 0;
+    auto advance_offset_to = [&](int32_t target) {
+      while (offset_group < target) {
+        expert_first_token_offset += params.rows_per_expert[offset_group];
+        ++offset_group;
+      }
+    };
 
     ProblemShapeMNKL problem_shape_MNKL;
 
@@ -175,9 +183,7 @@ class XE4GemmUniversal {
 
     if (work_tile_info.is_valid()) {
       curr_group = work_tile_info.L_idx;
-      auto M_ = static_cast<int>(
-          params.expert_first_token_offset[curr_group + 1] -
-          params.expert_first_token_offset[curr_group]);
+      auto M_ = params.rows_per_expert[curr_group];
       problem_shape_MNKL = append<4>(Shape<int, int, int>{M_, N, K}, 1);
     }
 
@@ -262,11 +268,12 @@ class XE4GemmUniversal {
 
       if (sg_id == 0) {  // Producer
         if (did_group_change) {
+          advance_offset_to(curr_group);
           AB_tensors = collective_mainloop.update_tensor_shape_stride(
               params.mainloop,
               curr_group,
               problem_shape_MNKL,
-              params.expert_first_token_offset);
+              expert_first_token_offset);
         }
 
         PipelineState smem_pipe_write_a =
@@ -303,8 +310,9 @@ class XE4GemmUniversal {
             smem_pipe_read_b);
 
         if (did_group_change) {
+          advance_offset_to(curr_group);
           CD_tensors = collective_epilogue.update_tensor_shape_stride(
-              curr_group, problem_shape_MNKL, params.expert_first_token_offset);
+              curr_group, problem_shape_MNKL, expert_first_token_offset);
           did_group_change = false;
         }
 
@@ -329,9 +337,7 @@ class XE4GemmUniversal {
       did_group_change = curr_group != work_tile_info.L_idx;
       if (did_group_change && work_tile_info.is_valid()) {
         curr_group = work_tile_info.L_idx;
-        auto M_ = static_cast<int>(
-            params.expert_first_token_offset[curr_group + 1] -
-            params.expert_first_token_offset[curr_group]);
+        auto M_ = params.rows_per_expert[curr_group];
         problem_shape_MNKL = append<4>(Shape<int, int, int>{M_, N, K}, 1);
       }
     }

@@ -55,7 +55,7 @@ class PersistentTileSchedulerMoE {
   int64_t N_ = 0;
   int64_t K_ = 0;
   int64_t num_experts_ = 0;
-  const int64_t* expert_first_token_offset_ = nullptr;
+  const int* rows_per_expert_ = nullptr;
 
   // Tracking current group, its starting linear idx and total tiles
   struct GroupInfo {
@@ -185,7 +185,7 @@ class PersistentTileSchedulerMoE {
 
   CUTLASS_DEVICE explicit PersistentTileSchedulerMoE(
       Params const& params_,
-      const int64_t* expert_first_token_offset,
+      const int* rows_per_expert,
       int64_t N,
       int64_t K,
       int64_t num_experts)
@@ -224,7 +224,7 @@ class PersistentTileSchedulerMoE {
     N_ = N;
     K_ = K;
     num_experts_ = num_experts;
-    expert_first_token_offset_ = expert_first_token_offset;
+    rows_per_expert_ = rows_per_expert;
 #else
     CUTLASS_ASSERT(false && "This line should never be reached");
 #endif
@@ -276,8 +276,7 @@ class PersistentTileSchedulerMoE {
     bool valid_tile = true;
     uint64_t ctas_along_m, ctas_along_n;
     int total_problem_groups = num_experts_;
-    int64_t M_ = expert_first_token_offset_[group_info.group_idx + 1] -
-                 expert_first_token_offset_[group_info.group_idx];
+    int64_t M_ = rows_per_expert_[group_info.group_idx];
     ctas_along_m =
         divmod_cta_shape_m.divide(M_ + divmod_cta_shape_m.divisor - 1);
     ctas_along_n =
@@ -297,8 +296,7 @@ class PersistentTileSchedulerMoE {
 
       group_info.start_linear_idx += group_info.total_tiles;
 
-      M_ = expert_first_token_offset_[group_info.group_idx + 1] -
-           expert_first_token_offset_[group_info.group_idx];
+      M_ = rows_per_expert_[group_info.group_idx];
       ctas_along_m =
           divmod_cta_shape_m.divide(M_ + divmod_cta_shape_m.divisor - 1);
       ctas_along_n =

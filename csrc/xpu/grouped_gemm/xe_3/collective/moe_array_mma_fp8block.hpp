@@ -196,22 +196,23 @@ struct CollectiveMma<
       Arguments const& mainloop_params,
       int next_group,
       ProblemShape_MNKL const& problem_shape_mnkl,
-      const int64_t* expert_first_token_offset) {
+      int64_t expert_first_token_offset) {
     const int32_t M = get<0>(problem_shape_mnkl);
     const int32_t N = get<1>(problem_shape_mnkl);
     const int32_t K = get<2>(problem_shape_mnkl);
+
 
     auto scale_k = cute::ceil_div(K, GROUP_K);
     auto scale_n = cute::ceil_div(N, GROUP_K);
     ElementA const* ptr_A_curr_batch =
         static_cast<ElementA const*>(mainloop_params.ptr_A) +
-        expert_first_token_offset[next_group] * K;
+        expert_first_token_offset * K;
     ElementB const* ptr_B_curr_batch =
         static_cast<ElementB const*>(mainloop_params.ptr_B) +
         next_group * N * K;
     ElementSF const* ptr_SFA_curr_batch =
         static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
-        expert_first_token_offset[next_group] * scale_k;
+        expert_first_token_offset * scale_k;
     ElementSF const* ptr_SFB_curr_batch =
         static_cast<ElementSF const*>(mainloop_params.ptr_SB) +
         next_group * scale_n * scale_k;

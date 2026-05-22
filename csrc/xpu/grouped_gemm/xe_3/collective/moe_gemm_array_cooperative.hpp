@@ -130,7 +130,7 @@ class GemmUniversal<
     GemmUniversalMode mode{};
     MainloopArguments mainloop{};
     EpilogueArguments epilogue{};
-    const int64_t* expert_first_token_offset{nullptr};
+    const int* rows_per_expert{nullptr};
     int64_t N;
     int64_t K;
     int64_t groups;
@@ -146,7 +146,7 @@ class GemmUniversal<
     KernelHardwareInfo hw_info{};
     TileSchedulerParams scheduler{};
     void* workspace{nullptr};
-    const int64_t* expert_first_token_offset{nullptr};
+    const int* rows_per_expert{nullptr};
     int64_t N;
     int64_t K;
     int64_t groups;
@@ -193,7 +193,7 @@ class GemmUniversal<
         hw_info,
         scheduler,
         workspace,
-        args.expert_first_token_offset,
+        args.rows_per_expert,
         args.N,
         args.K,
         args.groups};
@@ -287,7 +287,7 @@ class GemmUniversal<
 
     TileScheduler scheduler{
         params.scheduler,
-        params.expert_first_token_offset,
+        params.rows_per_expert,
         params.N,
         params.K,
         params.groups};
@@ -302,6 +302,14 @@ class GemmUniversal<
     constexpr auto subgroup_shape = SubgroupTileShape{};  // (SUB_M,SUB_N,SUB_K)
     bool did_group_change = true;
     int32_t curr_group = -1;
+    int64_t expert_first_token_offset = 0;
+    int32_t offset_group = 0;
+    auto advance_offset_to = [&](int32_t target) {
+      while (offset_group < target) {
+        expert_first_token_offset += params.rows_per_expert[offset_group];
+        ++offset_group;
+      }
+    };
     using ProblemShapeMNKL = Shape<int, int, int, int>;
     ProblemShapeMNKL problem_shape_MNKL;
     typename CollectiveMainloop::Base::Params base_params;
@@ -309,9 +317,7 @@ class GemmUniversal<
 
     if (work_tile_info.is_valid()) {
       curr_group = work_tile_info.L_idx;
-      auto M_ = static_cast<int>(
-          params.expert_first_token_offset[curr_group + 1] -
-          params.expert_first_token_offset[curr_group]);
+      auto M_ = static_cast<int>(params.rows_per_expert[curr_group]);
       problem_shape_MNKL = append<4>(Shape<int, int, int>{M_, N, K}, 1);
     }
 
@@ -334,13 +340,14 @@ class GemmUniversal<
 
       CollectiveMainloop collective_mma;
       if (did_group_change) {
+        advance_offset_to(curr_group);
         base_params = CollectiveMainloop::Base::to_underlying_arguments(
             problem_shape_MNKL,
             CollectiveMainloop::to_base_arguments(
                 params.mainloop,
                 curr_group,
                 problem_shape_MNKL,
-                params.expert_first_token_offset),
+                expert_first_token_offset),
             params.workspace);
       }
       auto tile_coord = make_coord(m_coord, n_coord, _, 0);
@@ -379,7 +386,7 @@ class GemmUniversal<
 
         if (did_group_change) {
           CD_tensors = epilogue.update_tensor_shape_stride(
-              curr_group, problem_shape_MNKL, params.expert_first_token_offset);
+              curr_group, problem_shape_MNKL, expert_first_token_offset);
           did_group_change = false;
         }
 
@@ -402,9 +409,7 @@ class GemmUniversal<
 
       if (did_group_change && work_tile_info.is_valid()) {
         curr_group = work_tile_info.L_idx;
-        auto M_ = static_cast<int>(
-            params.expert_first_token_offset[curr_group + 1] -
-            params.expert_first_token_offset[curr_group]);
+        auto M_ = static_cast<int>(params.rows_per_expert[curr_group]);
         problem_shape_MNKL = append<4>(Shape<int, int, int>{M_, N, K}, 1);
       }
     }
