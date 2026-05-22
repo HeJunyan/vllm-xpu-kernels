@@ -21,6 +21,10 @@ RECIPE_TO_DTYPE = {
     "mxfp4": (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu),
 }
 
+LOCAL_EXPERTS_NUM = [3, 8, 11]
+EP_RANK = [0, 1, 2, 3]
+EP_SIZE = [4]
+
 #override pytest parameters when enable mini pytest
 MINI_PYTEST_PARAMS = {
     "default": {
