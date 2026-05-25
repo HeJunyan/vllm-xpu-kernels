@@ -305,7 +305,8 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
       set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} -fsycl-targets=pisa)
       set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} --offload-new-driver)
       set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} --offload-arch=jgs)
-      set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} --pisa-fin-path=$ENV{CMPLR_ROOT}/bin/compiler)
+      set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS}
+                                 --pisa-fin-path=$ENV{CMPLR_ROOT}/bin/compiler)
 
     else()
       list(APPEND SYCL_DEVICE_LINK_FLAGS -fsycl-targets=spir64_gen
@@ -321,7 +322,11 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   if(AOT_DEVICES)
     list(APPEND FINAL_LINK_OPTIONS "-device ${AOT_DEVICES}")
     if(BUILD_ON_SIMULATOR_JGS)
-      list(APPEND FINAL_LINK_OPTIONS "-options -ze-intel-xe-features=+set-abarrier-arrive-lmc,+disable-misched,+null-dst")
+      list(
+        APPEND
+        FINAL_LINK_OPTIONS
+        "-options -ze-intel-xe-features=+set-abarrier-arrive-lmc,+disable-misched,+null-dst"
+      )
     endif()
   endif()
 
@@ -739,8 +744,10 @@ endif()
 if(MOE_KERNELS_ENABLED)
   message(STATUS "Enabling _moe_C extension.")
   file(GLOB VLLM_MOE_EXT_SRC "csrc/moe/*.cpp")
-  list(REMOVE_ITEM VLLM_MOE_EXT_SRC
-       ${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/fused_grouped_topk.cpp)
+  if(VLLM_XPU_ENABLE_XE4)
+    list(REMOVE_ITEM VLLM_MOE_EXT_SRC
+         ${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/fused_grouped_topk.cpp)
+  endif()
   define_gpu_extension_target(
     _moe_C
     DESTINATION
