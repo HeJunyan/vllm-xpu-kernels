@@ -345,6 +345,24 @@ class moe_mxfp4_mid_policy : public moe_mxfp4_policy {
   CALL_GENERATE_GEMM();
 };
 
+class moe_mxfp4_unaligned_policy : public moe_mxfp4_policy {
+ public:
+  using GEMMDispatchPolicy =
+      cutlass::gemm::MainloopMXFPXGroupUnaligned<PipelineStages>;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_mxfp4_unaligned_mid_policy : public moe_mxfp4_unaligned_policy {
+ public:
+  using TileShape = Shape<_128, _128, _128>;
+  using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
 // FP8 block-scaled
 class moe_fp8block_policy : public moe_policy_base {
  public:

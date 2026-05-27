@@ -89,10 +89,10 @@ at::Tensor grouped_gemm_func(
       A_dtype == at::kFloat4_e2m1fn_x2 && ptr_A_scale &&
       ptr_A_scale->dtype() == at::kFloat8_e8m0fnu) {
     if (avg_tokens_cnt > 32) {
-      using moe_policy = grouped_gemm::moe_mxfp4_policy;
+      using moe_policy = grouped_gemm::moe_mxfp4_unaligned_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);
     } else {
-      using moe_policy = grouped_gemm::moe_mxfp4_mid_policy;
+      using moe_policy = grouped_gemm::moe_mxfp4_unaligned_mid_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);
     }
   } else if (
