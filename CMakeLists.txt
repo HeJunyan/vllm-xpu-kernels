@@ -346,12 +346,13 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
   # when building.
   if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
-    # Bumped to PR #549 (libraries.ai.cutlass.internal) which extends the
-    # tuple-based scalar scale-load block-scaled mainloop to e2m1 inputs,
-    # enabling arbitrary M/N for both mxfp8 and mxfp4 grouped GEMM. Built on
-    # top of v0.1.0_next + PR #444 (arbitrary M/N for mxfp8).
+    # Bumped to PR #570 (libraries.ai.cutlass.internal) which improves
+    # MXFP4/8 perf when M is unaligned by folding the scalar scale-load
+    # fallback into the regular optimized block-scaled mainloop (the
+    # 2D scale loader now rounds the surface width up to 4-byte alignment
+    # internally). Built on top of PR #549 / v0.1.0_next.
     set(CUTLASS_REVISION
-        "43047b81069067e0d13e5624759f450845adba8e"
+        "71ddc8dc059d24bf26158be87c868d1f11b07b69"
         CACHE STRING "CUTLASS revision to use")
   elseif(BUILD_ON_SIMULATOR_JGS)
     # update on WW11 by Yizhou, this commit id is latest from master_next branch

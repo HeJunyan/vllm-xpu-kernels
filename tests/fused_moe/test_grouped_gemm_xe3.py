@@ -236,15 +236,30 @@ def test_grouped_gemm_mxfp(m, n, k, e, topk, recipe, has_bias):
                         device=DEVICE,
                         dtype=torch.bfloat16)
     A_scale = data_to_mx_scale(A_ref, BLOCK_SIZE, recipe)  # (m, scale_k)
-    A_scale_k = torch.zeros_like(A_scale)
+    # cutlass PR #570 requires per-expert scale-A surface width to be a
+    # multiple of 4 elements (4-byte aligned 2D block load). Allocate the
+    # scale-A buffer with each expert's M dimension padded up to 4 and
+    # leave the padding rows as zeros (they are out-of-bounds rows that
+    # the kernel ignores via the problem shape M).
+    scale_k = ceil_div(k, BLOCK_SIZE)
+    padded_rows_per_expert = [(gm + 3) & ~3 for gm in rows_per_expert]
+    padded_m_total = sum(padded_rows_per_expert)
+    A_scale_k = torch.zeros((padded_m_total, scale_k),
+                            dtype=A_scale.dtype,
+                            device=DEVICE)
     cumu_m = 0
-    for gm in rows_per_expert:
+    cumu_padded = 0
+    for gm, gm_padded in zip(rows_per_expert, padded_rows_per_expert):
         if gm != 0:
-            cur_slice = A_scale_k[cumu_m:cumu_m + gm, :].view_as(
-                A_scale[cumu_m:cumu_m + gm, :].transpose(-1, -2))
+            # Per-expert scale block is stored MN-major (column-major along M).
+            # Use the padded M as the leading dimension so the kernel can
+            # consume a 4-aligned surface width.
+            cur_slice = A_scale_k[cumu_padded:cumu_padded + gm_padded, :].view(
+                scale_k, gm_padded)[:, :gm]
             cur_slice.copy_(A_scale[cumu_m:cumu_m + gm, :].transpose(
                 -1, -2).contiguous())
-            cumu_m += gm
+        cumu_m += gm
+        cumu_padded += gm_padded
     if recipe == "mxfp8":
         B_scale = data_to_mx_scale(B_ref, BLOCK_SIZE,
                                    recipe)  # (e, n, scale_k)

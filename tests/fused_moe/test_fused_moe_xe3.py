@@ -243,8 +243,6 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
     if topk > e:
         pytest.skip(f"topk={topk} > num_experts={e}")
 
-    if recipe in ["mxfp8", "mxfp4"] and m < 256:
-        pytest.skip("MXFP requires m>=256 on CRI simulator (BLK_M=256)")
     seed_everything(7)
     data_dtype, scale_dtype = RECIPE_TO_DTYPE.get(recipe, (None, None))
 

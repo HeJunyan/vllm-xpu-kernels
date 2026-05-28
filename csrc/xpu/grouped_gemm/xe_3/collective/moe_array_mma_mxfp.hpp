@@ -207,13 +207,19 @@ struct CollectiveMma<
       Arguments const& mainloop_params,
       int next_group,
       ProblemShape_MNKL const& problem_shape_mnkl,
-      int64_t expert_first_token_offset) {
+      int64_t expert_first_token_offset,
+      int64_t expert_first_scale_offset = 0) {
     const int32_t M = get<0>(problem_shape_mnkl);
     const int32_t N = get<1>(problem_shape_mnkl);
     const int32_t K = get<2>(problem_shape_mnkl);
 
 
     auto scale_k = cute::ceil_div(K, GROUP_K);
+    // 2D block load of MXFP scales (cutlass PR #570) requires the scale-A
+    // surface width to be a multiple of 4 elements. The caller pads the
+    // per-expert M dimension of scale-A up to 4; here we use the padded M
+    // (and the padded cumulative offset) for the scale-A stride and ptr.
+    int32_t scale_M = (M + 3) & ~int32_t(3);
     if (cute::is_same_v<ElementA, cutlass::float_e4m3_t>) {
       ElementA const* ptr_A_curr_batch =
           static_cast<ElementA const*>(mainloop_params.ptr_A) +
@@ -223,7 +229,7 @@ struct CollectiveMma<
           next_group * N * K;
       ElementSF const* ptr_SFA_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
-          expert_first_token_offset * scale_k;
+          expert_first_scale_offset * scale_k;
       ElementSF const* ptr_SFB_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SB) +
           next_group * N * scale_k;
@@ -232,7 +238,7 @@ struct CollectiveMma<
       StrideB dB =
           cutlass::make_cute_packed_stride(InternalStrideB{}, {N, K, 1});
       StrideScaleA dSA = cutlass::make_cute_packed_stride(
-          InternalStrideScaleA{}, {M, scale_k, 1});
+          InternalStrideScaleA{}, {scale_M, scale_k, 1});
       StrideScaleB dSB = cutlass::make_cute_packed_stride(
           InternalStrideScaleB{}, {N, scale_k, 1});
 
@@ -254,7 +260,7 @@ struct CollectiveMma<
           next_group * N * K / 2;
       ElementSF const* ptr_SFA_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
-          expert_first_token_offset * scale_k;
+          expert_first_scale_offset * scale_k;
       ElementSF const* ptr_SFB_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SB) +
           next_group * N * scale_k;
@@ -263,7 +269,7 @@ struct CollectiveMma<
       StrideB dB =
           cutlass::make_cute_packed_stride(InternalStrideB{}, {N, K, 1});
       StrideScaleA dSA = cutlass::make_cute_packed_stride(
-          InternalStrideScaleA{}, {M, scale_k, 1});
+          InternalStrideScaleA{}, {scale_M, scale_k, 1});
       StrideScaleB dSB = cutlass::make_cute_packed_stride(
           InternalStrideScaleB{}, {N, scale_k, 1});
 
@@ -451,13 +457,19 @@ struct CollectiveMma<
       Arguments const& mainloop_params,
       int next_group,
       ProblemShape_MNKL const& problem_shape_mnkl,
-      int64_t expert_first_token_offset) {
+      int64_t expert_first_token_offset,
+      int64_t expert_first_scale_offset = 0) {
     const int32_t M = get<0>(problem_shape_mnkl);
     const int32_t N = get<1>(problem_shape_mnkl);
     const int32_t K = get<2>(problem_shape_mnkl);
 
 
     auto scale_k = cute::ceil_div(K, GROUP_K);
+    // 2D block load of MXFP scales (cutlass PR #570) requires the scale-A
+    // surface width to be a multiple of 4 elements. The caller pads the
+    // per-expert M dimension of scale-A up to 4; here we use the padded M
+    // (and the padded cumulative offset) for the scale-A stride and ptr.
+    int32_t scale_M = (M + 3) & ~int32_t(3);
     if (cute::is_same_v<ElementA, cutlass::float_e4m3_t>) {
       ElementA const* ptr_A_curr_batch =
           static_cast<ElementA const*>(mainloop_params.ptr_A) +
@@ -467,7 +479,7 @@ struct CollectiveMma<
           next_group * N * K;
       ElementSF const* ptr_SFA_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
-          expert_first_token_offset * scale_k;
+          expert_first_scale_offset * scale_k;
       ElementSF const* ptr_SFB_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SB) +
           next_group * N * scale_k;
@@ -476,7 +488,7 @@ struct CollectiveMma<
       StrideB dB =
           cutlass::make_cute_packed_stride(InternalStrideB{}, {N, K, 1});
       StrideScaleA dSA = cutlass::make_cute_packed_stride(
-          InternalStrideScaleA{}, {M, scale_k, 1});
+          InternalStrideScaleA{}, {scale_M, scale_k, 1});
       StrideScaleB dSB = cutlass::make_cute_packed_stride(
           InternalStrideScaleB{}, {N, scale_k, 1});
 
@@ -498,7 +510,7 @@ struct CollectiveMma<
           next_group * N * K / 2;
       ElementSF const* ptr_SFA_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
-          expert_first_token_offset * scale_k;
+          expert_first_scale_offset * scale_k;
       ElementSF const* ptr_SFB_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SB) +
           next_group * N * scale_k;
@@ -507,7 +519,7 @@ struct CollectiveMma<
       StrideB dB =
           cutlass::make_cute_packed_stride(InternalStrideB{}, {N, K, 1});
       StrideScaleA dSA = cutlass::make_cute_packed_stride(
-          InternalStrideScaleA{}, {M, scale_k, 1});
+          InternalStrideScaleA{}, {scale_M, scale_k, 1});
       StrideScaleB dSB = cutlass::make_cute_packed_stride(
           InternalStrideScaleB{}, {N, scale_k, 1});
 

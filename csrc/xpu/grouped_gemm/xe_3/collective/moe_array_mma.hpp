@@ -204,7 +204,8 @@ struct CollectiveMma<
       Arguments const& mainloop_params,
       int next_group,
       ProblemShape_MNKL const& problem_shape_mnkl,
-      int64_t expert_first_token_offset) {
+      int64_t expert_first_token_offset,
+      int64_t /*expert_first_scale_offset*/ = 0) {
     const int32_t M = get<0>(problem_shape_mnkl);
     const int32_t N = get<1>(problem_shape_mnkl);
     const int32_t K = get<2>(problem_shape_mnkl);

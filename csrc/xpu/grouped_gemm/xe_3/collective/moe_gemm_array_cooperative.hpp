@@ -303,10 +303,17 @@ class GemmUniversal<
     bool did_group_change = true;
     int32_t curr_group = -1;
     int64_t expert_first_token_offset = 0;
+    // Cumulative per-expert M padded up to 4 elements. Used to derive the
+    // per-expert MXFP scale-A pointer / stride so that each expert's scale
+    // block satisfies the 4-byte surface-width alignment required by the
+    // 2D block load in PR #570.
+    int64_t expert_first_scale_offset = 0;
     int32_t offset_group = 0;
     auto advance_offset_to = [&](int32_t target) {
       while (offset_group < target) {
-        expert_first_token_offset += params.rows_per_expert[offset_group];
+        int32_t rows = params.rows_per_expert[offset_group];
+        expert_first_token_offset += rows;
+        expert_first_scale_offset += (rows + 3) & ~int32_t(3);
         ++offset_group;
       }
     };
@@ -347,7 +354,8 @@ class GemmUniversal<
                 params.mainloop,
                 curr_group,
                 problem_shape_MNKL,
-                expert_first_token_offset),
+                expert_first_token_offset,
+                expert_first_scale_offset),
             params.workspace);
       }
       auto tile_coord = make_coord(m_coord, n_coord, _, 0);

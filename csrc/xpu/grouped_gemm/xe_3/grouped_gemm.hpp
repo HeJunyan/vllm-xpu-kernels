@@ -78,21 +78,25 @@ at::Tensor grouped_gemm_func(
   } else if (
       A_dtype == at::kFloat8_e4m3fn && ptr_A_scale &&
       ptr_A_scale->dtype() == at::kFloat8_e8m0fnu) {
+    // After cutlass PR #570 the optimized block-scaled MXFP mainloop
+    // handles unaligned M directly (the 2D scale loader rounds the
+    // surface width up to 4-byte alignment internally), so we no longer
+    // need the scalar scale-load fallback.
     if (avg_tokens_cnt > 32) {
-      using moe_policy = grouped_gemm::moe_mxfp8_unaligned_policy;
+      using moe_policy = grouped_gemm::moe_mxfp8_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);
     } else {
-      using moe_policy = grouped_gemm::moe_mxfp8_unaligned_mid_policy;
+      using moe_policy = grouped_gemm::moe_mxfp8_mid_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);
     }
   } else if (
       A_dtype == at::kFloat4_e2m1fn_x2 && ptr_A_scale &&
       ptr_A_scale->dtype() == at::kFloat8_e8m0fnu) {
     if (avg_tokens_cnt > 32) {
-      using moe_policy = grouped_gemm::moe_mxfp4_unaligned_policy;
+      using moe_policy = grouped_gemm::moe_mxfp4_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);
     } else {
-      using moe_policy = grouped_gemm::moe_mxfp4_unaligned_mid_policy;
+      using moe_policy = grouped_gemm::moe_mxfp4_mid_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);
     }
   } else if (

@@ -600,15 +600,32 @@ def quant_mxfp_act(x, recipe):
 
 
 def reorder_mxfp_scales(A_scales, rows_per_expert):
-    A_scale_k = torch.empty_like(A_scales)
-    cumu_m = 0
-    for gm in rows_per_expert.tolist():
-        if gm != 0:
-            cur_slice = A_scale_k[cumu_m:cumu_m + gm, :].view_as(
-                A_scales[cumu_m:cumu_m + gm, :].transpose(-1, -2))
-            cur_slice.copy_(A_scales[cumu_m:cumu_m + gm, :].transpose(
-                -1, -2).contiguous())
-            cumu_m += gm
+    # After cutlass-sycl PR #570, the optimized mxfp mainloop requires per-expert
+    # scale-A surface width (M dim, since scale is MN-major) to be a multiple of
+    # 4 (ScaleAlignElems for 8-bit scales). Pad each expert's M up to a multiple
+    # of 4 with zeros so the cumulative scale offsets used by the grouped-gemm
+    # kernel (sum of round_up_4(rows)) remain aligned.
+    rows_list = rows_per_expert.tolist()
+    scale_k = A_scales.shape[1]
+    padded_rows = [(r + 3) & ~3 for r in rows_list]
+    total_padded = sum(padded_rows)
+    A_scale_k = torch.zeros((total_padded, scale_k),
+                            dtype=A_scales.dtype,
+                            device=A_scales.device)
+    src_off = 0
+    dst_off = 0
+    for r, pr in zip(rows_list, padded_rows):
+        if r != 0:
+            # Each expert's slice is stored MN-major (column-major along M) with
+            # leading dim = pr. View the (pr, scale_k) row-major slice as
+            # (scale_k, pr) and write the transposed source into columns [0:r].
+            dst_block = A_scale_k[dst_off:dst_off + pr, :]
+            view = dst_block.view(scale_k, pr)
+            src = A_scales[src_off:src_off + r, :].transpose(-1,
+                                                             -2).contiguous()
+            view[:, :r] = src
+        src_off += r
+        dst_off += pr
     return A_scale_k
 
 
