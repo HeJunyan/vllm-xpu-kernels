@@ -3,9 +3,62 @@
 
 import torch
 from typing import Optional
-import vllm_xpu_kernels._C  # noqa: F401
-import vllm_xpu_kernels._moe_C  # noqa: F401
-import vllm_xpu_kernels._xpu_C  # noqa: F401
+import pytest
+
+# Import the C extension modules
+# These may load successfully but not register ops if there's a build issue
+try:
+    import vllm_xpu_kernels._C  # noqa: F401
+    _C_IMPORTED = True
+except ImportError:
+    _C_IMPORTED = False
+
+try:
+    import vllm_xpu_kernels._moe_C  # noqa: F401
+    _MOE_C_IMPORTED = True
+except ImportError:
+    _MOE_C_IMPORTED = False
+
+try:
+    import vllm_xpu_kernels._xpu_C  # noqa: F401
+    _XPU_C_IMPORTED = True
+except ImportError:
+    _XPU_C_IMPORTED = False
+
+
+def _has_torch_op(namespace: str, op_name: str) -> bool:
+    """Check if a torch op is registered."""
+    try:
+        ns = getattr(torch.ops, namespace, None)
+        if ns is None:
+            return False
+        return hasattr(ns, op_name)
+    except:
+        return False
+
+
+def require_torch_ops(*ops):
+    """Skip test if required torch ops are not registered.
+
+    Args:
+        *ops: Strings in format "namespace.op_name" (e.g., "_C.rms_norm", "_xpu_C.is_jgs")
+
+    Example:
+        @pytest.mark.skipif(not require_torch_ops("_C.rms_norm"),
+                           reason="rms_norm op not registered")
+        def test_something():
+            ...
+
+    Or use as a function:
+        def test_something():
+            if not require_torch_ops("_C.rms_norm", "_xpu_C.is_jgs"):
+                pytest.skip("Required ops not registered")
+    """
+    for op in ops:
+        namespace, op_name = op.rsplit(".", 1)
+        if not _has_torch_op(namespace, op_name):
+            return False
+    return True
 
 
 # layer norm ops

@@ -1019,6 +1019,24 @@ _QWEN3_235B_A22B_PROFILE = {
 }
 
 # ---------------------------------------------------------------------------
+# WAN 2.2 model (video generation)
+#   - Tests under tests/wan_ut/ for WAN-specific kernels and operations
+#   - Includes BF16 ops, MXFP8 quantized GEMM
+#   - torch_compile tests are collected but skipped via pytestmark
+# ---------------------------------------------------------------------------
+_WAN_PROFILE = {
+    "tests/wan_ut/test_wan22_kernels_ops_bf16.py": {
+        "default": {},
+    },
+    "tests/wan_ut/test_wan22_mxfp8_ops.py": {
+        "default": {},
+    },
+    "tests/wan_ut/test_wan22_torch_compile.py": {
+        "default": {},
+    },
+}
+
+# ---------------------------------------------------------------------------
 # Registry of all on-demand profiles
 # ---------------------------------------------------------------------------
 ONDEMAND_PROFILES = {
@@ -1027,4 +1045,5 @@ ONDEMAND_PROFILES = {
     "deepseek": _DEEPSEEK_PROFILE,
     "qwen3_30b_a3b": _QWEN3_30B_A3B_PROFILE,
     "qwen3_235b_a22b": _QWEN3_235B_A22B_PROFILE,
+    "wan": _WAN_PROFILE,
 }

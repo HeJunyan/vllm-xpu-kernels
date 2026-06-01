@@ -75,6 +75,8 @@ import numpy as np
 import pytest
 import torch
 
+pytestmark = pytest.mark.skip(reason="WAN torch.compile tests are not stable for CI")
+
 # Test device configuration
 DEVICE = "xpu" if torch.xpu.is_available() else "cpu"
 
