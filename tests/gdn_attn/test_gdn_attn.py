@@ -178,44 +178,64 @@ def ref_gdn_attention(
         else:
             conv_state_batch = torch.zeros_like(conv_state[0])
 
-        print ("\n\n\033[4;31m!!!!@ @@@@@@ ref_gdn_attention \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
-            "/// batch is :", batch, " conv_state_batch is :", conv_state_batch.shape)
+        print ("\n\n\033[4;31m!!!!@ ref_gdn_attention loop \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// batch is :", batch, " conv_state_batch is :", conv_state_batch.shape, " non_spec_state_indices_tensor[batch] is :", non_spec_state_indices_tensor[batch])
 
         batch_start_id = non_spec_query_start_loc[batch]
         batch_end_id = non_spec_query_start_loc[batch + 1]
         batch_num_tokens = batch_end_id - batch_start_id
+        print ("\033[4;31m!!!!@ ref_gdn_attention loop \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// batch_start_id is :", batch_start_id.item(), " batch_end_id is :", batch_end_id.item(), " batch_num_tokens is :", batch_num_tokens.item())
 
         qkv_batch = qkv[batch_start_id:batch_end_id]
         qkv_conv_input = torch.cat([conv_state_batch, qkv_batch], dim=0)
+        print ("\033[4;31m!!!!@ ref_gdn_attention loop \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// qkv_batch is :", qkv_batch.shape, "  qkv_conv_input is :", qkv_conv_input.shape)
+
         conv_state[non_spec_state_indices_tensor[batch]] = qkv_conv_input[
             batch_num_tokens:]
 
         qkv_conv_input = qkv_conv_input.transpose(0, 1).unsqueeze(0)
+        print ("\033[4;31m!!!!@ ref_gdn_attention loop @@@    \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// qkv_conv_input is :", qkv_conv_input.shape, "   conv_weights is :", conv_weights.shape)
 
         qkv_conv_out = F.conv1d(qkv_conv_input.to(torch.float32),
                                 conv_weights.unsqueeze(1).to(torch.float32),
                                 conv_bias,
                                 padding=0,
                                 groups=qkv_elems_size)
+        print ("\033[4;31m!!!!@ ref_gdn_attention loop ----  \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// qkv_conv_out is :", qkv_conv_out.shape)
+
         qkv_conv_out = (qkv_conv_out if activation is None else
                         F.silu(qkv_conv_out)).to(dtype=dtype)
         qkv_conv_out = qkv_conv_out.transpose(-2, -1).reshape(
             batch_num_tokens, qkv_elems_size)
+        print ("\033[4;31m!!!!@ ref_gdn_attention loop ----#########  \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// qkv_conv_out is :", qkv_conv_out.shape)
 
         split_arg_list_qkv = [
             num_k_heads // tp_size * head_k_dim,
             num_k_heads // tp_size * head_k_dim,
             num_k_heads // tp_size * num_v_heads // num_k_heads * head_v_dim,
         ]
+        print ("\033[4;31m!!!!@ ref_gdn_attention loop \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// split_arg_list_qkv is :", split_arg_list_qkv)
+
         (q_out, k_out, v_out) = torch.split(qkv_conv_out,
                                             split_arg_list_qkv,
                                             dim=-1)
+        print ("\033[4;31m!!!!@ ref_gdn_attention loop \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// q_out is :", q_out.shape, " k_out is :", k_out.shape, " v_out is :", v_out.shape)
+
         q_out = q_out.reshape(batch_num_tokens, num_k_heads // tp_size,
                               head_k_dim)
         k_out = k_out.reshape(batch_num_tokens, num_k_heads // tp_size,
                               head_k_dim)
         v_out = v_out.reshape(batch_num_tokens, num_v_heads // tp_size,
                               head_v_dim)
+        print ("\033[4;31m!!!!@ ref_gdn_attention loop  ============  \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// q_out is :", q_out.shape, " k_out is :", k_out.shape, " v_out is :", v_out.shape)
 
         if has_initial_state[batch]:
             ssm_state_batch = ssm_state[
@@ -225,6 +245,9 @@ def ref_gdn_attention(
         else:
             ssm_state_batch = torch.zeros_like(ssm_state[0],
                                                dtype=torch.float32)
+
+        print ("\033[4;31m!!!!@ ref_gdn_attention loop  ============  \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// ssm_state_batch is :", ssm_state_batch.shape)
 
         # ------------------------------------------------------------------
         # Hoist all per-token elementwise work out of the recurrence loop.
@@ -237,6 +260,8 @@ def ref_gdn_attention(
         beta_batch = torch.sigmoid(b_batch)  # [T, NV]
         g_batch = torch.exp(A_log_exp *
                             softplus(a_batch + dt_bias))  # [T, NV]
+        print ("\033[4;31m!!!!@ ref_gdn_attention loop \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// g_batch is :", g_batch.shape)
 
         q_all = q_out.to(torch.float32)  # [T, NK, Hk]
         k_all = k_out.to(torch.float32)
@@ -258,6 +283,9 @@ def ref_gdn_attention(
                               dtype=torch.float32,
                               device=core_attn_out.device)
 
+        print ("\033[4;31m!!!!@ ref_gdn_attention loop \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// out_buf is :", out_buf.shape)
+
         # O(t) = S(t) * q(t)
         # S(t) = g(t)*S(t - 1) + (v(t) - g(t)*S(t - 1)*k(t))*beta(t)*k(t)
         for token_id in range(batch_num_tokens):
@@ -266,12 +294,17 @@ def ref_gdn_attention(
             q_t = q_all[token_id]  # [NV, Hk]
             k_t = k_all[token_id]  # [NV, Hk]
             v_t = v_all[token_id]  # [NV, Hv]
+            print ("\033[4;31m!!!!@ ref_gdn_attention loop *************  \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+                "/// g_t is :", g_t.shape, " beta_t is :", beta_t.shape,
+                " q_t is :", q_t.shape, " k_t is :", k_t.shape, " v_t is :", v_t.shape)
 
             ssm_state_batch *= g_t.unsqueeze(-1).unsqueeze(-1)
 
             # kv_mem_t[v, h] = sum_k S[v, h, k] * k_t[v, k]
             kv_mem_t = torch.einsum("vhk,vk->vh", ssm_state_batch, k_t)
             delta_t = (v_t - kv_mem_t) * beta_t.unsqueeze(-1)  # [NV, Hv]
+            print ("\033[4;31m!!!!@ ref_gdn_attention loop ()()()()((_))  \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+                "/// kv_mem_t is :", kv_mem_t.shape, " delta_t is :", delta_t.shape)
 
             # outer product update: S[v, h, k] += delta[v, h] * k_t[v, k]
             ssm_state_batch.add_(
@@ -414,10 +447,15 @@ def test_gdn_attention(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
         "/// perm is : ", perm.shape, perm)
 
     shuffled_tensor = token_batches[perm]
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// shuffled_tensor is : ", shuffled_tensor.shape, shuffled_tensor)
     non_spec_query_start_loc = torch.cat([
         torch.zeros([1], device=device),
         torch.cumsum(shuffled_tensor, dim=0)
     ]).to(torch.int32)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// non_spec_query_start_loc is : ", non_spec_query_start_loc.shape, non_spec_query_start_loc)
+
     has_initial_state = perm >= num_decodes
     print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
         "/// has_initial_state is :", has_initial_state.shape, has_initial_state)
