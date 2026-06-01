@@ -4,6 +4,7 @@
 import math
 import os
 import random
+import sys
 
 import pytest
 import torch
@@ -13,8 +14,8 @@ import vllm_xpu_kernels._xpu_C  # noqa: F401
 from tests.utils import format_tc
 
 # QWEN NEXT shape
-NUM_TOKENS = [1, 32, 1024, 8192]
-BATCH_SIZE = [32]
+NUM_TOKENS = [1, 4, 32, 1024, 8192]
+BATCH_SIZE = [4]
 NUM_K_HEADS = [16]
 NUM_K_DIMS = [128]
 NUM_V_HEADS = [32]
@@ -109,12 +110,21 @@ def ref_gdn_attention(
         num_v_heads // num_k_heads,
         num_v_heads // num_k_heads,
     ]
+
     projected_states_ba = projected_states_ba.reshape(
         num_actual_tokens, num_k_heads // tp_size,
         (2 * num_v_heads // num_k_heads))
+    print ("\033[4;32m!!!!@  ref_gdn_attention \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// projected_states_ba is :", projected_states_ba.shape)
+
     (b, a) = torch.split(projected_states_ba, split_arg_list_ba, dim=-1)
+    print ("\033[4;32m!!!!@  ref_gdn_attention \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// b is :", b.shape, "/// a is :", a.shape)
+
     b = b.reshape(num_actual_tokens, num_v_heads // tp_size)
     a = a.reshape(num_actual_tokens, num_v_heads // tp_size)
+    print ("\033[4;32m!!!!@ 222 ref_gdn_attention \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// b is :", b.shape, "/// a is :", a.shape)
 
     split_arg_list_qkvz = [
         head_k_dim,
@@ -125,9 +135,16 @@ def ref_gdn_attention(
     projected_states_qkvz = projected_states_qkvz.reshape(
         num_actual_tokens, num_k_heads // tp_size,
         (2 * head_k_dim + 2 * num_v_heads // num_k_heads * head_v_dim))
+    print ("\033[4;32m!!!!@ ref_gdn_attention \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// projected_states_qkvz is :", projected_states_qkvz.shape)
+
     (q_split, k_split, v_split, z_spilt) = torch.split(projected_states_qkvz,
                                                        split_arg_list_qkvz,
                                                        dim=-1)
+    print ("\033[4;32m!!!!@ ref_gdn_attention \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// q_split is :", q_split.shape, " k_split is :", k_split.shape,
+        " v_split is :", v_split.shape, " z_split is :", z_spilt.shape)
+
     q_split = q_split.reshape(num_actual_tokens,
                               num_k_heads // tp_size * head_k_dim)
     k_split = k_split.reshape(num_actual_tokens,
@@ -135,10 +152,18 @@ def ref_gdn_attention(
     v_split = v_split.reshape(
         num_actual_tokens,
         num_k_heads // tp_size * num_v_heads // num_k_heads * head_v_dim)
+    print ("\033[4;32m!!!!@ @@@@@@ ref_gdn_attention \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// q_split is :", q_split.shape, " k_split is :", k_split.shape,
+        " v_split is :", v_split.shape)
+
+
     qkv = torch.cat((q_split, k_split, v_split), dim=-1).reshape(
         num_actual_tokens, num_k_heads // tp_size *
         (2 * head_k_dim + num_v_heads // num_k_heads * head_v_dim))
     qkv_elems_size = qkv.shape[-1]
+    print ("\033[4;32m!!!!@ @@@@@@ ref_gdn_attention \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// qkv is :", qkv.shape, " qkv_elems_size is :", qkv_elems_size)
+
     z.copy_(
         z_spilt.reshape(num_actual_tokens, num_v_heads // tp_size, head_v_dim))
 
@@ -152,6 +177,9 @@ def ref_gdn_attention(
             conv_state_batch = conv_state[non_spec_state_indices_tensor[batch]]
         else:
             conv_state_batch = torch.zeros_like(conv_state[0])
+
+        print ("\n\n\033[4;31m!!!!@ @@@@@@ ref_gdn_attention \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// batch is :", batch, " conv_state_batch is :", conv_state_batch.shape)
 
         batch_start_id = non_spec_query_start_loc[batch]
         batch_end_id = non_spec_query_start_loc[batch + 1]
@@ -295,6 +323,14 @@ def test_gdn_attention(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
     torch.manual_seed(42)
     ssm_state_dtype = torch.float32 if ssm_state_is_fp32 else dtype
 
+    print ("\033[4;34m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// num_actual_tokens is :", num_actual_tokens, " batch_size is :", batch_size,
+        " num_k_heads is :", num_k_heads, " head_k_dim is :", head_k_dim,
+        " num_v_heads is :", num_v_heads, " head_v_dim is :", head_v_dim,
+        " width is :", width, " tp_size is :", tp_size,
+        " has_bias is :", has_bias, " activation is :", activation,
+        " reorder_input is :", reorder_input, " mode is :", mode,
+        " dtype is :", dtype, " ssm_state_is_fp32 is :", ssm_state_is_fp32)
     assert head_k_dim == head_v_dim
 
     if batch_size > num_actual_tokens:
@@ -317,6 +353,9 @@ def test_gdn_attention(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
         2 * head_k_dim + 2 * head_v_dim * num_v_heads // num_k_heads)
     mixed_ba_size = num_k_heads // tp_size * (2 * num_v_heads // num_k_heads)
 
+    print ("\033[4;34m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// mixed_qkvz_size is :", mixed_qkvz_size, " mixed_ba_size is :", mixed_ba_size)
+
     projected_states_qkvz = torch.randn((num_actual_tokens, mixed_qkvz_size),
                                         dtype=dtype,
                                         device=device)
@@ -324,17 +363,26 @@ def test_gdn_attention(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
                                       dtype=dtype,
                                       device=device)
 
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// projected_states_qkvz is :", projected_states_qkvz.shape, " projected_states_ba is :", projected_states_ba.shape)
+
     mixed_qkv_size = num_k_heads // tp_size * (
         2 * head_k_dim + head_v_dim * num_v_heads // num_k_heads)
     conv_state = torch.randn((cache_batch_size, width - 1, mixed_qkv_size),
                              dtype=dtype,
                              device=device)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// mixed_qkv_size is :", mixed_qkv_size, " conv_state is :", conv_state.shape)
+
     ref_conv_state = conv_state.clone()
     ssm_state = torch.randn(
         (cache_batch_size, num_v_heads // tp_size, head_v_dim, head_k_dim),
         dtype=ssm_state_dtype,
         device=device)
     ref_ssm_state = ssm_state.clone()
+
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// ref_ssm_state is :", ref_ssm_state.shape)
 
     conv_weights = torch.randn((mixed_qkv_size, width),
                                dtype=dtype,
@@ -343,26 +391,39 @@ def test_gdn_attention(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
     if has_bias:
         conv_bias = torch.randn((mixed_qkv_size), dtype=dtype, device=device)
 
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// conv_weights is :", conv_weights.shape, " conv_bias is :", conv_bias.shape if has_bias else conv_bias)
+
     A_log = torch.randn((num_v_heads // tp_size),
                         dtype=torch.float32,
                         device=device)
     dt_bias = torch.randn((num_v_heads // tp_size), dtype=dtype, device=device)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// A_log is :", A_log.shape, " dt_bias is :", dt_bias.shape)
 
     prefill_batches = simple_random_distribute(num_actual_tokens - num_decodes,
                                                batch_size - num_decodes)
     token_batches = torch.cat([torch.ones([num_decodes]),
                                prefill_batches]).to(device)
     perm = torch.randperm(token_batches.size(0)).to(device)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// prefill_batches is :", prefill_batches.shape, " token_batches is :", token_batches.shape, " perm is : ", perm.shape)
+
     shuffled_tensor = token_batches[perm]
     non_spec_query_start_loc = torch.cat([
         torch.zeros([1], device=device),
         torch.cumsum(shuffled_tensor, dim=0)
     ]).to(torch.int32)
     has_initial_state = perm >= num_decodes
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// has_initial_state is :", has_initial_state.shape, has_initial_state)
+
     non_spec_state_indices_tensor = torch.tensor(random.sample(
         range(cache_batch_size), batch_size),
                                                  device=device,
                                                  dtype=torch.int32)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// non_spec_state_indices_tensor is :", non_spec_state_indices_tensor.shape)
 
     core_attn_out = torch.zeros(
         (num_actual_tokens, num_v_heads // tp_size, head_v_dim),
@@ -370,6 +431,9 @@ def test_gdn_attention(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
         device=device,
     )
     z = torch.empty_like(core_attn_out)
+
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// core_attn_out is :", core_attn_out.shape, "   z is :", z.shape)
 
     torch.ops._xpu_C.gdn_attention(
         core_attn_out,
