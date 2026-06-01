@@ -14,8 +14,8 @@ import vllm_xpu_kernels._xpu_C  # noqa: F401
 from tests.utils import format_tc
 
 # QWEN NEXT shape
-NUM_TOKENS = [1, 4, 32, 1024, 8192]
-BATCH_SIZE = [4]
+NUM_TOKENS = [1, 8, 32, 1024, 8192]
+BATCH_SIZE = [8]
 NUM_K_HEADS = [16]
 NUM_K_DIMS = [128]
 NUM_V_HEADS = [32]
@@ -407,7 +407,11 @@ def test_gdn_attention(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
                                prefill_batches]).to(device)
     perm = torch.randperm(token_batches.size(0)).to(device)
     print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
-        "/// prefill_batches is :", prefill_batches.shape, " token_batches is :", token_batches.shape, " perm is : ", perm.shape)
+        "/// prefill_batches is :", prefill_batches.shape, prefill_batches)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// token_batches is :", token_batches.shape, token_batches)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// perm is : ", perm.shape, perm)
 
     shuffled_tensor = token_batches[perm]
     non_spec_query_start_loc = torch.cat([
@@ -423,7 +427,7 @@ def test_gdn_attention(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
                                                  device=device,
                                                  dtype=torch.int32)
     print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
-        "/// non_spec_state_indices_tensor is :", non_spec_state_indices_tensor.shape)
+        "/// non_spec_state_indices_tensor is :", non_spec_state_indices_tensor.shape, non_spec_state_indices_tensor)
 
     core_attn_out = torch.zeros(
         (num_actual_tokens, num_v_heads // tp_size, head_v_dim),
