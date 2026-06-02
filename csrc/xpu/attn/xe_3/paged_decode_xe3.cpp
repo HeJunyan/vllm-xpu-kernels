@@ -32,6 +32,8 @@ void cutlass_paged_decode_xe3(
     bool is_sink,
     int num_kv_splits,
     std::optional<const at::Tensor>& is_prefill) {
+  std::optional<at::Tensor> splits_per_seq_empty;
+  std::optional<at::Tensor> work_list_empty;
   cutlass_paged_decode_impl(
       queue,
       query,
@@ -58,7 +60,9 @@ void cutlass_paged_decode_xe3(
       is_local,
       is_sink,
       num_kv_splits,
-      is_prefill);
+      is_prefill,
+      splits_per_seq_empty,
+      work_list_empty);
 }
 
 void cutlass_paged_decode_impl(
@@ -88,7 +92,9 @@ void cutlass_paged_decode_impl(
     bool is_local,
     bool is_sink,
     int num_kv_splits,
-    std::optional<const at::Tensor>& is_prefill) {
+    std::optional<const at::Tensor>& is_prefill,
+    std::optional<at::Tensor>& splits_per_seq,
+    std::optional<at::Tensor>& work_list) {
   bool is_fp8_kv = key_cache.scalar_type() == at::ScalarType::Float8_e5m2 ||
                    key_cache.scalar_type() == at::ScalarType::Float8_e4m3fn;
   if (is_fp8_kv) {
@@ -170,8 +176,10 @@ void cutlass_paged_decode_impl(
       is_causal,
       is_local,
       is_sink,
-      false, // is_interleaved_kv_cache
       num_kv_splits,
+      nullptr,  // splits_per_seq
+      nullptr,  // work_list
+      0,        // total_wgs
       // KV cache strides
       key_cache.stride(0),
       key_cache.stride(1),

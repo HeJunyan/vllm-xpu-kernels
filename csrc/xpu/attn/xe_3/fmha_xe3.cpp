@@ -108,8 +108,6 @@ void cutlass_chunk_prefill_impl(
     num_heads_kv = key_cache.size(2);
     max_blocks_per_seq = block_table.size(1);
     total_seqlen_k = num_blocks * block_size;
-
-    is_interleaved_kv = is_interleaved_kv_cache(key_cache, value_cache);
   }
 
   if (is_local) {
@@ -154,8 +152,7 @@ void cutlass_chunk_prefill_impl(
       is_paged,   // paged
       is_causal,
       is_local,
-      is_sink,
-      is_interleaved_kv};
+      is_sink};
 
   // softmax_lse output is only supported on the
   // !Paged && !Local && !Sink specialization (template-constrained to
