@@ -2,6 +2,7 @@
 // FIXME: reuse chunk_prefill from xe2 now
 #include "csrc/xpu/attn/xe_2/chunk_prefill_utils.hpp"
 #include "csrc/xpu/attn/xe_2/chunk_prefill_extern.hpp"
+#include "csrc/xpu/attn/paged_kv_utils.h"
 
 void cutlass_chunk_prefill_xe3(
     sycl::queue& queue,
@@ -219,6 +220,22 @@ void cutlass_chunk_prefill_impl(
       args.v_stride_seq = value_cache.stride(2);
       args.v_stride_heads = value_cache.stride(1);
       args.v_stride_batch = value_cache.stride(0);
+    }
+  }
+
+  // For non-contiguous paged KV (e.g., cross-layer KV cache), enlarge
+  // total_seqlen_k to cover the full physical extent for the 2D block
+  // load surface descriptor. Without this, block loads for blocks at
+  // higher physical addresses would return zeros. The page_stride_elements
+  // is also required by the paged index computation in the shared xe_2
+  // mainloop; leaving it at 0 makes every paged block resolve to block 0.
+  if (is_paged) {
+    args.page_stride_elements =
+        static_cast<int>(get_paged_kv_cache_page_stride_elements(key_cache));
+    int64_t effective_total =
+        get_paged_kv_cache_effective_total_seqlen(key_cache);
+    if (effective_total > args.total_seqlen_k) {
+      args.total_seqlen_k = static_cast<int>(effective_total);
     }
   }
 
