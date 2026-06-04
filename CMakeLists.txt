@@ -94,7 +94,60 @@ option(XPU_SPECIFIC_KERNELS_ENABLED
        "Build XPU-specific kernels (_xpu_C extension)" ON)
 option(XPUMEM_ALLOCATOR_ENABLED "Build xpumem_allocator extension" ON)
 
-message(STATUS "")
+# KERNEL CONFIGURATION — controls which paged decode kernel variants are
+# compiled. Use model-specific configs to dramatically reduce compile time. See
+# csrc/xpu/attn/kernel_configs/ for available presets.
+set(VLLM_PAGED_DECODE_CONFIG
+    ""
+    CACHE
+      STRING
+      "Path to paged decode kernel config (empty=default, or filename like paged_decode_full.conf)"
+)
+
+# Resolve shorthand config names to full paths
+if(VLLM_PAGED_DECODE_CONFIG AND NOT IS_ABSOLUTE "${VLLM_PAGED_DECODE_CONFIG}")
+  # Allow e.g. "paged_decode_full.conf" or "paged_decode_full"
+  if(NOT VLLM_PAGED_DECODE_CONFIG MATCHES "\\.conf$")
+    set(VLLM_PAGED_DECODE_CONFIG "${VLLM_PAGED_DECODE_CONFIG}.conf")
+  endif()
+  set(VLLM_PAGED_DECODE_CONFIG
+      "${CMAKE_CURRENT_SOURCE_DIR}/csrc/xpu/attn/kernel_configs/${VLLM_PAGED_DECODE_CONFIG}"
+  )
+endif()
+
+# Default to full config if not specified
+if(NOT VLLM_PAGED_DECODE_CONFIG OR "${VLLM_PAGED_DECODE_CONFIG}" STREQUAL "")
+  set(VLLM_PAGED_DECODE_CONFIG
+      "${CMAKE_CURRENT_SOURCE_DIR}/csrc/xpu/attn/kernel_configs/paged_decode_full.conf"
+  )
+endif()
+
+# KERNEL CONFIGURATION — controls which chunk prefill kernel variants are
+# compiled. Use model-specific configs to reduce compile time.
+set(VLLM_CHUNK_PREFILL_CONFIG
+    ""
+    CACHE
+      STRING
+      "Path to chunk prefill kernel config (empty=default, or filename like chunk_prefill_full.conf)"
+)
+
+# Resolve shorthand config names to full paths
+if(VLLM_CHUNK_PREFILL_CONFIG AND NOT IS_ABSOLUTE "${VLLM_CHUNK_PREFILL_CONFIG}")
+  if(NOT VLLM_CHUNK_PREFILL_CONFIG MATCHES "\\.conf$")
+    set(VLLM_CHUNK_PREFILL_CONFIG "${VLLM_CHUNK_PREFILL_CONFIG}.conf")
+  endif()
+  set(VLLM_CHUNK_PREFILL_CONFIG
+      "${CMAKE_CURRENT_SOURCE_DIR}/csrc/xpu/attn/kernel_configs/${VLLM_CHUNK_PREFILL_CONFIG}"
+  )
+endif()
+
+# Default to full config if not specified
+if(NOT VLLM_CHUNK_PREFILL_CONFIG OR "${VLLM_CHUNK_PREFILL_CONFIG}" STREQUAL "")
+  set(VLLM_CHUNK_PREFILL_CONFIG
+      "${CMAKE_CURRENT_SOURCE_DIR}/csrc/xpu/attn/kernel_configs/chunk_prefill_full.conf"
+  )
+endif()
+
 message(STATUS "Kernel build configuration:")
 message(STATUS "  BUILD_SYCL_TLA_KERNELS       = ${BUILD_SYCL_TLA_KERNELS}")
 message(STATUS "  VLLM_XPU_ENABLE_XE2          = ${VLLM_XPU_ENABLE_XE2}")
@@ -109,6 +162,8 @@ message(STATUS "  MQA_LOGITS_KERNELS_ENABLED   = ${MQA_LOGITS_KERNELS_ENABLED}")
 message(
   STATUS "  XPU_SPECIFIC_KERNELS_ENABLED = ${XPU_SPECIFIC_KERNELS_ENABLED}")
 message(STATUS "  XPUMEM_ALLOCATOR_ENABLED     = ${XPUMEM_ALLOCATOR_ENABLED}")
+message(STATUS "  VLLM_PAGED_DECODE_CONFIG     = ${VLLM_PAGED_DECODE_CONFIG}")
+message(STATUS "  VLLM_CHUNK_PREFILL_CONFIG    = ${VLLM_CHUNK_PREFILL_CONFIG}")
 message(STATUS "")
 
 if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
@@ -346,11 +401,11 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
   # when building.
   if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
-    # Bumped to PR #570 (libraries.ai.cutlass.internal) which improves
-    # MXFP4/8 perf when M is unaligned by folding the scalar scale-load
-    # fallback into the regular optimized block-scaled mainloop (the
-    # 2D scale loader now rounds the surface width up to 4-byte alignment
-    # internally). Built on top of PR #549 / v0.1.0_next.
+    # Bumped to PR #570 (libraries.ai.cutlass.internal) which improves MXFP4/8
+    # perf when M is unaligned by folding the scalar scale-load fallback into
+    # the regular optimized block-scaled mainloop (the 2D scale loader now
+    # rounds the surface width up to 4-byte alignment internally). Built on top
+    # of PR #549 / v0.1.0_next.
     set(CUTLASS_REVISION
         "71ddc8dc059d24bf26158be87c868d1f11b07b69"
         CACHE STRING "CUTLASS revision to use")

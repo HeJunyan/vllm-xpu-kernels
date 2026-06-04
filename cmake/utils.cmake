@@ -571,8 +571,9 @@ function(add_xe2_kernel_library LIBRARY_NAME)
 
   # Set include directories
   target_include_directories(
-    ${LIBRARY_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
-                           ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    ${LIBRARY_NAME}
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..
+           ${CMAKE_CURRENT_BINARY_DIR})
 
   # Optionally add CMAKE_SOURCE_DIR
   if(ARG_INCLUDE_CMAKE_SOURCE_DIR)
@@ -644,8 +645,9 @@ function(add_xe3_kernel_library LIBRARY_NAME)
 
   # Set include directories
   target_include_directories(
-    ${LIBRARY_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
-                           ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    ${LIBRARY_NAME}
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..
+           ${CMAKE_CURRENT_BINARY_DIR})
 
   # Optionally add CMAKE_SOURCE_DIR
   if(ARG_INCLUDE_CMAKE_SOURCE_DIR)
@@ -658,7 +660,7 @@ function(add_xe3_kernel_library LIBRARY_NAME)
     PRIVATE ${SYCL_TLA_KERNELS_COMPILE_FLAGS} -fPIC -Wno-c++20-extensions
             -Wno-intel-compat -Wno-pragma-once-outside-header)
   target_compile_definitions(${LIBRARY_NAME} PRIVATE -DSYCL_INTEL_TARGET=35)
-  if (BUILD_ON_NVL)
+  if(BUILD_ON_NVL)
     target_compile_definitions(${LIBRARY_NAME} PRIVATE -DVLLM_GRF_SIZE=256)
   else()
     target_compile_definitions(${LIBRARY_NAME} PRIVATE -DVLLM_GRF_SIZE=512)
@@ -680,14 +682,20 @@ function(add_xe3_kernel_library LIBRARY_NAME)
 
   # Set link options for XE3 devices
   set(XE3_GPU_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
-  if (BUILD_ON_NVL)
+  if(BUILD_ON_NVL)
     list(
-      APPEND XE3_GPU_LINK_FLAGS -Xsycl-target-backend=spir64_gen
-      "-device ${XE3_AOT_DEVICES} -internal_options -cl-intel-256-GRF-per-thread")
+      APPEND
+      XE3_GPU_LINK_FLAGS
+      -Xsycl-target-backend=spir64_gen
+      "-device ${XE3_AOT_DEVICES} -internal_options -cl-intel-256-GRF-per-thread"
+    )
   else()
     list(
-      APPEND XE3_GPU_LINK_FLAGS -Xsycl-target-backend=spir64_gen
-      "-device ${XE3_AOT_DEVICES} -internal_options -cl-intel-512-GRF-per-thread")
+      APPEND
+      XE3_GPU_LINK_FLAGS
+      -Xsycl-target-backend=spir64_gen
+      "-device ${XE3_AOT_DEVICES} -internal_options -cl-intel-512-GRF-per-thread"
+    )
   endif()
   target_link_options(${LIBRARY_NAME} PRIVATE ${XE3_GPU_LINK_FLAGS})
 endfunction()
@@ -764,8 +772,10 @@ function(add_xe4_kernel_library LIBRARY_NAME)
       "-Xsxe-enable-phi-uniform"
       "-Xsxe-enable-texp-overlap")
   list(
-    APPEND XE4_GPU_LINK_FLAGS
-    "-device ${XE4_AOT_DEVICES} -options -ze-intel-xe-features=+set-abarrier-arrive-lmc,+disable-misched,+total-grf-num-96,+null-dst")
+    APPEND
+    XE4_GPU_LINK_FLAGS
+    "-device ${XE4_AOT_DEVICES} -options -ze-intel-xe-features=+set-abarrier-arrive-lmc,+disable-misched,+total-grf-num-96,+null-dst"
+  )
   target_link_options(${LIBRARY_NAME} PRIVATE ${XE4_GPU_LINK_FLAGS})
 endfunction()
 
