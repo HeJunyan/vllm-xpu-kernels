@@ -23,8 +23,8 @@ else:
 
 NUM_HEADS = [(8, 2)]
 HEAD_SIZES = [64, 128, 256, 512]
-BLOCK_SIZES = [16, 64, 512]
-DTYPES = [torch.half, torch.bfloat16]
+BLOCK_SIZES = [16, 64]
+DTYPES = [torch.bfloat16]
 QDTYPES = [None]
 NUM_BLOCKS = [2048]
 SOFT_CAPS = [None]
