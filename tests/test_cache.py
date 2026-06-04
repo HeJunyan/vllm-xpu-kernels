@@ -956,12 +956,12 @@ def test_swap_blocks_mla(
     opcheck(
         torch.ops._C_cache_ops.swap_blocks,
         (_to_kernel(src_cache), _to_kernel(dst_cache), block_size_in_bytes,
-         _to_kernel(block_mapping_tensor)),
+         block_mapping_tensor),
         test_utils=DEFAULT_OPCHECK_TEST_UTILS,
     )
 
     ops.swap_blocks(_to_kernel(src_cache), _to_kernel(dst_cache),
-                    block_size_in_bytes, _to_kernel(block_mapping_tensor))
+                    block_size_in_bytes, block_mapping_tensor)
 
     for src, dst in block_mapping:
         torch.testing.assert_close(

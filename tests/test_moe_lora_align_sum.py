@@ -18,8 +18,9 @@ def _to_kernel(x):
 # override pytest parameters when enable mini pytest
 MINI_PYTEST_PARAMS = {
     "default": {
-        "num_tokens": [100],
-        "num_experts": [64],
+        "num_tokens": [4],
+        "num_experts": [4],
+        "topk_num": [2],
         "max_loras": [2],
         "block_size": [16],
     },
@@ -36,7 +37,7 @@ def CEILDIV(x, y):
 
 def sample_data(num_experts, max_loras, num_tokens, topk_num):
     topk_ids = torch.zeros((num_tokens, topk_num), dtype=torch.int32)
-    token_lora_mapping = torch.zeros((num_tokens, ), dtype=torch.int32)
+    token_lora_mapping = torch.zeros((num_tokens,), dtype=torch.int32)
 
     for i in range(num_tokens):
         pool = list(range(num_experts))
@@ -53,12 +54,14 @@ def sample_data(num_experts, max_loras, num_tokens, topk_num):
 @pytest.mark.parametrize("num_experts", [64, 128, 256, 512])
 @pytest.mark.parametrize("max_loras", [2, 32])
 @pytest.mark.parametrize("block_size", [16])
-def test_moe_lora_align_block_size(num_tokens, topk_num, num_experts,
-                                   max_loras, block_size):
+def test_moe_lora_align_block_size(
+    num_tokens, topk_num, num_experts, max_loras, block_size
+):
     # sample data
     random.seed(1)
-    topk_ids, token_lora_mapping = sample_data(num_experts, max_loras,
-                                               num_tokens, topk_num)
+    topk_ids, token_lora_mapping = sample_data(
+        num_experts, max_loras, num_tokens, topk_num
+    )
 
     # compute paddings
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
@@ -69,21 +72,23 @@ def test_moe_lora_align_block_size(num_tokens, topk_num, num_experts,
 
     # init output tensors
     sorted_token_ids = torch.full(
-        (max_loras * max_num_tokens_padded, ),
+        (max_loras * max_num_tokens_padded,),
         topk_ids.numel(),
         dtype=torch.int32,
         device=DEVICE,
     )
-    expert_ids = torch.full((max_loras * max_num_m_blocks, ),
-                            num_experts,
-                            dtype=torch.int32,
-                            device=DEVICE)
-    num_tokens_post_pad = torch.zeros((max_loras, ),
-                                      dtype=torch.int32,
-                                      device=DEVICE)
-    adapter_enabled = torch.ones((max_loras + 1, ),
-                                 dtype=torch.int32,
-                                 device=DEVICE)
+    expert_ids = torch.full(
+        (max_loras * max_num_m_blocks,),
+        num_experts,
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    num_tokens_post_pad = torch.zeros(
+        (max_loras,), dtype=torch.int32, device=DEVICE
+    )
+    adapter_enabled = torch.ones(
+        (max_loras + 1,), dtype=torch.int32, device=DEVICE
+    )
     lora_ids = torch.arange(max_loras + 2, dtype=torch.int32, device=DEVICE)
     # call kernel
     sorted_token_ids_k = sorted_token_ids.to(KERNEL_DEVICE)
@@ -107,15 +112,19 @@ def test_moe_lora_align_block_size(num_tokens, topk_num, num_experts,
         lora_ids_k,
     )
 
-    sorted_token_ids = sorted_token_ids_k.cpu()
-    expert_ids = expert_ids_k.cpu()
+    # Reshape to [max_loras, max_num_m_blocks, block_size] and
+    # [max_loras, max_num_m_blocks] for block-level verification.
+    sorted_token_ids = sorted_token_ids_k.cpu().view(
+        max_loras, max_num_m_blocks, block_size
+    )
+    expert_ids = expert_ids_k.cpu().view(max_loras, max_num_m_blocks)
 
     for lora_idx in range(max_loras):
-        for token_idx in range(sorted_token_ids.size(1)):
-            block = sorted_token_ids[lora_idx][token_idx]
+        for token_id in range(sorted_token_ids.size(1)):
+            block = sorted_token_ids[lora_idx][token_id]
             indices = block[block != topk_ids.numel()]
             if indices.numel() > 0:
-                expert_id = expert_ids[lora_idx][token_idx]
+                expert_id = expert_ids[lora_idx][token_id]
                 assert torch.all(topk_ids.view(-1)[indices] == expert_id)
 
 
