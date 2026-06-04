@@ -6,14 +6,6 @@ from tests.ops.topk_op import (fused_topk_sigmoid, fused_topk_softmax,
                                topk_sigmoid, topk_softmax)
 from tests.utils import format_tc, seed_everything
 
-DEVICE = "cpu"
-KERNEL_DEVICE = "xpu"
-
-
-def _to_kernel(x):
-    return None if x is None else x.to(KERNEL_DEVICE)
-
-
 #override pytest parameters when enable mini pytest
 MINI_PYTEST_PARAMS = {
     "default": {
@@ -36,11 +28,11 @@ def test_fused_topk_softmax(n_token: int, n_hidden: int, n_expert: int,
                             topk: int, renormalize: bool, has_bias: bool,
                             dtype: torch.dtype):
     seed_everything(0)
-    hidden_states = torch.randn((n_token, n_hidden), dtype=dtype, device=DEVICE)
-    gating_output = torch.randn((n_token, n_expert), dtype=dtype, device=DEVICE)
+    hidden_states = torch.randn((n_token, n_hidden), dtype=dtype, device="xpu")
+    gating_output = torch.randn((n_token, n_expert), dtype=dtype, device="xpu")
     bias = None
     if has_bias:
-        bias = torch.randn((n_expert, ), dtype=torch.float32, device=DEVICE)
+        bias = torch.randn((n_expert, ), dtype=torch.float32, device="xpu")
 
     baseline_topk_weights, baseline_topk_ids = topk_softmax(
         hidden_states=hidden_states,
@@ -50,13 +42,11 @@ def test_fused_topk_softmax(n_token: int, n_hidden: int, n_expert: int,
         bias=bias)
 
     test_topk_weights, test_topk_ids = fused_topk_softmax(
-        hidden_states=_to_kernel(hidden_states),
-        gating_output=_to_kernel(gating_output),
+        hidden_states=hidden_states,
+        gating_output=gating_output,
         topk=topk,
         renormalize=renormalize,
-        bias=_to_kernel(bias))
-    test_topk_weights = test_topk_weights.cpu()
-    test_topk_ids = test_topk_ids.cpu()
+        bias=bias)
 
     torch.testing.assert_close(baseline_topk_weights,
                                test_topk_weights,
@@ -82,11 +72,11 @@ def test_fused_topk_sigmoid(n_token: int, n_hidden: int, n_expert: int,
                             topk: int, renormalize: bool, has_bias: bool,
                             dtype: torch.dtype):
     seed_everything(0)
-    hidden_states = torch.randn((n_token, n_hidden), dtype=dtype, device=DEVICE)
-    gating_output = torch.randn((n_token, n_expert), dtype=dtype, device=DEVICE)
+    hidden_states = torch.randn((n_token, n_hidden), dtype=dtype, device="xpu")
+    gating_output = torch.randn((n_token, n_expert), dtype=dtype, device="xpu")
     bias = None
     if has_bias:
-        bias = torch.randn((n_expert, ), dtype=torch.float32, device=DEVICE)
+        bias = torch.randn((n_expert, ), dtype=torch.float32, device="xpu")
 
     baseline_topk_weights, baseline_topk_ids = topk_sigmoid(
         hidden_states=hidden_states,
@@ -96,13 +86,11 @@ def test_fused_topk_sigmoid(n_token: int, n_hidden: int, n_expert: int,
         bias=bias)
 
     test_topk_weights, test_topk_ids = fused_topk_sigmoid(
-        hidden_states=_to_kernel(hidden_states),
-        gating_output=_to_kernel(gating_output),
+        hidden_states=hidden_states,
+        gating_output=gating_output,
         topk=topk,
         renormalize=renormalize,
-        bias=_to_kernel(bias))
-    test_topk_weights = test_topk_weights.cpu()
-    test_topk_ids = test_topk_ids.cpu()
+        bias=bias)
 
     torch.testing.assert_close(baseline_topk_weights,
                                test_topk_weights,
