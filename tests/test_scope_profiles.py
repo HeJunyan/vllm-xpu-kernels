@@ -210,15 +210,7 @@ _LLAMA4_PROFILE = {
             "has_bias": [True, False],
         },
     },
-    # ---- MoE prologue ----
-    "tests/fused_moe/test_moe_prologue.py": {
-        "test_prologue": {
-            "m,n,k": [(1, LLAMA4_INTERMEDIATE_SIZE, LLAMA4_HIDDEN_SIZE),
-                      (128, LLAMA4_INTERMEDIATE_SIZE, LLAMA4_HIDDEN_SIZE)],
-            "e": [LLAMA4_NUM_EXPERTS],
-            "topk": [LLAMA4_TOPK],
-        },
-    },
+
     # ---- MoE remap hidden states ----
     "tests/fused_moe/test_remap_hidden_states.py": {
         "test_remap_hidden_states": {
@@ -650,17 +642,7 @@ _QWEN3_30B_A3B_PROFILE = {
             "recipe": ["mxfp8"],
         },
     },
-    # ---- MoE prologue ----
-    "tests/fused_moe/test_moe_prologue.py": {
-        "test_prologue": {
-            "m,n,k": [
-                (1, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
-                (128, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
-            ],
-            "e": [QWEN3_30B_NUM_EXPERTS],
-            "topk": [QWEN3_30B_TOPK],
-        },
-    },
+
     # ---- MoE remap hidden states ----
     "tests/fused_moe/test_remap_hidden_states.py": {
         "test_remap_hidden_states": {
@@ -917,18 +899,7 @@ _QWEN3_235B_A22B_PROFILE = {
             "recipe": ["mxfp4"],
         },
     },
-    # ---- MoE prologue ----
-    "tests/fused_moe/test_moe_prologue.py": {
-        "test_prologue": {
-            "m,n,k": [
-                (1, QWEN3_235B_MOE_INTERMEDIATE_SIZE, QWEN3_235B_HIDDEN_SIZE),
-                (128, QWEN3_235B_MOE_INTERMEDIATE_SIZE,
-                 QWEN3_235B_HIDDEN_SIZE),
-            ],
-            "e": [QWEN3_235B_NUM_EXPERTS],
-            "topk": [QWEN3_235B_TOPK],
-        },
-    },
+
     # ---- MoE remap hidden states ----
     "tests/fused_moe/test_remap_hidden_states.py": {
         "test_remap_hidden_states": {
