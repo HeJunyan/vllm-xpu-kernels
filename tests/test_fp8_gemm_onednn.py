@@ -108,10 +108,11 @@ def test_fp8_gemm_w8a16(fp8_dtype, out_dtype, trans_wei, is_mbk, batch,
         weight = torch.ones([k, n], dtype=out_dtype).to(DEVICE)
     scale_wei = torch.tensor(4.0).to(DEVICE)
 
-    weight_fp8, _ = scaled_fp8_quant(weight,
-                                     scale_wei,
+    weight_fp8, _ = scaled_fp8_quant(weight.to(KERNEL_DEVICE),
+                                     scale_wei.to(KERNEL_DEVICE),
                                      fp8_dtype=fp8_dtype,
                                      group_shape=(-1, 1))
+    weight_fp8 = weight_fp8.cpu()
     weight_fp8_hp = weight_fp8.to(out_dtype) * scale_wei.to(out_dtype)
 
     # reference fp16 gemm
@@ -153,10 +154,14 @@ def test_fp8_gemm_per_tensor(fp8_dtype, out_dtype, is_nt, batch, mnk_factors):
     scale_src = torch.tensor(4.0).to(DEVICE)
     scale_wei = torch.tensor(4.0).to(DEVICE)
 
-    input_fp8, _ = scaled_fp8_quant(input.reshape(-1, k),
-                                    scale_src,
+    input_fp8, _ = scaled_fp8_quant(input.reshape(-1, k).to(KERNEL_DEVICE),
+                                    scale_src.to(KERNEL_DEVICE),
                                     fp8_dtype=fp8_dtype)
-    weight_fp8, _ = scaled_fp8_quant(weight, scale_wei, fp8_dtype=fp8_dtype)
+    input_fp8 = input_fp8.cpu()
+    weight_fp8, _ = scaled_fp8_quant(weight.to(KERNEL_DEVICE),
+                                     scale_wei.to(KERNEL_DEVICE),
+                                     fp8_dtype=fp8_dtype)
+    weight_fp8 = weight_fp8.cpu()
 
     input_fp8_hp = input_fp8.to(out_dtype) * scale_src.to(out_dtype)
     weight_fp8_hp = weight_fp8.to(out_dtype) * scale_wei.to(out_dtype)
@@ -195,12 +200,16 @@ def test_fp8_gemm_per_channel(fp8_dtype, out_dtype, is_nt, batch, mnk_factors):
         [batch, m, k], dtype=out_dtype, device=DEVICE) / 10.0
     weight = torch.randn([n, k], dtype=out_dtype).to(DEVICE) / 10.0
 
-    input_fp8, scale_src_fp8 = scaled_fp8_quant(input.reshape(-1, k),
-                                                use_per_token_if_dynamic=True,
-                                                fp8_dtype=fp8_dtype)
-    weight_fp8, scale_wei_fp8 = scaled_fp8_quant(weight,
+    input_fp8, scale_src_fp8 = scaled_fp8_quant(input.reshape(-1, k).to(KERNEL_DEVICE),
+                                               use_per_token_if_dynamic=True,
+                                               fp8_dtype=fp8_dtype)
+    input_fp8 = input_fp8.cpu()
+    scale_src_fp8 = scale_src_fp8.cpu()
+    weight_fp8, scale_wei_fp8 = scaled_fp8_quant(weight.to(KERNEL_DEVICE),
                                                  use_per_token_if_dynamic=True,
                                                  fp8_dtype=fp8_dtype)
+    weight_fp8 = weight_fp8.cpu()
+    scale_wei_fp8 = scale_wei_fp8.cpu()
 
     # reference fp16 gemm
     input_fp8_hp = input_fp8.to(out_dtype) * scale_src_fp8.to(out_dtype)
@@ -240,9 +249,11 @@ def test_fp8_gemm_w8a16_per_channel(fp8_dtype, out_dtype, is_nt, is_mbk, batch,
         [batch, m, k], dtype=out_dtype, device=DEVICE) / 10.0
     weight = torch.randn([n, k], dtype=out_dtype).to(DEVICE) / 10.0
 
-    weight_fp8, scale_wei_fp8 = scaled_fp8_quant(weight,
+    weight_fp8, scale_wei_fp8 = scaled_fp8_quant(weight.to(KERNEL_DEVICE),
                                                  use_per_token_if_dynamic=True,
                                                  fp8_dtype=fp8_dtype)
+    weight_fp8 = weight_fp8.cpu()
+    scale_wei_fp8 = scale_wei_fp8.cpu()
     # scale_wei_fp8 is [n, 1], flatten to [n] for per-channel scale
     scale_wei_flat = scale_wei_fp8.flatten()
 
