@@ -7,6 +7,28 @@ import torch
 
 import tests.register_ops as ops
 
+import numpy as np
+def numpy_topk(arr, k, dim=-1, largest=True, sorted=True):
+    device = arr.device if isinstance(arr, torch.Tensor) else "cpu"
+    if isinstance(arr, torch.Tensor):
+        arr = arr.to("cpu").numpy()
+
+    shape = [1] * arr.ndim
+    shape[dim] = arr.shape[dim]
+    indices = np.broadcast_to(np.arange(arr.shape[dim]).reshape(shape), arr.shape)
+
+    if largest:
+        order = np.lexsort((indices, -arr), axis=dim)
+    else:
+        order = np.lexsort((indices, arr), axis=dim)
+
+    top_order = np.take(order, np.arange(k), axis=dim)
+    idx = top_order
+    values = np.take_along_axis(arr, top_order, axis=dim)
+
+    return (torch.from_numpy(np.ascontiguousarray(values)).to(device),
+            torch.from_numpy(np.ascontiguousarray(idx)).to(device))
+
 
 def topk_softmax(
     hidden_states: torch.Tensor,
@@ -20,10 +42,10 @@ def topk_softmax(
     routing_weights = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
     if bias is not None:
         routing_weights_with_bias = routing_weights + bias.unsqueeze(0)
-        _, topk_ids = torch.topk(routing_weights_with_bias, topk, dim=-1)
+        _, topk_ids = numpy_topk(routing_weights_with_bias, topk, dim=-1)
         topk_weights = routing_weights.gather(1, topk_ids)
     else:
-        topk_weights, topk_ids = torch.topk(routing_weights, topk, dim=-1)
+        topk_weights, topk_ids = numpy_topk(routing_weights, topk, dim=-1)
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -42,10 +64,10 @@ def topk_sigmoid(
     routing_weights = torch.sigmoid(gating_output).to(torch.float32)
     if bias is not None:
         routing_weights_with_bias = routing_weights + bias.unsqueeze(0)
-        _, topk_ids = torch.topk(routing_weights_with_bias, topk, dim=-1)
+        _, topk_ids = numpy_topk(routing_weights_with_bias, topk, dim=-1)
         topk_weights = routing_weights.gather(1, topk_ids)
     else:
-        topk_weights, topk_ids = torch.topk(routing_weights, topk, dim=-1)
+        topk_weights, topk_ids = numpy_topk(routing_weights, topk, dim=-1)
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
