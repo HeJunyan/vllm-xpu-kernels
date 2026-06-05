@@ -72,6 +72,7 @@ def test_silu_and_mul_quant(
     x_cpu = x
     scale_cpu = scale
     ref_out = ref_silu_and_mul_quant(x_cpu, scale_cpu, fp8_dtype)
+    ref_out = ref_out.to(KERNEL_DEVICE)
 
     # Fused kernel
     d = x.shape[-1] // 2
