@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+from typing import Optional
 
 import torch
 
@@ -157,7 +158,8 @@ class XpuFusedMoe:
         is_int4=False,
         is_mxfp4=False,
         is_mxfp8=False,
-        is_block_fp8=False
+        is_block_fp8=False,
+        gemm1_clamp_limit: Optional[float] = None,
     ):
         # 4bits support [E, N, K]
         # other types [E, K, N]
@@ -209,6 +211,7 @@ class XpuFusedMoe:
         self.is_mxfp4 = is_mxfp4
         self.is_mxfp8 = is_mxfp8
         self.is_block_fp8 = is_block_fp8
+        self.gemm1_clamp_limit = gemm1_clamp_limit
         self.recipe = _get_recipe(is_fp8, is_mxfp8, is_mxfp4, is_int4,
                                    is_block_fp8)
         self._use_ref = _should_use_ref_fused_moe(is_mxfp8)
@@ -290,7 +293,8 @@ class XpuFusedMoe:
                             ep_rank=self.ep_rank,
                             ep_size=self.ep_size,
                             expert_map=expert_map,
-                            a1q_scale=a1q_scale)
+                            a1q_scale=a1q_scale,
+                            gemm1_clamp_limit=self.gemm1_clamp_limit)
 
     def _apply_kernel(
         self,
@@ -368,6 +372,13 @@ class XpuFusedMoe:
             num_experts=self.num_experts,
             is_B_int4=self.is_int4,
             is_B_mxfp4=self.is_mxfp4)
+
+        # Apply swiglu_limit clamping before activation
+        if self.gemm1_clamp_limit is not None and self.gemm1_clamp_limit > 0:
+            gate = gemm1_output[:, :self.inter_size]
+            up = gemm1_output[:, self.inter_size:]
+            gate.clamp_(max=self.gemm1_clamp_limit)
+            up.clamp_(min=-self.gemm1_clamp_limit, max=self.gemm1_clamp_limit)
 
         # act
         act_output = torch.empty(
@@ -521,7 +532,8 @@ def xpu_fused_moe(hidden_states,
                   is_int4=False,
                   is_mxfp4=False,
                   is_mxfp8=False,
-                  is_block_fp8=False):
+                  is_block_fp8=False,
+                  gemm1_clamp_limit: Optional[float] = None):
     '''
     hidden_states: [num_rows, hidden_size]
     w13: [num_experts, 2*inter_size, hidden_size]
@@ -574,7 +586,8 @@ def xpu_fused_moe(hidden_states,
                             activation=activation,
                             num_experts=num_experts,
                             ep_rank=ep_rank,
-                            ep_size=ep_size)
+                            ep_size=ep_size,
+                            gemm1_clamp_limit=gemm1_clamp_limit)
         output.copy_(out)
         return output
 
@@ -702,6 +715,13 @@ def xpu_fused_moe(hidden_states,
         num_experts=num_experts,
         is_B_int4=is_int4,
         is_B_mxfp4=is_mxfp4)
+
+    # Apply swiglu_limit clamping before activation
+    if gemm1_clamp_limit is not None and gemm1_clamp_limit > 0:
+        gate = gemm1_output[:, :inter_size]
+        up = gemm1_output[:, inter_size:]
+        gate.clamp_(max=gemm1_clamp_limit)
+        up.clamp_(min=-gemm1_clamp_limit, max=gemm1_clamp_limit)
 
     inter_size_scale = 2 if activation == "relu2_no_mul" else 1
     # act

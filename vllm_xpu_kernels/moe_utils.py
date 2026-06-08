@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+from typing import Optional
+
 import torch
 
 from . import _C  # noqa: F401
@@ -257,6 +259,7 @@ def ref_fused_moe(recipe,
                   ep_size=1,
                   expert_map=None,
                   a1q_scale=None,
+                  gemm1_clamp_limit: Optional[float] = None,
 ):
     """
     Reference fused MoE implementation with quantization simulation.
@@ -369,6 +372,12 @@ def ref_fused_moe(recipe,
             out_i = out_i + w13_bias[i].to(compute_dtype)
         gemm1_output[offset:offset + n_tokens] = out_i
         offset += n_tokens
+
+    # Apply swiglu_limit clamping before activation
+    if gemm1_clamp_limit is not None and gemm1_clamp_limit > 0:
+        gemm1_output[:, :inter_size].clamp_(max=gemm1_clamp_limit)
+        gemm1_output[:, inter_size:].clamp_(min=-gemm1_clamp_limit,
+                                            max=gemm1_clamp_limit)
 
     # ---- activation (unchanged from _apply_kernel) ----
     inter_size_scale = 2 if activation == "relu2_no_mul" else 1
