@@ -60,10 +60,18 @@ inline at::Tensor grouped_gemm_func(
   } else if (A_dtype == at::kBFloat16) {
     using moe_policy = grouped_gemm::moe_bf16_policy;
     CALL_KERNEL_WITH_POLICY(moe_policy);
+  } else if (A_dtype == at::kFloat8_e4m3fn && ptr_A_scale &&
+             ptr_A_scale->dtype() == at::kFloat8_e8m0fnu) {
+    using moe_policy = grouped_gemm::moe_mxfp8_policy;
+    CALL_KERNEL_WITH_POLICY(moe_policy);
+  } else if (A_dtype == at::kFloat4_e2m1fn_x2 && ptr_A_scale &&
+             ptr_A_scale->dtype() == at::kFloat8_e4m3fn) {
+    using moe_policy = grouped_gemm::moe_nvfp4_policy;
+    CALL_KERNEL_WITH_POLICY(moe_policy);
   } else {
     TORCH_CHECK(
         false,
-        "grouped_gemm_func only supports FP16/BF16"
+        "grouped_gemm_func only supports FP16/BF16/MXFP8/NVFP4"
         " dtypes, but got: ",
         A_dtype);
   }

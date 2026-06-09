@@ -335,7 +335,9 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
         -fsycl-targets=pisa
         "-Xsze-intel-xe-features=+set-abarrier-arrive-lmc,+disable-misched,+null-dst"
         "-Xsxe-enable-phi-uniform"
-        "-Xsxe-enable-texp-overlap")
+        "-Xsxe-enable-texp-overlap"
+        "-Xsswsb-allocation"
+        "-Xsdstcache=3")
   else()
     set(SYCL_DEVICE_LINK_FLAGS
         ${SYCL_DEVICE_LINK_FLAGS}
@@ -410,15 +412,45 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
         "71ddc8dc059d24bf26158be87c868d1f11b07b69"
         CACHE STRING "CUTLASS revision to use")
   elseif(BUILD_ON_SIMULATOR_JGS)
-    # update on WW11 by Yizhou, this commit id is latest from master_next branch
+    # Bumped to latest master_next (provides Xe4BlockScaledConfig, XE4_ADMA_LOAD,
+    # and bs_op_selector required by the low-precision (mxfp8/nvfp4) grouped GEMM
+    # vendored from xiaoli/low_precision_moe_grouped_gemm.
+    # PR #563 (dynamic descriptor update) is merged into this revision.
     # TODO: switch to a release tag/version in future
     set(CUTLASS_REVISION
-        "ed1502f86b8baa7a84275c85597d06ecf5254d84"
+        "a69377d32b088b620527bc83f8a4d10cd5b38067"
         CACHE STRING "CUTLASS revision to use")
   else()
     set(CUTLASS_REVISION
         "cd763790ad2f74d7294435ecf77682bac0062c3a"
         CACHE STRING "CUTLASS revision to use")
+  endif()
+
+  if(BUILD_ON_SIMULATOR_JGS)
+    # PR #563 (dynamic descriptor update) is now merged into master_next at the
+    # pinned revision above. Apply PR #605 (Fix XE4 ADMA alignment validation for
+    # SYCL device builds) which is still under review. The patch is fetched at
+    # configure time from the GitHub API into the build directory; it is NOT
+    # stored in this repository.
+    set(_PR605_PATCH_URL
+        "https://api.github.com/repos/intel-innersource/libraries.ai.cutlass.internal/pulls/605")
+    set(_PR605_PATCH_FILE "${CMAKE_BINARY_DIR}/cutlass-pr-605.patch")
+    file(DOWNLOAD "${_PR605_PATCH_URL}" "${_PR605_PATCH_FILE}"
+         HTTPHEADER "Accept: application/vnd.github.v3.patch"
+         NETRC OPTIONAL
+         STATUS _pr605_download_status)
+    list(GET _pr605_download_status 0 _pr605_download_err)
+    if(NOT _pr605_download_err EQUAL 0)
+      message(FATAL_ERROR
+        "Failed to download CUTLASS PR #605 patch: ${_pr605_download_status}\n"
+        "URL: ${_PR605_PATCH_URL}\n"
+        "Ensure ~/.netrc has a valid GitHub token for api.github.com.")
+    endif()
+    set(_VLLM_CUTLASS_PATCH_CMD
+        git apply --whitespace=nowarn "${_PR605_PATCH_FILE}"
+        || git apply --reverse --check "${_PR605_PATCH_FILE}")
+  else()
+    set(_VLLM_CUTLASS_PATCH_CMD "")
   endif()
 
   if(DEFINED ENV{VLLM_CUTLASS_SRC_DIR})
@@ -445,6 +477,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
       # Please keep this in sync with CUTLASS_REVISION line above.
       GIT_TAG ${CUTLASS_REVISION}
       GIT_PROGRESS TRUE
+      PATCH_COMMAND ${_VLLM_CUTLASS_PATCH_CMD}
       # Speed up CUTLASS download by retrieving only the specified GIT_TAG
       # instead of   the history. Important: If GIT_SHALLOW is enabled then
       # GIT_TAG works only with branch names  and tags. So if the GIT_TAG above
@@ -564,8 +597,19 @@ if(BUILD_SYCL_TLA_KERNELS)
   endif()
   if(VLLM_XPU_ENABLE_XE4)
     # FIXME: we disabled xe4 sycl-tla kernel.
+    list(APPEND SYCL_TLA_KERNELS_COMPILE_FLAGS
+         "-D__SYCL_TARGET_INTEL_GPU_JGS__")
     add_subdirectory(csrc/xpu/attn/xe_4)
     add_subdirectory(csrc/xpu/grouped_gemm/xe_4)
+    # Reset link options for the scaled grouped_gemm kernels — the default xe4
+    # link flags (e.g. +total-grf-num-96, +disable-misched) cause runtime hangs
+    # for the block-scaled MXFP8/NVFP4 pipelines. Use Xiaoli's reference link
+    # flags from examples/xe4/scaled_grouped_gemm instead.
+    set_target_properties(grouped_gemm_xe_4 PROPERTIES LINK_OPTIONS "")
+    target_link_options(grouped_gemm_xe_4 PRIVATE
+        ${SYCL_LINK_FLAGS} -fsycl -fsycl-targets=pisa
+        -fsycl-max-parallel-link-jobs=16
+        "-device ${XE4_AOT_DEVICES}")
     list(APPEND ATTN_KERNEL_LIB_NAME "attn_kernels_xe_4")
     list(APPEND GROUPED_GEMM_LIB_NAME "grouped_gemm_xe_4")
     list(APPEND SYCL_TLA_COMPILE_OPTIONS -DVLLM_XPU_ENABLE_XE4)

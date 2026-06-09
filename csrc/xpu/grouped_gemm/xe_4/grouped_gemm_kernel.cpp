@@ -101,8 +101,8 @@ struct ElementScaleSelector {
 
 template <typename Gemm>
 struct ElementScaleSelector<Gemm, true> {
-  using A = typename Gemm::CollectiveMainloop::ElementScaleA;
-  using B = typename Gemm::CollectiveMainloop::ElementScaleB;
+  using A = typename Gemm::CollectiveMainloop::ElementSFA;
+  using B = typename Gemm::CollectiveMainloop::ElementSFB;
 };
 
 template <class Gemm, bool NeedScale, class KernelTag = Xe4GroupGemmKernel>
@@ -119,6 +119,7 @@ struct GroupedGemmRunner {
   using ElementScaleB = typename ElementScaleSelector<Gemm, NeedScale>::B;
 
   cutlass::DeviceAllocation<uint64_t> dynamic_counter;
+
   /// Populates a Gemm::Arguments structure from the given commandline options
   typename Gemm::Arguments args_from_options(
       const cutlass::KernelHardwareInfo& hw_info,
@@ -134,11 +135,11 @@ struct GroupedGemmRunner {
       int64_t groups,
       int block_size) {
     typename Gemm::Arguments arguments;
-    using RasterOrderOptions = typename cutlass::xe4_grouped_gemm::kernel::
-        PersistentTileSchedulerXe4Group::RasterOrderOptions;
 
     // Per-GEMM problem shape info may only exist on the device.
     if constexpr (!NeedScale) {
+      using RasterOrderOptions = typename cutlass::xe4_grouped_gemm::kernel::
+          PersistentTileSchedulerXe4Group::RasterOrderOptions;
       arguments = typename Gemm::Arguments{
           {ptr_A, ptr_B},
           {ptr_D},
@@ -166,19 +167,82 @@ struct GroupedGemmRunner {
       int64_t K,
       int64_t groups,
       int block_size) {
-    auto arguments = args_from_options(
-        hw_info,
+    if constexpr (!NeedScale) {
+      auto arguments = args_from_options(
+          hw_info,
+          rows_per_expert,
+          ptr_A,
+          ptr_A_scale,
+          ptr_B,
+          ptr_B_scale,
+          ptr_C,
+          ptr_D,
+          N,
+          K,
+          groups,
+          block_size);
+
+      auto params = Gemm::to_underlying_arguments(arguments);
+      dim3 const block = Gemm::get_block_shape();
+      dim3 const grid = Gemm::get_grid_shape(params);
+
+      const auto sycl_block = compat::dim3(block.x, block.y, block.z);
+      const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
+
+      Gemm kernel;
+
+      stream
+          .submit([&](sycl::handler& h) {
+            h.parallel_for<KernelTag>(
+                sycl::nd_range<3>{sycl_grid * sycl_block, sycl_block},
+                [=](sycl::nd_item<3> item) { kernel(params); });
+          })
+          .wait();
+    } else {
+      // Scaled (mxfp8 / nvfp4) path: Xiaoli's grouped GEMM expects per-group
+      // pointer/stride/problem-shape arrays.
+      run_scaled(
+          stream, hw_info, rows_per_expert, ptr_A, ptr_A_scale, ptr_B,
+          ptr_B_scale, ptr_D, N, K, groups, block_size);
+    }
+
+    return cutlass::Status::kSuccess;
+  }
+
+  template <bool Enable = NeedScale,
+            std::enable_if_t<Enable, int> = 0>
+  void run_scaled(
+      sycl::queue& stream,
+      const cutlass::KernelHardwareInfo& hw_info,
+      int const* rows_per_expert,
+      const ElementA* ptr_A,
+      const ElementScaleA* ptr_A_scale,
+      const ElementB* ptr_B,
+      const ElementScaleB* ptr_B_scale,
+      ElementOutput* ptr_D,
+      int64_t N,
+      int64_t K,
+      int64_t groups,
+      int block_size) {
+    using RasterOrderOptions = typename cutlass::xe4_scaled_grouped_gemm::
+        kernel::PersistentTileSchedulerXe4Group::RasterOrderOptions;
+
+    // Zero the dynamic scheduler counter on the stream (non-blocking; the
+    // GEMM kernel below is submitted on the same stream and so is ordered
+    // after this memset without any host wait).
+    dynamic_counter.reset(1);
+    auto* counter_p = dynamic_counter.get();
+    stream.memset(counter_p, 0, sizeof(uint64_t));
+
+    typename Gemm::Arguments arguments{
+        /*mainloop=*/{ptr_A, ptr_B, ptr_A_scale, ptr_B_scale, N, K},
+        /*epilogue=*/{ptr_D, N},
         rows_per_expert,
-        ptr_A,
-        ptr_A_scale,
-        ptr_B,
-        ptr_B_scale,
-        ptr_C,
-        ptr_D,
         N,
         K,
         groups,
-        block_size);
+        hw_info,
+        {1, RasterOrderOptions::AlongN, counter_p}};
 
     auto params = Gemm::to_underlying_arguments(arguments);
     dim3 const block = Gemm::get_block_shape();
@@ -189,15 +253,11 @@ struct GroupedGemmRunner {
 
     Gemm kernel;
 
-    stream
-        .submit([&](sycl::handler& h) {
-          h.parallel_for<KernelTag>(
-              sycl::nd_range<3>{sycl_grid * sycl_block, sycl_block},
-              [=](sycl::nd_item<3> item) { kernel(params); });
-        })
-        .wait();
-
-    return cutlass::Status::kSuccess;
+    stream.submit([&](sycl::handler& h) {
+      h.parallel_for<KernelTag>(
+          sycl::nd_range<3>{sycl_grid * sycl_block, sycl_block},
+          [=](sycl::nd_item<3> item) { kernel(params); });
+    });
   }
 };
 
@@ -269,7 +329,8 @@ INSTANTIATE_KERNEL(moe_bf16_policy)
 INSTANTIATE_KERNEL(moe_fp16_policy)
 /* INSTANTIATE_KERNEL(moe_fp16_decode_policy) */
 /* INSTANTIATE_KERNEL(moe_mxfp4_policy) */
-/* INSTANTIATE_KERNEL(moe_mxfp8_policy) */
+INSTANTIATE_KERNEL(moe_mxfp8_policy)
+INSTANTIATE_KERNEL(moe_nvfp4_policy)
 /* INSTANTIATE_KERNEL(moe_fp8block_policy) */
 
 }  // namespace grouped_gemm
