@@ -916,6 +916,17 @@ def test_gdn_attention_mtp(num_spec_decodes, num_spec_tokens, num_k_heads,
     num_actual_tokens = num_spec_decodes * K
     cache_batch_size = 200
 
+    print ("\033[4;34m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// num_actual_tokens is :", num_actual_tokens,
+        " num_k_heads is :", num_k_heads, " head_k_dim is :", head_k_dim,
+        " num_v_heads is :", num_v_heads, " head_v_dim is :", head_v_dim,
+        " width is :", width, " tp_size is :", tp_size,
+        " has_bias is :", has_bias, " activation is :", activation,
+        " reorder_input is :", reorder_input,
+        " dtype is :", dtype, " ssm_state_dtype is :", ssm_state_dtype,
+        " K is :", K, " num_spec_decodes is :", num_spec_decodes)
+
+
     mixed_qkvz_size = num_k_heads // tp_size * (
         2 * head_k_dim + 2 * head_v_dim * num_v_heads // num_k_heads)
     mixed_ba_size = num_k_heads // tp_size * (2 * num_v_heads // num_k_heads)
@@ -930,11 +941,17 @@ def test_gdn_attention_mtp(num_spec_decodes, num_spec_tokens, num_k_heads,
                                       mixed_ba_size,
                                       dtype=dtype,
                                       device=device)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// projected_states_qkvz is :", projected_states_qkvz.shape, " projected_states_ba is :", projected_states_ba.shape)
+
     conv_state = torch.randn(cache_batch_size,
                              width - 1,
                              mixed_qkv_size,
                              dtype=dtype,
                              device=device)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// mixed_qkv_size is :", mixed_qkv_size, " conv_state is :", conv_state.shape)
+
     ref_conv_state = conv_state.clone()
     ssm_state = torch.randn(cache_batch_size,
                             num_v_heads // tp_size,
@@ -943,34 +960,54 @@ def test_gdn_attention_mtp(num_spec_decodes, num_spec_tokens, num_k_heads,
                             dtype=ssm_state_dtype,
                             device=device)
     ref_ssm_state = ssm_state.clone()
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// ref_ssm_state is :", ref_ssm_state.shape)
+
     conv_weights = torch.randn(mixed_qkv_size,
                                width,
                                dtype=dtype,
                                device=device)
     conv_bias = (torch.randn(mixed_qkv_size, dtype=dtype, device=device)
                  if has_bias else None)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// conv_weights is :", conv_weights.shape, " conv_bias is :", conv_bias.shape if has_bias else conv_bias)
+
     A_log = torch.randn(num_v_heads // tp_size,
                         dtype=torch.float32,
                         device=device)
     dt_bias = torch.randn(num_v_heads // tp_size, dtype=dtype, device=device)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// A_log is :", A_log.shape, " dt_bias is :", dt_bias.shape)
 
     # Each spec seq owns K consecutive cache slots (cols 0..K-1).
     state_slots = random.sample(range(cache_batch_size), num_spec_decodes * K)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// state_slots is : ", state_slots)
     spec_state_indices_tensor = torch.tensor(state_slots,
                                              dtype=torch.int32,
                                              device=device).reshape(
                                                  num_spec_decodes, K)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// spec_state_indices_tensor is : ", spec_state_indices_tensor.shape, spec_state_indices_tensor)
     # Mix of acceptance counts including the 0 edge case.
     num_accepted_tokens = torch.tensor(
         [random.randint(0, K) for _ in range(num_spec_decodes)],
         dtype=torch.int32,
         device=device)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// num_accepted_tokens is : ", num_accepted_tokens.shape, num_accepted_tokens)
 
     # Shuffle global token positions across the K-tokens-per-seq layout.
     perm = torch.randperm(num_actual_tokens, device=device).to(torch.int32)
     spec_token_indx = perm.contiguous()
     spec_query_start_loc = (torch.arange(
         num_spec_decodes + 1, dtype=torch.int32, device=device) * K)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// perm is : ", perm.shape, perm)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// spec_query_start_loc is :", spec_query_start_loc.shape, spec_query_start_loc)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// spec_token_indx is :", spec_token_indx.shape, spec_token_indx)
 
     core_attn_out = torch.zeros(num_actual_tokens,
                                 num_v_heads // tp_size,
