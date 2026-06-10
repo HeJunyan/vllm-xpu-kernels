@@ -792,8 +792,18 @@ def ref_gdn_attention_spec(
         num_k_heads, num_v_heads, head_k_dim, head_v_dim, tp_size,
         reorder_input)
 
+    print ("\033[4;32m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// num_actual_tokens is :", num_actual_tokens,
+        " qkv_elems_size is :", qkv_elems_size,
+        " qkv is :", qkv.shape, " b is :", b.shape,
+        " a is :", a.shape, " b is :", b.shape,
+        " z_global is :", z_global.shape)
+
     # Scatter z into output at the spec token positions.
     spec_indx_long = spec_token_indx.to(torch.long)
+    print ("\033[4;32m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// spec_indx_long is :", spec_indx_long)
+
     z[spec_indx_long] = z_global[spec_indx_long]
 
     A_log_exp = -torch.exp(A_log)
@@ -813,15 +823,27 @@ def ref_gdn_attention_spec(
         assert end - start == K, (end - start, K)
         globals_ = spec_token_indx[start:end].to(torch.long)
 
+        print ("\n\033[4;36m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// n is :", n, " start is :", start, " end is :", end,
+            " globals_ is :", globals_.shape, globals_)
+
         naccepted = int(num_accepted_tokens[n].item())
         init_col = max(naccepted - 1, 0)
         init_slot = int(spec_state_indices_tensor[n, init_col].item())
         final_conv_slot = int(spec_state_indices_tensor[n, K - 1].item())
 
+        print ("\033[4;36m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// init_slot is :", init_slot, " final_conv_slot is :", final_conv_slot,
+            "  naccepted is :", naccepted)
+
         # ---- conv1d on the K gathered tokens (with Width-1 history) ----
         conv_state_batch = conv_state[init_slot].clone()
         qkv_batch = qkv[globals_]  # [K, qkv_elems]
         qkv_conv_input = torch.cat([conv_state_batch, qkv_batch], dim=0)
+        print ("\033[4;36m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// conv_state_batch is :", conv_state_batch.shape, " qkv_batch is :", qkv_batch.shape,
+            " qkv_conv_input is :", qkv_conv_input.shape)
+
         # Final conv state goes ONLY to the last cache slot.
         conv_state[final_conv_slot] = qkv_conv_input[-(width - 1):]
 
@@ -832,6 +854,9 @@ def ref_gdn_attention_spec(
                                 conv_bias_f,
                                 padding=0,
                                 groups=qkv_elems_size)
+        print ("\033[4;36m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+            "/// qkv_conv_in is :", qkv_conv_in.shape, " qkv_conv_out is :", qkv_conv_out.shape)
+
         qkv_conv_out = (qkv_conv_out if activation is None else
                         F.silu(qkv_conv_out)).to(dtype=dtype)
         qkv_conv_out = qkv_conv_out.transpose(-2, -1).reshape(
