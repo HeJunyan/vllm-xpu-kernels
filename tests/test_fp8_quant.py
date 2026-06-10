@@ -340,6 +340,8 @@ def test_per_block_fp8_quant(
                     device=DEVICE) + 1e-6)  # avoid nans
 
     ref_out, ref_scales = ref_per_block_quant(x, 1, group_size)
+    ref_out = ref_out.to(KERNEL_DEVICE)
+    ref_scales = ref_scales.to(KERNEL_DEVICE)
 
     ops_out, ops_scales = per_token_group_quant_fp8(
         _to_kernel(x),
@@ -348,8 +350,6 @@ def test_per_block_fp8_quant(
         use_ue8m0=False,
         column_major_scales=column_major_scale,
         tma_aligned_scales=tma_aligned_scale)
-    ops_out = ops_out.cpu()
-    ops_scales = ops_scales.cpu()
 
     assert torch.allclose(ref_out.float(),
                           ops_out.float(),
