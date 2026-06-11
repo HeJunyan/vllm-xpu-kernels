@@ -174,6 +174,8 @@ class CollectiveSoftmaxEpilogue {
   // Host side epilogue arguments
   struct Arguments {
     ElementAccum const softmax_scale; // 1/sqrt(head dim)
+    // Per-query-head softmax sink logits ([num_query_heads]); nullptr disables.
+    ElementS const* sm_sink = nullptr;
   };
 
   // Device side epilogue params
@@ -186,6 +188,7 @@ class CollectiveSoftmaxEpilogue {
     TiledCopyR2S_FinalRescaleO tiled_copy_r2s_final_rescale_o;
     ElementAccum const scale;
     ElementAccum const softmax_scale;
+    ElementS const* sm_sink;
   };
 
   static constexpr Params to_underlying_arguments(Arguments const& args) {
@@ -208,7 +211,8 @@ class CollectiveSoftmaxEpilogue {
         tiled_copy_s2r_final_rescale_o,
         tiled_copy_r2s_final_rescale_o,
         scale,
-        args.softmax_scale};
+        args.softmax_scale,
+        args.sm_sink};
   }
 
   CUTLASS_HOST_DEVICE
@@ -913,7 +917,10 @@ class CollectiveSoftmaxEpilogue {
       FragSmemO const& tRS_sO,
       const mat_desc_t& o_acc_desc,
       const mat_desc_t& o_desc,
-      FragSum& sum_reg) {
+      FragSum& sum_reg,
+      bool is_sink = false,
+      ElementS sink_val = ElementS(0),
+      ElementS const* max_reg = nullptr) {
     constexpr auto numRowsPerSubgroup = numRowsPerWarp;
     constexpr int O_tile_N = CUTE_STATIC_V(get<1>(TileShapePV_MNK{}));
     constexpr int numElemPerThread = O_tile_N / NumThreadPerRow;
@@ -945,6 +952,15 @@ class CollectiveSoftmaxEpilogue {
       // reduce the local sum cross threads in same row to get the global sum
       float global_sum = reduce_sum<numRowsPerSubgroup>(
           sg, worker_id, sum_reg[i], local_row_id);
+
+      // Softmax sink: augment the denominator with exp(sink - softmax_scale*max).
+      // max_reg[i] is the raw (unscaled) row max; params.scale = softmax_scale*log2e.
+      if (is_sink) {
+        constexpr double kLog2e = 1.4426950408889634074;
+        global_sum += sycl::native::exp2(
+            static_cast<float>(sink_val) * static_cast<float>(kLog2e) -
+            static_cast<float>(max_reg[i]) * params.scale);
+      }
 
       float scale = (global_sum == 0.f || global_sum != global_sum)
           ? 1.f
@@ -979,6 +995,15 @@ class CollectiveSoftmaxEpilogue {
       // reduce the local sum cross threads in same row to get the global sum
       float global_sum = reduce_sum<numRowsPerSubgroup>(
           sg, worker_id, sum_reg[i], local_row_id);
+
+      // Softmax sink: augment the denominator with exp(sink - softmax_scale*max).
+      // max_reg[i] is the raw (unscaled) row max; params.scale = softmax_scale*log2e.
+      if (is_sink) {
+        constexpr double kLog2e = 1.4426950408889634074;
+        global_sum += sycl::native::exp2(
+            static_cast<float>(sink_val) * static_cast<float>(kLog2e) -
+            static_cast<float>(max_reg[i]) * params.scale);
+      }
 
       float scale = 1.f / global_sum;
       for (int k = 0; k < numElemPerThread; ++k) {

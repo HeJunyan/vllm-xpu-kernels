@@ -145,7 +145,7 @@ MINI_PYTEST_PARAMS = {
         "block_size": [512],
         "window_size": [(-1, -1)],
         "is_paged": [True],
-        "is_sink": [False],
+        "is_sink": SINK,
         "is_casual": CASUAL,
         "fp8_dtype": [None],
     },

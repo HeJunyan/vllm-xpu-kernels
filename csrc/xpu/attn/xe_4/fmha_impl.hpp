@@ -61,6 +61,7 @@ struct KernelLauncher {
   using ElementV = typename GemmKernel::ElementV;
   using ElementAccum = typename GemmKernel::ElementAccum;
   using ElementO = typename GemmKernel::ElementOutput;
+  using ElementS = typename GemmKernel::ElementS;
 
   using StrideQ = typename GemmKernel::StrideQ;
   using StrideK = typename GemmKernel::StrideK;
@@ -216,7 +217,7 @@ struct KernelLauncher {
        args.total_seqlen_k,
        args.total_seqlen_q,
       },
-      {args.sm_scale},
+      {args.sm_scale, reinterpret_cast<const ElementS*>(args.sm_sink)},
       {o_ptr, stride_O, args.total_seqlen_q}
     };
 

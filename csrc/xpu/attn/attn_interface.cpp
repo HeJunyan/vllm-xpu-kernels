@@ -101,7 +101,6 @@ void cutlass_chunk_prefill_interface(
   else if (vllm::xpu::is_xe4_arch()) {
     // Use XE4 cutlass kernel
     TORCH_CHECK(!is_local, "XE4 sycl-tla kernel does not support local features currently.");
-    TORCH_CHECK(!is_sink, "XE4 sycl-tla kernel does not support sink features currently.");
     cutlass_chunk_prefill_xe4(
         queue,
         query,

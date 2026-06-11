@@ -984,6 +984,13 @@ struct CollectiveMmaAttention {
     // pair starts from X=0.
     int q_tile_local = get<0>(block_coord);
 
+    // Softmax sink: per-query-head logit added to the softmax denominator.
+    // Indexed by the query head this work-group is processing.
+    ElementS const* sm_sink = collective_softmax.get_params().sm_sink;
+    bool is_sink = sm_sink != nullptr;
+    ElementS sink_val =
+        is_sink ? sm_sink[get<3>(block_coord)] : ElementS(0);
+
     auto tiled_copy_s2r_update =
         collective_softmax.get_params().tiled_copy_s2r_update;
     auto thr_copy_s2r_update = tiled_copy_s2r_update.get_slice(worker_id);
@@ -1233,7 +1240,10 @@ struct CollectiveMmaAttention {
         tSR_sO(_, _, _0{}),
         tOsOacc,
         tOsO,
-        sum_reg[0]);
+        sum_reg[0],
+        is_sink,
+        sink_val,
+        max_reg[0]);
 
     pipeline_o.consumer_release(pipeline_o_consumer_state);
     ++pipeline_o_consumer_state;
@@ -1281,7 +1291,10 @@ struct CollectiveMmaAttention {
         tSR_sO(_, _, _1{}),
         tOsOacc + slm_bytes_per_oacc_stage,
         tOsO + slm_bytes_per_o_stage,
-        sum_reg[1]);
+        sum_reg[1],
+        is_sink,
+        sink_val,
+        max_reg[1]);
 
     pipeline_o.consumer_release(pipeline_o_consumer_state);
     ++pipeline_o_consumer_state;
