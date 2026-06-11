@@ -72,6 +72,7 @@ MODEL_SHAPES = [
     GdnShape("Synthetic_MHA_16x16",  16, 16, 128, 128, 4),
     GdnShape("Synthetic_16x64x128",  16, 64, 128, 128, 4),
     GdnShape("Synthetic_16x32x256",  16, 32, 256, 256, 4),
+    GdnShape("SelfDefShape",  16, 64, 128, 128, 4, tp_size=1),
 ]
 
 
@@ -92,13 +93,16 @@ WORKLOADS = [
     # ---- pure decode (native path) ----
     Workload("decode_b1",         "decode",     1,    1),
     Workload("decode_b8",         "decode",     8,    1),
+    Workload("decode_b16",        "decode",    16,    1),
     Workload("decode_b32",        "decode",    32,    1),
+    Workload("decode_b64",        "decode",    64,    1),
     Workload("decode_b128",       "decode",   128,    1),
     Workload("decode_b256",       "decode",   256,    1),
     # ---- pure prefill (XE2 chunked path) ----
     Workload("prefill_b1_1k",     "prefill",    1, 1024),
     Workload("prefill_b1_4k",     "prefill",    1, 4096),
     Workload("prefill_b1_8k",     "prefill",    1, 8192),
+    Workload("prefill_b1_16k",     "prefill",    1, 16384),
     Workload("prefill_b4_2k",     "prefill",    4, 2048),
     Workload("prefill_b8_1k",     "prefill",    8, 1024),
     Workload("prefill_b16_512",   "prefill",   16,  512),
