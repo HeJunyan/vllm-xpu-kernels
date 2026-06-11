@@ -73,6 +73,7 @@ MODEL_SHAPES = [
     GdnShape("Synthetic_MHA_16x16",  16, 16, 128, 128, 4),
     GdnShape("Synthetic_16x64x128",  16, 64, 128, 128, 4),
     GdnShape("Synthetic_16x32x256",  16, 32, 256, 256, 4),
+    GdnShape("SelfDefShape",  16, 64, 128, 128, 4, tp_size=1),
 ]
 
 
@@ -91,28 +92,31 @@ class Workload:
 
 WORKLOADS = [
     # ---- pure decode (native path) ----
-    Workload("decode_b1",         "decode",     1,    1),
-    Workload("decode_b8",         "decode",     8,    1),
-    Workload("decode_b32",        "decode",    32,    1),
-    Workload("decode_b128",       "decode",   128,    1),
-    Workload("decode_b256",       "decode",   256,    1),
+    # Workload("decode_b1",         "decode",     1,    1),
+    # Workload("decode_b8",         "decode",     8,    1),
+    # Workload("decode_b16",        "decode",    16,    1),
+    # Workload("decode_b32",        "decode",    32,    1),
+    # Workload("decode_b64",        "decode",    64,    1),
+    # Workload("decode_b128",       "decode",   128,    1),
+    # Workload("decode_b256",       "decode",   256,    1),
     # ---- pure prefill (XE2 chunked path) ----
     Workload("prefill_b1_1k",     "prefill",    1, 1024),
     Workload("prefill_b1_4k",     "prefill",    1, 4096),
     Workload("prefill_b1_8k",     "prefill",    1, 8192),
+    Workload("prefill_b1_16k",     "prefill",    1, 16384),
     Workload("prefill_b4_2k",     "prefill",    4, 2048),
     Workload("prefill_b8_1k",     "prefill",    8, 1024),
     Workload("prefill_b16_512",   "prefill",   16,  512),
-    Workload("prefill_b32_256",   "prefill",   32,  256),
-    # ---- mixed prefill + decode (XE2 chunked path) ----
-    Workload("mix_b32_1k_d050",   "mix",       32, 1024, decode_frac=0.50),
-    Workload("mix_b64_512_d075",  "mix",       64,  512, decode_frac=0.75),
-    Workload("mix_b16_2k_d025",   "mix",       16, 2048, decode_frac=0.25),
-    # ---- speculative decode (MTP, native path) ----
-    Workload("spec_b16_mtp1",     "spec",      16,    1, num_spec_tokens=1),
-    Workload("spec_b32_mtp1",     "spec",      32,    1, num_spec_tokens=1),
-    Workload("spec_b64_mtp1",     "spec",      64,    1, num_spec_tokens=1),
-    Workload("spec_b16_mtp3",     "spec",      16,    1, num_spec_tokens=3),
+    # Workload("prefill_b32_256",   "prefill",   32,  256),
+    # # ---- mixed prefill + decode (XE2 chunked path) ----
+    # Workload("mix_b32_1k_d050",   "mix",       32, 1024, decode_frac=0.50),
+    # Workload("mix_b64_512_d075",  "mix",       64,  512, decode_frac=0.75),
+    # Workload("mix_b16_2k_d025",   "mix",       16, 2048, decode_frac=0.25),
+    # # ---- speculative decode (MTP, native path) ----
+    # Workload("spec_b16_mtp1",     "spec",      16,    1, num_spec_tokens=1),
+    # Workload("spec_b32_mtp1",     "spec",      32,    1, num_spec_tokens=1),
+    # Workload("spec_b64_mtp1",     "spec",      64,    1, num_spec_tokens=1),
+    # Workload("spec_b16_mtp3",     "spec",      16,    1, num_spec_tokens=3),
 ]
 
 
