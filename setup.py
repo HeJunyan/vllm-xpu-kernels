@@ -39,6 +39,8 @@ def is_sccache_available() -> bool:
 
 
 def is_ccache_available() -> bool:
+    if os.environ.get("VLLM_USE_CCACHE", "0") == "0":
+        return False
     return which("ccache") is not None
 
 
