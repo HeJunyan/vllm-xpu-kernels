@@ -276,7 +276,11 @@ class TestTritonJITKernels:
         if DEVICE == "cpu":
             pytest.skip("Triton kernels require XPU")
 
-        from vllm_xpu_kernels.rotary import apply_rotary_emb
+        try:
+            from vllm_xpu_kernels.rotary import apply_rotary_emb
+            has_vllm_xpu_kernels = True
+        except ImportError:
+            has_vllm_xpu_kernels = False
 
         # --- Setup (matching profiled shapes exactly) ---
         # x: [1, 75600, 40, 128], cos/sin: [1, 75600, 1, 64]
@@ -329,26 +333,28 @@ class TestTritonJITKernels:
         compile_ms = np.mean(compile_latencies)
 
         # --- 3. _C.apply_rotary_emb (SYCL kernel) ---
-        # Reshape cos/sin from [1, S, 1, D/2] to [S, D/2] for the kernel
-        cos_2d = cos_xpu.reshape(SEQ_LEN, HEAD_DIM // 2)
-        sin_2d = sin_xpu.reshape(SEQ_LEN, HEAD_DIM // 2)
+        sycl_ms = None
+        if has_vllm_xpu_kernels:
+            # Reshape cos/sin from [1, S, 1, D/2] to [S, D/2] for the kernel
+            cos_2d = cos_xpu.reshape(SEQ_LEN, HEAD_DIM // 2)
+            sin_2d = sin_xpu.reshape(SEQ_LEN, HEAD_DIM // 2)
 
-        for _ in range(WARMUP):
-            _ = apply_rotary_emb(x_xpu, cos_2d, sin_2d, is_neox=False)
-            torch.xpu.synchronize()
+            for _ in range(WARMUP):
+                _ = apply_rotary_emb(x_xpu, cos_2d, sin_2d, is_neox=False)
+                torch.xpu.synchronize()
 
-        sycl_latencies = []
-        for _ in range(RUNS):
-            torch.xpu.synchronize()
-            start = torch.xpu.Event(enable_timing=True)
-            end = torch.xpu.Event(enable_timing=True)
-            start.record()
-            _ = apply_rotary_emb(x_xpu, cos_2d, sin_2d, is_neox=False)
-            end.record()
-            torch.xpu.synchronize()
-            sycl_latencies.append(start.elapsed_time(end))
+            sycl_latencies = []
+            for _ in range(RUNS):
+                torch.xpu.synchronize()
+                start = torch.xpu.Event(enable_timing=True)
+                end = torch.xpu.Event(enable_timing=True)
+                start.record()
+                _ = apply_rotary_emb(x_xpu, cos_2d, sin_2d, is_neox=False)
+                end.record()
+                torch.xpu.synchronize()
+                sycl_latencies.append(start.elapsed_time(end))
 
-        sycl_ms = np.mean(sycl_latencies)
+            sycl_ms = np.mean(sycl_latencies)
 
         # --- Results ---
         print(f"\n{'='*70}")
@@ -356,20 +362,25 @@ class TestTritonJITKernels:
         print(f"{'='*70}")
         print(f"  Eager (forward_native):              {eager_ms:.3f} ms")
         print(f"  torch.compile (triton fused):        {compile_ms:.3f} ms")
-        print(f"  _C.apply_rotary_emb (SYCL):          {sycl_ms:.3f} ms")
-        print(f"  Speedup (eager / compile):           {eager_ms / compile_ms:.2f}x")
-        print(f"  Speedup (eager / SYCL):              {eager_ms / sycl_ms:.2f}x")
-        if abs(compile_ms - sycl_ms) / max(compile_ms, sycl_ms) < 0.05:
-            print(f"  compile vs SYCL: within 5% ({sycl_ms / compile_ms:.2f}x)")
-        elif compile_ms > sycl_ms:
-            print(f"  Winner: SYCL ({compile_ms / sycl_ms:.2f}x faster than compile)")
+        if sycl_ms is not None:
+            print(f"  _C.apply_rotary_emb (SYCL):          {sycl_ms:.3f} ms")
         else:
-            print(f"  Winner: compile ({sycl_ms / compile_ms:.2f}x faster than SYCL)")
+            print(f"  _C.apply_rotary_emb (SYCL):          SKIPPED (vllm_xpu_kernels not installed)")
+        print(f"  Speedup (eager / compile):           {eager_ms / compile_ms:.2f}x")
+        if sycl_ms is not None:
+            print(f"  Speedup (eager / SYCL):              {eager_ms / sycl_ms:.2f}x")
+            if abs(compile_ms - sycl_ms) / max(compile_ms, sycl_ms) < 0.05:
+                print(f"  compile vs SYCL: within 5% ({sycl_ms / compile_ms:.2f}x)")
+            elif compile_ms > sycl_ms:
+                print(f"  Winner: SYCL ({compile_ms / sycl_ms:.2f}x faster than compile)")
+            else:
+                print(f"  Winner: compile ({sycl_ms / compile_ms:.2f}x faster than SYCL)")
         print(f"{'='*70}")
 
         TEST_RESULTS.append({"name": "RoPE Wan - Eager", "avg_ms": eager_ms, "std_ms": np.std(eager_latencies), "tflops": 0, "memory_bw_gbs": 0, "shape_info": {"elements": BATCH_SIZE * SEQ_LEN * NUM_HEADS * HEAD_DIM}, "profiling_info": "forward_native: unflatten+unbind+stack+mul+flatten"})
         TEST_RESULTS.append({"name": "RoPE Wan - torch.compile", "avg_ms": compile_ms, "std_ms": np.std(compile_latencies), "tflops": 0, "memory_bw_gbs": 0, "shape_info": {"elements": BATCH_SIZE * SEQ_LEN * NUM_HEADS * HEAD_DIM}, "profiling_info": "T2V: 49 calls, 530.37ms compiled (10824us/call)"})
-        TEST_RESULTS.append({"name": "RoPE Wan - _C.apply_rotary_emb", "avg_ms": sycl_ms, "std_ms": np.std(sycl_latencies), "tflops": 0, "memory_bw_gbs": 0, "shape_info": {"elements": BATCH_SIZE * SEQ_LEN * NUM_HEADS * HEAD_DIM}, "profiling_info": "SYCL kernel from vllm-xpu-kernels"})
+        if sycl_ms is not None:
+            TEST_RESULTS.append({"name": "RoPE Wan - _C.apply_rotary_emb", "avg_ms": sycl_ms, "std_ms": np.std(sycl_latencies), "tflops": 0, "memory_bw_gbs": 0, "shape_info": {"elements": BATCH_SIZE * SEQ_LEN * NUM_HEADS * HEAD_DIM}, "profiling_info": "SYCL kernel from vllm-xpu-kernels"})
 
     def test_ada_layer_norm_fused(self):
         """triton_red_fused__to_copy_add_mul_native_layer_norm_0
@@ -638,7 +649,11 @@ class TestTritonJITKernels:
         if DEVICE == "cpu":
             pytest.skip("Triton kernels require XPU")
 
-        from vllm._custom_ops import rms_norm as fused_rms_norm
+        try:
+            import vllm_xpu_kernels._C  # noqa: F401
+            has_vllm_xpu_kernels = True
+        except ImportError:
+            has_vllm_xpu_kernels = False
 
         x_xpu = torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_DIM, device="xpu", dtype=torch.bfloat16)
         weight_xpu = torch.randn(HIDDEN_DIM, device="xpu", dtype=torch.bfloat16)
@@ -671,30 +686,37 @@ class TestTritonJITKernels:
         compile_ms = np.mean(compile_latencies)
 
         # --- 3. _C.rms_norm (SYCL) ---
-        x_2d = x_xpu.reshape(-1, HIDDEN_DIM).contiguous()
-        out_sycl = torch.empty_like(x_2d)
-        for _ in range(WARMUP):
-            fused_rms_norm(out_sycl, x_2d, weight_xpu, eps); torch.xpu.synchronize()
-        sycl_latencies = []
-        for _ in range(RUNS):
-            torch.xpu.synchronize(); start = torch.xpu.Event(enable_timing=True); end = torch.xpu.Event(enable_timing=True)
-            start.record(); fused_rms_norm(out_sycl, x_2d, weight_xpu, eps); end.record()
-            torch.xpu.synchronize(); sycl_latencies.append(start.elapsed_time(end))
-        sycl_ms = np.mean(sycl_latencies)
+        sycl_ms = None
+        if has_vllm_xpu_kernels:
+            x_2d = x_xpu.reshape(-1, HIDDEN_DIM).contiguous()
+            out_sycl = torch.empty_like(x_2d)
+            for _ in range(WARMUP):
+                torch.ops._C.rms_norm(out_sycl, x_2d, weight_xpu, eps); torch.xpu.synchronize()
+            sycl_latencies = []
+            for _ in range(RUNS):
+                torch.xpu.synchronize(); start = torch.xpu.Event(enable_timing=True); end = torch.xpu.Event(enable_timing=True)
+                start.record(); torch.ops._C.rms_norm(out_sycl, x_2d, weight_xpu, eps); end.record()
+                torch.xpu.synchronize(); sycl_latencies.append(start.elapsed_time(end))
+            sycl_ms = np.mean(sycl_latencies)
 
         print(f"\n{'='*70}")
         print(f"RMSNorm SelfAttn: [1, {SEQ_LEN}, {HIDDEN_DIM}] @ bf16")
         print(f"{'='*70}")
         print(f"  Eager (native):          {eager_ms:.3f} ms")
         print(f"  torch.compile:           {compile_ms:.3f} ms")
-        print(f"  _C.rms_norm (SYCL):      {sycl_ms:.3f} ms")
+        if sycl_ms is not None:
+            print(f"  _C.rms_norm (SYCL):      {sycl_ms:.3f} ms")
+        else:
+            print(f"  _C.rms_norm (SYCL):      SKIPPED (vllm_xpu_kernels not installed)")
         print(f"  Speedup (eager/compile):  {eager_ms / compile_ms:.2f}x")
-        print(f"  Speedup (eager/SYCL):     {eager_ms / sycl_ms:.2f}x")
+        if sycl_ms is not None:
+            print(f"  Speedup (eager/SYCL):     {eager_ms / sycl_ms:.2f}x")
         print(f"{'='*70}")
 
         TEST_RESULTS.append({"name": "RMSNorm SelfAttn - Eager", "avg_ms": eager_ms, "std_ms": np.std(eager_latencies), "tflops": 0, "memory_bw_gbs": 0, "shape_info": {"elements": BATCH_SIZE * SEQ_LEN * HIDDEN_DIM}, "profiling_info": "pow + mean + rsqrt + mul + copy"})
         TEST_RESULTS.append({"name": "RMSNorm SelfAttn - torch.compile", "avg_ms": compile_ms, "std_ms": np.std(compile_latencies), "tflops": 0, "memory_bw_gbs": 0, "shape_info": {"elements": BATCH_SIZE * SEQ_LEN * HIDDEN_DIM}, "profiling_info": "T2V: 32 calls, 96.22ms (3007us/call)"})
-        TEST_RESULTS.append({"name": "RMSNorm SelfAttn - _C.rms_norm", "avg_ms": sycl_ms, "std_ms": np.std(sycl_latencies), "tflops": 0, "memory_bw_gbs": 0, "shape_info": {"elements": BATCH_SIZE * SEQ_LEN * HIDDEN_DIM}, "profiling_info": "SYCL kernel from vllm-xpu-kernels"})
+        if sycl_ms is not None:
+            TEST_RESULTS.append({"name": "RMSNorm SelfAttn - _C.rms_norm", "avg_ms": sycl_ms, "std_ms": np.std(sycl_latencies), "tflops": 0, "memory_bw_gbs": 0, "shape_info": {"elements": BATCH_SIZE * SEQ_LEN * HIDDEN_DIM}, "profiling_info": "SYCL kernel from vllm-xpu-kernels"})
 
     def test_rmsnorm_cross_attn_fused(self):
         """triton_red_fused__to_copy_mean_mul_pow_rsqrt_view_0
@@ -710,7 +732,11 @@ class TestTritonJITKernels:
         if DEVICE == "cpu":
             pytest.skip("Triton kernels require XPU")
 
-        from vllm._custom_ops import rms_norm as fused_rms_norm
+        try:
+            import vllm_xpu_kernels._C  # noqa: F401
+            has_vllm_xpu_kernels = True
+        except ImportError:
+            has_vllm_xpu_kernels = False
 
         x_xpu = torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_DIM, device="xpu", dtype=torch.bfloat16)
         weight_xpu = torch.randn(HIDDEN_DIM, device="xpu", dtype=torch.bfloat16)
@@ -743,30 +769,37 @@ class TestTritonJITKernels:
         compile_ms = np.mean(compile_latencies)
 
         # --- 3. _C.rms_norm (SYCL) ---
-        x_2d = x_xpu.reshape(-1, HIDDEN_DIM).contiguous()
-        out_sycl = torch.empty_like(x_2d)
-        for _ in range(WARMUP):
-            fused_rms_norm(out_sycl, x_2d, weight_xpu, eps); torch.xpu.synchronize()
-        sycl_latencies = []
-        for _ in range(RUNS):
-            torch.xpu.synchronize(); start = torch.xpu.Event(enable_timing=True); end = torch.xpu.Event(enable_timing=True)
-            start.record(); fused_rms_norm(out_sycl, x_2d, weight_xpu, eps); end.record()
-            torch.xpu.synchronize(); sycl_latencies.append(start.elapsed_time(end))
-        sycl_ms = np.mean(sycl_latencies)
+        sycl_ms = None
+        if has_vllm_xpu_kernels:
+            x_2d = x_xpu.reshape(-1, HIDDEN_DIM).contiguous()
+            out_sycl = torch.empty_like(x_2d)
+            for _ in range(WARMUP):
+                torch.ops._C.rms_norm(out_sycl, x_2d, weight_xpu, eps); torch.xpu.synchronize()
+            sycl_latencies = []
+            for _ in range(RUNS):
+                torch.xpu.synchronize(); start = torch.xpu.Event(enable_timing=True); end = torch.xpu.Event(enable_timing=True)
+                start.record(); torch.ops._C.rms_norm(out_sycl, x_2d, weight_xpu, eps); end.record()
+                torch.xpu.synchronize(); sycl_latencies.append(start.elapsed_time(end))
+            sycl_ms = np.mean(sycl_latencies)
 
         print(f"\n{'='*70}")
         print(f"RMSNorm CrossAttn: [1, {SEQ_LEN}, {HIDDEN_DIM}] @ bf16")
         print(f"{'='*70}")
         print(f"  Eager (native):          {eager_ms:.3f} ms")
         print(f"  torch.compile:           {compile_ms:.3f} ms")
-        print(f"  _C.rms_norm (SYCL):      {sycl_ms:.3f} ms")
+        if sycl_ms is not None:
+            print(f"  _C.rms_norm (SYCL):      {sycl_ms:.3f} ms")
+        else:
+            print(f"  _C.rms_norm (SYCL):      SKIPPED (vllm_xpu_kernels not installed)")
         print(f"  Speedup (eager/compile):  {eager_ms / compile_ms:.2f}x")
-        print(f"  Speedup (eager/SYCL):     {eager_ms / sycl_ms:.2f}x")
+        if sycl_ms is not None:
+            print(f"  Speedup (eager/SYCL):     {eager_ms / sycl_ms:.2f}x")
         print(f"{'='*70}")
 
         TEST_RESULTS.append({"name": "RMSNorm CrossAttn - Eager", "avg_ms": eager_ms, "std_ms": np.std(eager_latencies), "tflops": 0, "memory_bw_gbs": 0, "shape_info": {"elements": BATCH_SIZE * SEQ_LEN * HIDDEN_DIM}, "profiling_info": "pow + mean + rsqrt + mul + copy"})
         TEST_RESULTS.append({"name": "RMSNorm CrossAttn - torch.compile", "avg_ms": compile_ms, "std_ms": np.std(compile_latencies), "tflops": 0, "memory_bw_gbs": 0, "shape_info": {"elements": BATCH_SIZE * SEQ_LEN * HIDDEN_DIM}, "profiling_info": "T2V: 16 calls, 46.52ms (2907us/call)"})
-        TEST_RESULTS.append({"name": "RMSNorm CrossAttn - _C.rms_norm", "avg_ms": sycl_ms, "std_ms": np.std(sycl_latencies), "tflops": 0, "memory_bw_gbs": 0, "shape_info": {"elements": BATCH_SIZE * SEQ_LEN * HIDDEN_DIM}, "profiling_info": "SYCL kernel from vllm-xpu-kernels"})
+        if sycl_ms is not None:
+            TEST_RESULTS.append({"name": "RMSNorm CrossAttn - _C.rms_norm", "avg_ms": sycl_ms, "std_ms": np.std(sycl_latencies), "tflops": 0, "memory_bw_gbs": 0, "shape_info": {"elements": BATCH_SIZE * SEQ_LEN * HIDDEN_DIM}, "profiling_info": "SYCL kernel from vllm-xpu-kernels"})
 
 
 if __name__ == "__main__":
