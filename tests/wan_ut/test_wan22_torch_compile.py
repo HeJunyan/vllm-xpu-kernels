@@ -41,6 +41,9 @@ import torch.nn.functional as F
 
 pytestmark = pytest.mark.skip(reason="WAN torch.compile tests are not stable for CI")
 
+# Skip this module in mini scope (use test_wan22_kernels_mini.py instead)
+SKIP_IN_MINI_SCOPE = True
+
 # Test device configuration
 DEVICE = "xpu" if torch.xpu.is_available() else "cpu"
 
