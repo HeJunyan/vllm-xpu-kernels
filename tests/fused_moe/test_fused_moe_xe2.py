@@ -169,8 +169,8 @@ def test_fused_moe(m, n, k, e, topk, dtype, w_dtype, has_bias):
     seed_everything(7)
 
     input_len = m
-    hidden_size = k
-    intermediate_size = n
+    hidden_size = n
+    intermediate_size = k
     num_experts = e
 
     a = torch.randn((input_len, hidden_size), device=DEVICE, dtype=dtype) / 16
@@ -306,6 +306,10 @@ def test_fused_moe_int4(m, n, k, e, topk, dtype, has_bias):
     # scale
     group_num_13 = hidden_size // group_size
     group_num_2 = intermediate_size // group_size
+    assert hidden_size % group_size == 0, \
+        "hidden_size must be divisible by group_size"
+    assert intermediate_size % group_size == 0, \
+        "intermediate_size must be divisible by group_size"
     random_exponents = torch.randint(
         -5,
         -4, (num_experts, 2 * intermediate_size, group_num_13),
@@ -520,8 +524,8 @@ def test_fused_moe_ep(m, n, k, e, topk, ep_rank, ep_size, dtype, w_dtype,
     seed_everything(7)
 
     input_len = m
-    hidden_size = k
-    intermediate_size = n
+    hidden_size = n
+    intermediate_size = k
     num_experts = e
 
     a = torch.randn((input_len, hidden_size), device=DEVICE, dtype=dtype) / 16
@@ -670,6 +674,10 @@ def test_fused_moe_int4_ep(m, n, k, e, topk, ep_rank, ep_size, dtype,
     # scale
     group_num_13 = hidden_size // group_size
     group_num_2 = intermediate_size // group_size
+    assert hidden_size % group_size == 0, \
+        "hidden_size must be divisible by group_size"
+    assert intermediate_size % group_size == 0, \
+        "intermediate_size must be divisible by group_size"
     random_exponents = torch.randint(
         -5,
         -4, (num_experts, 2 * intermediate_size, group_num_13),
@@ -897,8 +905,8 @@ def test_fused_moe_clamp_limit(m, n, k, e, topk, dtype, gemm1_clamp_limit):
     seed_everything(7)
 
     input_len = m
-    hidden_size = k
-    intermediate_size = n
+    hidden_size = n
+    intermediate_size = k
     num_experts = e
 
     # Use /2 scaling so GEMM1 std ≈ 0.25 * sqrt(k) ≈ 8 for k=1024,
