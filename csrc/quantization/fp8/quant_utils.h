@@ -28,6 +28,10 @@ struct fp8_max_f<at::Float8_e5m2> {
   static constexpr float value = 57344.0f;
 };
 
+// Alias kept in sync with the upstream naming of the same constant.
+template <typename Tout>
+inline constexpr float quant_type_max_v = fp8_max_f<Tout>::value;
+
 template <typename scalar_t>
 inline float thread_max_vec(
     scalar_t const* input,
