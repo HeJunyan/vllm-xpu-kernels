@@ -2,6 +2,8 @@
 
 #include <sycl/sycl.hpp>
 #include <torch/all.h>
+#include <iostream>
+#include <sycl/ext/oneapi/experimental/builtins.hpp>
 
 #include "gdn_attn_utils.h"
 
@@ -96,6 +98,9 @@ struct causal_conv1d_kernel {
     const int local_id = item.get_local_linear_id();
     const int qkvz_elems_id =
         local_group_id * elems_per_group + local_id * elems_per_item;
+
+    sycl::ext::oneapi::experimental::printf(
+        "^^^^^ token=%d\n", token_id);
 
     if (qkvz_elems_id >= qkvz_elems) {
       return;
@@ -1024,6 +1029,8 @@ void causal_conv1d(
     const int num_spec_decodes,
     const bool reorder_input) {
   TORCH_CHECK(query_start_loc.has_value() && cache_indices.has_value());
+
+  printf("2222 ********** BBBBBBBBBBBBBBBBegin****************** \n");
 
   const bool is_spec = num_accepted_tokens.has_value();
   const int batch_size = query_start_loc->size(0) - 1;
