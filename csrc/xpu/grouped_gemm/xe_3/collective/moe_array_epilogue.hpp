@@ -133,6 +133,15 @@ class CollectiveEpilogue<
 
   static constexpr int SubgroupSize = DispatchPolicy::SubgroupSize;
 
+  // SFINAE: detect FusionCallbacks that provide is_identity().
+  template <class T, class = void>
+  struct has_is_identity : cute::false_type {};
+  template <class T>
+  struct has_is_identity<
+      T,
+      cute::void_t<decltype(cute::declval<T const&>().is_identity())>>
+      : cute::true_type {};
+
   static_assert(
       cute::rank(WGTileMNK{}) == 3, "WGTileMNK must be rank-3: [M, N, K]");
   static_assert(
@@ -397,6 +406,36 @@ class CollectiveEpilogue<
     auto residue_gCD = MN - gCD(_0{});        // (res_m, res_n)
     auto residue_tCDgCD = MN - tCDgCD(_0{});  // (res_m, res_n)
 
+    // Outer loop extents over epilogue tiles.
+    constexpr auto EpiTilesM = size<2>(gCD_epi);
+    constexpr auto EpiTilesN = size<3>(gCD_epi);
+
+    // Identity fast path: when D = Acc (alpha == 1, beta == 0), skip the
+    // fusion-callback path and directly reorder + store, matching the sycl-tla
+    // IntelXeGeneric epilogue.
+    bool is_identity_epilogue = false;
+    if constexpr (has_is_identity<FusionCallbacks>::value) {
+      is_identity_epilogue = fusion_callbacks.is_identity();
+    }
+
+    if (is_identity_epilogue) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int epi_m = 0; epi_m < EpiTilesM; epi_m++) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int epi_n = 0; epi_n < EpiTilesN; epi_n++) {
+          auto acc_epi_wi = make_tensor(
+              tiled_acc(_, epi_m, epi_n).data(),
+              tiled_acc(_, _0{}, _0{}).layout());
+          auto acc_epi = make_subgroup_tensor(acc_epi_wi, cd_compute_tv);
+          if constexpr (is_destination_supported) {
+            reorder(acc_epi, tDrD);
+            copy(copy_d, tDrD, tDgD(_, _, _, epi_m, epi_n));
+          }
+        }
+      }
+      return;
+    }
+
     // Pass data to fusions.
     // FIXME: Some Xe visitors expect subgroup tiles/coordinates here and should
     // be updated to accept
@@ -443,10 +482,6 @@ class CollectiveEpilogue<
     auto tDrD_compute = make_subgroup_tensor(
         tDrD_compute_wi, cd_compute_tv);  // (mma_v,mma_m,mma_n)
     auto tDrD_compute_v = recast<FragmentVisit>(tDrD_compute_wi);
-
-    // Outer loops over epilogue tiles.
-    constexpr auto EpiTilesM = size<2>(gCD_epi);
-    constexpr auto EpiTilesN = size<3>(gCD_epi);
 
     cst_callbacks.begin();
 

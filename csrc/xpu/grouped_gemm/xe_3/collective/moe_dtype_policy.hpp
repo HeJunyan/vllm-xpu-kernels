@@ -187,7 +187,42 @@ class moe_bf16_policy : public moe_policy_base {
       MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
       Layout<TileShape>,
       SGLayout>::TiledMMA;
+  static constexpr int PipelineStages = 2;
   using GEMMDispatchPolicy = cutlass::gemm::MainloopMoE16Group<PipelineStages>;
+  CALL_GENERATE_GEMM();
+};
+
+// BF16 tile variants selected by pick_bf16_variant() for wave-quantization.
+class moe_bf16_256x128_policy : public moe_bf16_policy {
+ public:
+  using TileShape = Shape<_256, _128, _32>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_bf16_128x256_policy : public moe_bf16_policy {
+ public:
+  using TileShape = Shape<_128, _256, _32>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_bf16_128x128_policy : public moe_bf16_policy {
+ public:
+  using TileShape = Shape<_128, _128, _32>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
   CALL_GENERATE_GEMM();
 };
 

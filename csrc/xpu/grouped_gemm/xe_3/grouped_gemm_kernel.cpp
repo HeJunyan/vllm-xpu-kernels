@@ -281,6 +281,9 @@ void kernel_functor(
       int64_t groups);
 
 INSTANTIATE_KERNEL(moe_bf16_policy)
+INSTANTIATE_KERNEL(moe_bf16_256x128_policy)
+INSTANTIATE_KERNEL(moe_bf16_128x256_policy)
+INSTANTIATE_KERNEL(moe_bf16_128x128_policy)
 INSTANTIATE_KERNEL(moe_bf16_mid_policy)
 INSTANTIATE_KERNEL(moe_bf16_decode_policy)
 INSTANTIATE_KERNEL(moe_fp16_policy)
