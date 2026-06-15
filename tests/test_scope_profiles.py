@@ -202,8 +202,14 @@ _LLAMA4_PROFILE = {
     # ---- Grouped GEMM: 16 experts, top-1 ----
     "tests/fused_moe/test_grouped_gemm_xe3.py": {
         "test_grouped_gemm": {
-            "m,n,k": [(1, LLAMA4_INTERMEDIATE_SIZE, LLAMA4_HIDDEN_SIZE),
-                      (128, LLAMA4_INTERMEDIATE_SIZE, LLAMA4_HIDDEN_SIZE)],
+            "m,n,k": [
+                # gate_up_proj
+                (1, 2 * LLAMA4_INTERMEDIATE_SIZE, LLAMA4_HIDDEN_SIZE),
+                (128, 2 * LLAMA4_INTERMEDIATE_SIZE, LLAMA4_HIDDEN_SIZE),
+                # down_proj
+                (1, LLAMA4_HIDDEN_SIZE, LLAMA4_INTERMEDIATE_SIZE),
+                (128, LLAMA4_HIDDEN_SIZE, LLAMA4_INTERMEDIATE_SIZE),
+            ],
             "e": [LLAMA4_NUM_EXPERTS],
             "topk": [LLAMA4_TOPK],
             "dtype": [torch.bfloat16],  # FIXME: add low precision
@@ -600,17 +606,17 @@ _QWEN3_30B_A3B_PROFILE = {
                 # gate_up_proj
                 (
                     1,
-                    QWEN3_30B_HIDDEN_SIZE,
                     2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_30B_HIDDEN_SIZE,
                 ),
                 (
                     128,
-                    QWEN3_30B_HIDDEN_SIZE,
                     2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_30B_HIDDEN_SIZE,
                 ),
                 # down_proj
-                (1, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
-                (128, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                (1, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
+                (128, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
             ],
             "e": [QWEN3_30B_NUM_EXPERTS],
             "topk": [QWEN3_30B_TOPK],
@@ -623,17 +629,17 @@ _QWEN3_30B_A3B_PROFILE = {
                 # gate_up_proj
                 (
                     1,
-                    QWEN3_30B_HIDDEN_SIZE,
                     2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_30B_HIDDEN_SIZE,
                 ),
                 (
                     128,
-                    QWEN3_30B_HIDDEN_SIZE,
                     2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_30B_HIDDEN_SIZE,
                 ),
                 # down_proj
-                (1, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
-                (128, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                (1, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
+                (128, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
             ],
             "e": [QWEN3_30B_NUM_EXPERTS],
             "topk": [QWEN3_30B_TOPK],
@@ -858,17 +864,17 @@ _QWEN3_235B_A22B_PROFILE = {
                 # gate_up_proj
                 (
                     1,
-                    QWEN3_235B_HIDDEN_SIZE,
                     2 * QWEN3_235B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_235B_HIDDEN_SIZE,
                 ),
                 (
                     128,
-                    QWEN3_235B_HIDDEN_SIZE,
                     2 * QWEN3_235B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_235B_HIDDEN_SIZE,
                 ),
                 # down_proj
-                (1, QWEN3_235B_MOE_INTERMEDIATE_SIZE, QWEN3_235B_HIDDEN_SIZE),
-                (128, QWEN3_235B_MOE_INTERMEDIATE_SIZE, QWEN3_235B_HIDDEN_SIZE),
+                (1, QWEN3_235B_HIDDEN_SIZE, QWEN3_235B_MOE_INTERMEDIATE_SIZE),
+                (128, QWEN3_235B_HIDDEN_SIZE, QWEN3_235B_MOE_INTERMEDIATE_SIZE),
             ],
             "e": [QWEN3_235B_NUM_EXPERTS],
             "topk": [QWEN3_235B_TOPK],
@@ -880,17 +886,17 @@ _QWEN3_235B_A22B_PROFILE = {
                 # gate_up_proj
                 (
                     1,
-                    QWEN3_235B_HIDDEN_SIZE,
                     2 * QWEN3_235B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_235B_HIDDEN_SIZE,
                 ),
                 (
                     128,
-                    QWEN3_235B_HIDDEN_SIZE,
                     2 * QWEN3_235B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_235B_HIDDEN_SIZE,
                 ),
                 # down_proj
-                (1, QWEN3_235B_MOE_INTERMEDIATE_SIZE, QWEN3_235B_HIDDEN_SIZE),
-                (128, QWEN3_235B_MOE_INTERMEDIATE_SIZE, QWEN3_235B_HIDDEN_SIZE),
+                (1, QWEN3_235B_HIDDEN_SIZE, QWEN3_235B_MOE_INTERMEDIATE_SIZE),
+                (128, QWEN3_235B_HIDDEN_SIZE, QWEN3_235B_MOE_INTERMEDIATE_SIZE),
             ],
             "e": [QWEN3_235B_NUM_EXPERTS],
             "topk": [QWEN3_235B_TOPK],
