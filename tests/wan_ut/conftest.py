@@ -20,11 +20,26 @@ def _is_mini_scope():
 
 
 def pytest_collection_modifyitems(config, items):
-    """In mini scope, only keep test_wan22_kernels_mini.py from wan_ut."""
+    """In mini scope, only filter tests inside wan_ut.
+
+    Keep non-wan_ut items unchanged so this local conftest does not
+    accidentally prune the global test session.
+    """
     if not _is_mini_scope():
         return
 
-    items[:] = [item for item in items if "test_wan22_kernels_mini" in item.nodeid]
+    filtered = []
+    for item in items:
+        nodeid = item.nodeid
+        # Only apply mini filtering to WAN UT subtree.
+        if "/wan_ut/" not in nodeid and not nodeid.startswith("wan_ut/"):
+            filtered.append(item)
+            continue
+
+        if "test_wan22_kernels_mini" in nodeid:
+            filtered.append(item)
+
+    items[:] = filtered
 
 
 def pytest_sessionfinish(session, exitstatus):
