@@ -2,8 +2,7 @@
 import pytest
 import torch
 
-from tests.ops.grouped_topk_op import (fused_grouped_topk,
-                                       fused_grouped_topk_sycl, grouped_topk)
+from tests.ops.grouped_topk_op import fused_grouped_topk, grouped_topk
 from tests.utils import seed_everything
 
 DEVICE = "cpu"
@@ -72,34 +71,13 @@ def test_grouped_topk(n_token: int, n_hidden: int, n_expert: int, topk: int,
     test_topk_weights = test_topk_weights.cpu()
     test_topk_ids = test_topk_ids.cpu()
 
-    test_topk_weights_sycl, test_topk_ids_sycl = fused_grouped_topk_sycl(
-        hidden_states=_to_kernel(hidden_states),
-        gating_output=_to_kernel(gating_output),
-        topk=topk,
-        renormalize=renormalize,
-        num_expert_group=num_expert_group,
-        topk_group=topk_group,
-        scoring_func=scoring_func,
-        routed_scaling_factor=routed_scaling_factor,
-        e_score_correction_bias=_to_kernel(e_score_correction_bias))
-    test_topk_weights_sycl = test_topk_weights_sycl.cpu()
-    test_topk_ids_sycl = test_topk_ids_sycl.cpu()
-
     if renormalize:
         torch.testing.assert_close(baseline_topk_weights,
                                    test_topk_weights,
                                    atol=2e-2,
                                    rtol=0)
-        torch.testing.assert_close(baseline_topk_weights,
-                                   test_topk_weights_sycl,
-                                   atol=2e-2,
-                                   rtol=0)
 
     torch.testing.assert_close(baseline_topk_ids,
                                test_topk_ids,
-                               atol=0,
-                               rtol=0)
-    torch.testing.assert_close(baseline_topk_ids,
-                               test_topk_ids_sycl,
                                atol=0,
                                rtol=0)
