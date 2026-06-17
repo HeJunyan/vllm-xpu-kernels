@@ -1,5 +1,7 @@
 #include <torch/all.h>
 
+#include <cstdlib>
+
 #include "collective/moe_dtype_policy.hpp"
 #include "csrc/utils.h"
 
@@ -20,41 +22,55 @@ void kernel_functor(
     int64_t K,
     int64_t groups);
 
-// Selects the bf16/fp16 work-group tile. 256x256 has the highest arithmetic
-// intensity, so we keep it unless its tile count leaves a half-empty tail wave
-// across the 32 Xe cores; then we switch to a smaller tile that packs the cores
-// more fully. Returns a variant id: 0 = 256x256, 1 = 256x128, 2 = 128x256,
-// 3 = 128x128.
-inline int pick_bf16_variant(int64_t M_total, int64_t N, int64_t groups) {
-  constexpr int kCores = 32;
-  // A tile is only worth shrinking to when its smaller-intensity penalty
-  // (~15%) is outweighed by better wave packing, i.e. when 256x256 utilization
-  // drops below ~0.85.
-  constexpr double kMinUtil = 0.85;
+// Work-group tiles for the high-occupancy ("prefill", avg_tokens > 32) path.
+// Ids match XE3_GG_FORCE_TILE for profiling overrides.
+enum class PrefillTile : int {
+  k256x256 = 0,
+  k256x128 = 1,
+  k128x256 = 2,
+  k128x128 = 3,
+};
 
+// Dtype families that share a tile-selection rule on the prefill path.
+enum class PrefillFamily { kBF16, kMXFP8, kMXFP4 };
+
+// Selects the prefill work-group tile. Only two tiles are ever optimal:
+// 256x256 (best arithmetic intensity) and 128x256 (packs the 32 Xe cores more
+// fully when 256x256's last wave is short). The choice follows one rule per
+// dtype family:
+//
+//   1. MXFP8: its 256x256 tile is occupancy/scale-load bound and measures
+//      ~2.5x slower than 128x256 across every shape, so MXFP8 always uses
+//      128x256.
+//   2. BF16 / MXFP4: keep 256x256 while it keeps the cores busy; fall back to
+//      128x256 once the final wave drops below a utilization threshold. MXFP4
+//      is 4-bit and compute-bound, so it tolerates a shorter tail wave (>=0.85)
+//      than the more wave-quantization-sensitive BF16 (>=0.90).
+inline PrefillTile pick_prefill_tile(
+    PrefillFamily family, int64_t M_total, int64_t N, int64_t groups) {
+  // Manual override for tuning/profiling.
+  if (const char* env = std::getenv("XE3_GG_FORCE_TILE")) {
+    return static_cast<PrefillTile>(std::atoi(env));
+  }
+
+  if (family == PrefillFamily::kMXFP8) {
+    return PrefillTile::k128x256;
+  }
+
+  constexpr int kCores = 32;
+  const double kMinUtil = (family == PrefillFamily::kMXFP4) ? 0.85 : 0.90;
   const int64_t M_g = M_total / (groups > 0 ? groups : 1);
   auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
-  auto util = [&](int64_t tm, int64_t tn) {
-    int64_t tiles =
-        groups * ceil_div(M_g > 0 ? M_g : 1, tm) * ceil_div(N, tn);
-    int64_t waves = ceil_div(tiles, kCores);
-    return static_cast<double>(tiles) / static_cast<double>(waves * kCores);
-  };
+  int64_t tiles_256 =
+      groups * ceil_div(M_g > 0 ? M_g : 1, 256) * ceil_div(N, 256);
+  int64_t waves_256 = ceil_div(tiles_256, kCores);
+  double util_256 =
+      static_cast<double>(tiles_256) / static_cast<double>(waves_256 * kCores);
 
-  // 256x256: best intensity, use it whenever it packs the cores well.
-  if (util(256, 256) >= kMinUtil) {
-    return 0;
+  if (util_256 >= kMinUtil) {
+    return PrefillTile::k256x256;
   }
-  // Otherwise prefer a half tile. 128x256 halves M, which gives finer
-  // granularity on the variable per-expert token count in MoE.
-  if (util(128, 256) >= kMinUtil) {
-    return 2;
-  }
-  if (util(256, 128) >= kMinUtil) {
-    return 1;
-  }
-  // Fall back to the smallest tile when the wider tiles all tail badly.
-  return 3;
+  return PrefillTile::k128x256;
 }
 }  // namespace grouped_gemm
 
@@ -90,29 +106,36 @@ at::Tensor grouped_gemm_func(
       K,                                               \
       groups)
 
+// Dispatches the high-occupancy path to the wave-quantization-selected tile.
+// FAMILY is a dtype prefix providing FAMILY##_policy (256x256) plus the
+// _256x128 / _128x256 / _128x128 tile variants. FAM is the PrefillFamily tag.
+#define DISPATCH_PREFILL_TILE(FAMILY, FAM)                                 \
+  switch (grouped_gemm::pick_prefill_tile(                                 \
+      grouped_gemm::PrefillFamily::FAM, ptr_A.size(0), N, groups)) {       \
+    case grouped_gemm::PrefillTile::k256x128: {                            \
+      using moe_policy = grouped_gemm::FAMILY##_256x128_policy;            \
+      CALL_KERNEL_WITH_POLICY(moe_policy);                                 \
+      break;                                                               \
+    }                                                                      \
+    case grouped_gemm::PrefillTile::k128x256: {                            \
+      using moe_policy = grouped_gemm::FAMILY##_128x256_policy;            \
+      CALL_KERNEL_WITH_POLICY(moe_policy);                                 \
+      break;                                                               \
+    }                                                                      \
+    case grouped_gemm::PrefillTile::k128x128: {                           \
+      using moe_policy = grouped_gemm::FAMILY##_128x128_policy;            \
+      CALL_KERNEL_WITH_POLICY(moe_policy);                                 \
+      break;                                                               \
+    }                                                                      \
+    default: {                                                             \
+      using moe_policy = grouped_gemm::FAMILY##_policy;                    \
+      CALL_KERNEL_WITH_POLICY(moe_policy);                                 \
+    }                                                                      \
+  }
+
   if (A_dtype == at::kBFloat16) {
     if (avg_tokens_cnt > 32) {
-      switch (grouped_gemm::pick_bf16_variant(ptr_A.size(0), N, groups)) {
-        case 1: {
-          using moe_policy = grouped_gemm::moe_bf16_256x128_policy;
-          CALL_KERNEL_WITH_POLICY(moe_policy);
-          break;
-        }
-        case 2: {
-          using moe_policy = grouped_gemm::moe_bf16_128x256_policy;
-          CALL_KERNEL_WITH_POLICY(moe_policy);
-          break;
-        }
-        case 3: {
-          using moe_policy = grouped_gemm::moe_bf16_128x128_policy;
-          CALL_KERNEL_WITH_POLICY(moe_policy);
-          break;
-        }
-        default: {
-          using moe_policy = grouped_gemm::moe_bf16_policy;
-          CALL_KERNEL_WITH_POLICY(moe_policy);
-        }
-      }
+      DISPATCH_PREFILL_TILE(moe_bf16, kBF16);
     } else if (avg_tokens_cnt > 4) {
       using moe_policy = grouped_gemm::moe_bf16_mid_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);
@@ -139,8 +162,7 @@ at::Tensor grouped_gemm_func(
     // surface width up to 4-byte alignment internally), so we no longer
     // need the scalar scale-load fallback.
     if (avg_tokens_cnt > 32) {
-      using moe_policy = grouped_gemm::moe_mxfp8_policy;
-      CALL_KERNEL_WITH_POLICY(moe_policy);
+      DISPATCH_PREFILL_TILE(moe_mxfp8, kMXFP8);
     } else {
       using moe_policy = grouped_gemm::moe_mxfp8_mid_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);
@@ -149,8 +171,7 @@ at::Tensor grouped_gemm_func(
       A_dtype == at::kFloat4_e2m1fn_x2 && ptr_A_scale &&
       ptr_A_scale->dtype() == at::kFloat8_e8m0fnu) {
     if (avg_tokens_cnt > 32) {
-      using moe_policy = grouped_gemm::moe_mxfp4_policy;
-      CALL_KERNEL_WITH_POLICY(moe_policy);
+      DISPATCH_PREFILL_TILE(moe_mxfp4, kMXFP4);
     } else {
       using moe_policy = grouped_gemm::moe_mxfp4_mid_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);

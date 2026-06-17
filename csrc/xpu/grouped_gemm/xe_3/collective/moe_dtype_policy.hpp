@@ -312,6 +312,41 @@ class moe_mxfp8_policy : public moe_policy_base {
   CALL_GENERATE_GEMM();
 };
 
+// MXFP8 prefill tile variants selected by pick_prefill_tile() to keep the
+// 32 Xe cores fully packed (wave quantization). Mirrors the bf16 variants.
+class moe_mxfp8_256x128_policy : public moe_mxfp8_policy {
+ public:
+  using TileShape = Shape<_256, _128, _64>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_mxfp8_128x256_policy : public moe_mxfp8_policy {
+ public:
+  using TileShape = Shape<_128, _256, _64>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_mxfp8_128x128_policy : public moe_mxfp8_policy {
+ public:
+  using TileShape = Shape<_128, _128, _64>;
+  using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
 class moe_mxfp8_unaligned_policy : public moe_mxfp8_policy {
  public:
   using GEMMDispatchPolicy =
@@ -366,6 +401,40 @@ class moe_mxfp4_policy : public moe_policy_base {
       SGLayout>::TiledMMA;
 
   using GEMMDispatchPolicy = cutlass::gemm::MainloopMXFPXGroup<PipelineStages>;
+  CALL_GENERATE_GEMM();
+};
+
+// MXFP4 prefill tile variants selected by pick_prefill_tile().
+class moe_mxfp4_256x128_policy : public moe_mxfp4_policy {
+ public:
+  using TileShape = Shape<_256, _128, _128>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_mxfp4_128x256_policy : public moe_mxfp4_policy {
+ public:
+  using TileShape = Shape<_128, _256, _128>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_mxfp4_128x128_policy : public moe_mxfp4_policy {
+ public:
+  using TileShape = Shape<_128, _128, _128>;
+  using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
   CALL_GENERATE_GEMM();
 };
 
