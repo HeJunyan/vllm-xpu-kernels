@@ -10,10 +10,20 @@ from tests.ops.mx_utils import (_bfloat16_to_float4_e2m1fn_x2,
 from tests.utils import seed_everything
 from vllm_xpu_kernels.fused_moe_interface import cutlass_grouped_gemm
 
-# CRI simulator warmup: the very first CUTLASS grouped GEMM dispatch
-# in a fresh process may produce incorrect results.  Run a dummy
-# GEMM to stabilise the device state.
-if torch.xpu.is_available() and torch.ops._xpu_C.is_cri(0):
+_CRI_GROUPED_GEMM_WARMED_UP = False
+
+
+def maybe_warm_up_cri_grouped_gemm() -> None:
+    global _CRI_GROUPED_GEMM_WARMED_UP
+
+    if _CRI_GROUPED_GEMM_WARMED_UP:
+        return
+    if not torch.xpu.is_available() or not torch.ops._xpu_C.is_cri(0):
+        return
+
+    # CRI simulator warmup: the very first CUTLASS grouped GEMM dispatch
+    # in a fresh process may produce incorrect results. Run a dummy GEMM
+    # at test runtime, not import time, so pytest collection stays safe.
     _m, _n, _k = 32, 128, 128
     _a = torch.randn(_m, _k, dtype=torch.bfloat16, device="xpu")
     _b = torch.randn(1, _k, _n, dtype=torch.bfloat16, device="xpu")
@@ -21,6 +31,7 @@ if torch.xpu.is_available() and torch.ops._xpu_C.is_cri(0):
     cutlass_grouped_gemm(_a, None, _b, None, None, _o, [_m], _n, _k, 1)
     torch.xpu.synchronize()
     del _a, _b, _o
+    _CRI_GROUPED_GEMM_WARMED_UP = True
 
 pytestmark = pytest.mark.skipif(
     not torch.ops._xpu_C.is_cri(0) and not torch.ops._xpu_C.is_nvl_p(0),
@@ -32,6 +43,11 @@ KERNEL_DEVICE = "xpu"
 
 def _to_kernel(x):
     return None if x is None else x.to(KERNEL_DEVICE)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def warm_up_cri_grouped_gemm():
+    maybe_warm_up_cri_grouped_gemm()
 
 # shape for Llama-4-scout
 FUSED_MOE_MNK_FACTORS = [
