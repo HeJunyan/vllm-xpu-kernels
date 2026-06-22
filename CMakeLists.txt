@@ -67,12 +67,6 @@ if(BUILD_ON_NVL AND BUILD_ON_SIMULATOR_JGS)
       "Both BUILD_ON_NVL and BUILD_ON_SIMULATOR_JGS are set. Please set only one."
   )
 endif()
-if(BUILD_ON_SIMULATOR_CRI AND BUILD_ON_NVL)
-  message(
-    FATAL_ERROR
-      "Both BUILD_ON_SIMULATOR_CRI and BUILD_ON_NVL are set. Please set only one."
-  )
-endif()
 if(BUILD_ON_SIMULATOR_CRI AND BUILD_ON_SIMULATOR_JGS)
   message(
     FATAL_ERROR
@@ -148,28 +142,12 @@ if(NOT VLLM_CHUNK_PREFILL_CONFIG OR "${VLLM_CHUNK_PREFILL_CONFIG}" STREQUAL "")
   )
 endif()
 
-message(STATUS "Kernel build configuration:")
-message(STATUS "  BUILD_SYCL_TLA_KERNELS       = ${BUILD_SYCL_TLA_KERNELS}")
-message(STATUS "  VLLM_XPU_ENABLE_XE2          = ${VLLM_XPU_ENABLE_XE2}")
-message(STATUS "  VLLM_XPU_ENABLE_XE3          = ${VLLM_XPU_ENABLE_XE3}")
-message(STATUS "  VLLM_XPU_ENABLE_XE4          = ${VLLM_XPU_ENABLE_XE4}")
-message(STATUS "  VLLM_XPU_ENABLE_XE_DEFAULT   = ${VLLM_XPU_ENABLE_XE_DEFAULT}")
-message(STATUS "  BASIC_KERNELS_ENABLED        = ${BASIC_KERNELS_ENABLED}")
-message(STATUS "  FA2_KERNELS_ENABLED          = ${FA2_KERNELS_ENABLED}")
-message(STATUS "  MOE_KERNELS_ENABLED          = ${MOE_KERNELS_ENABLED}")
-message(STATUS "  GDN_KERNELS_ENABLED          = ${GDN_KERNELS_ENABLED}")
-message(STATUS "  MQA_LOGITS_KERNELS_ENABLED   = ${MQA_LOGITS_KERNELS_ENABLED}")
-message(
-  STATUS "  XPU_SPECIFIC_KERNELS_ENABLED = ${XPU_SPECIFIC_KERNELS_ENABLED}")
-message(STATUS "  XPUMEM_ALLOCATOR_ENABLED     = ${XPUMEM_ALLOCATOR_ENABLED}")
-message(STATUS "  VLLM_PAGED_DECODE_CONFIG     = ${VLLM_PAGED_DECODE_CONFIG}")
-message(STATUS "  VLLM_CHUNK_PREFILL_CONFIG    = ${VLLM_CHUNK_PREFILL_CONFIG}")
-message(STATUS "")
+if(VLLM_XPU_ENABLE_XE2)
+  message(STATUS "Building on XE2, enable XE2 kernels.")
+endif()
 
 if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
-  message(STATUS "Building on CRI simulator, enable XE3 kernels only.")
-  set(VLLM_XPU_ENABLE_XE2 OFF) # actually we can enable XE2 as well on CRI
-                               # simulator, but we will never test it there
+  message(STATUS "Building on CRI simulator, enable XE3 kernels.")
   set(VLLM_XPU_ENABLE_XE3 ON)
   set(VLLM_XPU_ENABLE_XE4 OFF)
   set(VLLM_XPU_ENABLE_XE_DEFAULT OFF)
@@ -189,6 +167,24 @@ if(BUILD_ON_SIMULATOR_JGS)
       "prv-xe4"
       CACHE STRING "Specific prv-xe4 for oneDNN on JGS")
 endif()
+
+message(STATUS "Kernel build configuration:")
+message(STATUS "  BUILD_SYCL_TLA_KERNELS       = ${BUILD_SYCL_TLA_KERNELS}")
+message(STATUS "  VLLM_XPU_ENABLE_XE2          = ${VLLM_XPU_ENABLE_XE2}")
+message(STATUS "  VLLM_XPU_ENABLE_XE3          = ${VLLM_XPU_ENABLE_XE3}")
+message(STATUS "  VLLM_XPU_ENABLE_XE4          = ${VLLM_XPU_ENABLE_XE4}")
+message(STATUS "  VLLM_XPU_ENABLE_XE_DEFAULT   = ${VLLM_XPU_ENABLE_XE_DEFAULT}")
+message(STATUS "  BASIC_KERNELS_ENABLED        = ${BASIC_KERNELS_ENABLED}")
+message(STATUS "  FA2_KERNELS_ENABLED          = ${FA2_KERNELS_ENABLED}")
+message(STATUS "  MOE_KERNELS_ENABLED          = ${MOE_KERNELS_ENABLED}")
+message(STATUS "  GDN_KERNELS_ENABLED          = ${GDN_KERNELS_ENABLED}")
+message(STATUS "  MQA_LOGITS_KERNELS_ENABLED   = ${MQA_LOGITS_KERNELS_ENABLED}")
+message(
+  STATUS "  XPU_SPECIFIC_KERNELS_ENABLED = ${XPU_SPECIFIC_KERNELS_ENABLED}")
+message(STATUS "  XPUMEM_ALLOCATOR_ENABLED     = ${XPUMEM_ALLOCATOR_ENABLED}")
+message(STATUS "  VLLM_PAGED_DECODE_CONFIG     = ${VLLM_PAGED_DECODE_CONFIG}")
+message(STATUS "  VLLM_CHUNK_PREFILL_CONFIG    = ${VLLM_CHUNK_PREFILL_CONFIG}")
+message(STATUS "")
 
 #
 # Try to find python package with an executable that exactly matches
@@ -286,8 +282,8 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # VLLM_XPU_AOT_DEVICES and VLLM_XPU_XE2_AOT_DEVICES Example: export
   # VLLM_XPU_AOT_DEVICES="pvc,bmg-g21-a0" export
   # VLLM_XPU_XE2_AOT_DEVICES="pvc,bmg-g31-a0"
-  set(AOT_DEVICES "pvc,bmg,bmg-g21-a0,bmg-g31-a0")
-  set(XE2_AOT_DEVICES "pvc,bmg,bmg-g21-a0,bmg-g31-a0")
+  set(AOT_DEVICES "bmg")
+  set(XE2_AOT_DEVICES "bmg")
 
   # Allow overriding via env, including explicitly disabling AOT by setting an
   # empty env var (e.g. export VLLM_XPU_AOT_DEVICES="").
@@ -306,14 +302,10 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   set(SYCL_COMPILE_FLAGS ${SYCL_FLAGS})
   set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} "-O3" "-DNDEBUG")
-  if(BUILD_ON_SIMULATOR_CRI)
-    set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=intel_gpu_cri)
-  elseif(BUILD_ON_NVL)
-    set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=intel_gpu_nvl_p)
+  if(VLLM_XPU_ENABLE_XE2 OR VLLM_XPU_ENABLE_XE3)
+    set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=spir64_gen)
   elseif(BUILD_ON_SIMULATOR_JGS)
     set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -no-ftz -fsycl-targets=pisa)
-  elseif(AOT_DEVICES)
-    set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=spir64_gen)
   endif()
   # Final build option be like: icpx -fsycl -fsycl-target=spir64_gen
   # ${SYCL_KERNEL_OPTIONS} -fsycl-host-compiler=gcc
@@ -326,7 +318,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_LINK_FLAGS})
   set(SYCL_DEVICE_LINK_FLAGS
-      ${SYCL_DEVICE_LINK_FLAGS} -fsycl-max-parallel-link-jobs=16
+      ${SYCL_DEVICE_LINK_FLAGS} -fsycl-max-parallel-link-jobs=64
       -Wno-sycl-target -flink-huge-device-code)
   if(BUILD_ON_SIMULATOR_JGS)
     set(SYCL_DEVICE_LINK_FLAGS
@@ -344,13 +336,18 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
         "-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"
     )
   endif()
+  set(XE3_AOT_DEVICES "cri,cri-a0")
   if(BUILD_ON_NVL)
-    set(XE3_AOT_DEVICES "nvl-p,nvl-p-a0")
-  else()
-    set(XE3_AOT_DEVICES "cri-a0")
+    set(XE3_AOT_DEVICES "${XE3_AOT_DEVICES},nvl-p-a0,nvl-p")
   endif()
   set(XE4_AOT_DEVICES "jgs-a0")
-  if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
+
+  # temporary solution.
+  if(VLLM_XPU_ENABLE_XE2 AND VLLM_XPU_ENABLE_XE3)
+    set(AOT_DEVICES "${XE2_AOT_DEVICES},${XE3_AOT_DEVICES}")
+  elseif(VLLM_XPU_ENABLE_XE2)
+    set(AOT_DEVICES ${XE2_AOT_DEVICES})
+  elseif(VLLM_XPU_ENABLE_XE3)
     set(AOT_DEVICES ${XE3_AOT_DEVICES})
   endif()
   if(BUILD_ON_SIMULATOR_JGS)
@@ -402,7 +399,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
   # when building.
-  if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
+  if(VLLM_XPU_ENABLE_XE3)
     # Bumped to PR #570 (libraries.ai.cutlass.internal) which improves MXFP4/8
     # perf when M is unaligned by folding the scalar scale-load fallback into
     # the regular optimized block-scaled mainloop (the 2D scale loader now
@@ -412,11 +409,12 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
         "71ddc8dc059d24bf26158be87c868d1f11b07b69"
         CACHE STRING "CUTLASS revision to use")
   elseif(BUILD_ON_SIMULATOR_JGS)
-    # Bumped to latest master_next (provides Xe4BlockScaledConfig, XE4_ADMA_LOAD,
-    # and bs_op_selector required by the low-precision (mxfp8/nvfp4) grouped GEMM
-    # vendored from xiaoli/low_precision_moe_grouped_gemm.
-    # PR #563 (dynamic descriptor update) is merged into this revision.
-    # TODO: switch to a release tag/version in future
+    # Bumped to latest master_next (provides Xe4BlockScaledConfig,
+    # XE4_ADMA_LOAD, and bs_op_selector required by the low-precision
+    # (mxfp8/nvfp4) grouped GEMM vendored from
+    # xiaoli/low_precision_moe_grouped_gemm. PR #563 (dynamic descriptor update)
+    # is merged into this revision. TODO: switch to a release tag/version in
+    # future
     set(CUTLASS_REVISION
         "a69377d32b088b620527bc83f8a4d10cd5b38067"
         CACHE STRING "CUTLASS revision to use")
@@ -428,27 +426,38 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   if(BUILD_ON_SIMULATOR_JGS)
     # PR #563 (dynamic descriptor update) is now merged into master_next at the
-    # pinned revision above. Apply PR #605 (Fix XE4 ADMA alignment validation for
-    # SYCL device builds) which is still under review. The patch is fetched at
-    # configure time from the GitHub API into the build directory; it is NOT
+    # pinned revision above. Apply PR #605 (Fix XE4 ADMA alignment validation
+    # for SYCL device builds) which is still under review. The patch is fetched
+    # at configure time from the GitHub API into the build directory; it is NOT
     # stored in this repository.
     set(_PR605_PATCH_URL
-        "https://api.github.com/repos/intel-innersource/libraries.ai.cutlass.internal/pulls/605")
+        "https://api.github.com/repos/intel-innersource/libraries.ai.cutlass.internal/pulls/605"
+    )
     set(_PR605_PATCH_FILE "${CMAKE_BINARY_DIR}/cutlass-pr-605.patch")
-    file(DOWNLOAD "${_PR605_PATCH_URL}" "${_PR605_PATCH_FILE}"
-         HTTPHEADER "Accept: application/vnd.github.v3.patch"
-         NETRC OPTIONAL
-         STATUS _pr605_download_status)
+    file(
+      DOWNLOAD "${_PR605_PATCH_URL}" "${_PR605_PATCH_FILE}"
+      HTTPHEADER "Accept: application/vnd.github.v3.patch"
+      NETRC OPTIONAL
+      STATUS _pr605_download_status)
     list(GET _pr605_download_status 0 _pr605_download_err)
     if(NOT _pr605_download_err EQUAL 0)
-      message(FATAL_ERROR
-        "Failed to download CUTLASS PR #605 patch: ${_pr605_download_status}\n"
-        "URL: ${_PR605_PATCH_URL}\n"
-        "Ensure ~/.netrc has a valid GitHub token for api.github.com.")
+      message(
+        FATAL_ERROR
+          "Failed to download CUTLASS PR #605 patch: ${_pr605_download_status}\n"
+          "URL: ${_PR605_PATCH_URL}\n"
+          "Ensure ~/.netrc has a valid GitHub token for api.github.com.")
     endif()
     set(_VLLM_CUTLASS_PATCH_CMD
-        git apply --whitespace=nowarn "${_PR605_PATCH_FILE}"
-        || git apply --reverse --check "${_PR605_PATCH_FILE}")
+        git
+        apply
+        --whitespace=nowarn
+        "${_PR605_PATCH_FILE}"
+        ||
+        git
+        apply
+        --reverse
+        --check
+        "${_PR605_PATCH_FILE}")
   else()
     set(_VLLM_CUTLASS_PATCH_CMD "")
   endif()
@@ -489,25 +498,22 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   set(CUTLASS_ENABLE_SYCL "ON")
   # TODO: make this a list TODO: this may be not needed anymore since we will
   # add this in each cmake target
-  if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
+  if(VLLM_XPU_ENABLE_XE3)
     set(DPCPP_SYCL_TARGET
         "intel_gpu_cri"
         CACHE STRING "DPC++ SYCL target architectures")
     # FIXME: these are sycl-tla internal.
-    list(APPEND VLLM_CUTLASS_FLAGS "-DSYCL_INTEL_TARGET=35")
   elseif(BUILD_ON_SIMULATOR_JGS)
     set(DPCPP_SYCL_TARGET
         "intel_gpu_jgs"
         CACHE STRING "DPC++ SYCL target architectures")
     # FIXME: these are sycl-tla internal.
-    list(APPEND VLLM_CUTLASS_FLAGS "-DSYCL_INTEL_TARGET=40")
     list(APPEND VLLM_CUTLASS_FLAGS "-DSYCL_INTEL_XE4_TARGET")
   else()
     set(DPCPP_SYCL_TARGET
         "intel_gpu_bmg_g21"
         CACHE STRING "DPC++ SYCL target architectures")
     # FIXME: these are sycl-tla internal.
-    list(APPEND VLLM_CUTLASS_FLAGS "-DSYCL_INTEL_TARGET=20")
   endif()
 
   set(CMAKE_EXPORT_COMPILE_COMMANDS "ON")
@@ -606,10 +612,14 @@ if(BUILD_SYCL_TLA_KERNELS)
     # for the block-scaled MXFP8/NVFP4 pipelines. Use Xiaoli's reference link
     # flags from examples/xe4/scaled_grouped_gemm instead.
     set_target_properties(grouped_gemm_xe_4 PROPERTIES LINK_OPTIONS "")
-    target_link_options(grouped_gemm_xe_4 PRIVATE
-        ${SYCL_LINK_FLAGS} -fsycl -fsycl-targets=pisa
-        -fsycl-max-parallel-link-jobs=16
-        "-device ${XE4_AOT_DEVICES}")
+    target_link_options(
+      grouped_gemm_xe_4
+      PRIVATE
+      ${SYCL_LINK_FLAGS}
+      -fsycl
+      -fsycl-targets=pisa
+      -fsycl-max-parallel-link-jobs=16
+      "-device ${XE4_AOT_DEVICES}")
     list(APPEND ATTN_KERNEL_LIB_NAME "attn_kernels_xe_4")
     list(APPEND GROUPED_GEMM_LIB_NAME "grouped_gemm_xe_4")
     list(APPEND SYCL_TLA_COMPILE_OPTIONS -DVLLM_XPU_ENABLE_XE4)
