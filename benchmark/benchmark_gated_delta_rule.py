@@ -22,6 +22,7 @@ Output format matches benchmark_gdn_attn.py
 """
 # isort: off
 import gc
+import time
 
 import torch
 import triton
@@ -41,6 +42,7 @@ from benchmark_gdn_attn import (
     WORKLOADS,
     _bpe,
     make_inputs,
+    normalize_dtype_str,
 )
 # isort: on
 
@@ -151,18 +153,26 @@ def estimate_flops(kwargs):
     hv = kwargs["head_v_dim"]
     return n_tok * (7 * nv * hv * hk + 2 * nv * hv)
 
-
 # ----------------------------------------------------------------------------
 # Benchmark driver (mirrors benchmark_gdn_attn.py)
 # ----------------------------------------------------------------------------
-def benchmark_gated_delta_rule(shape_name, workload_name, dtype_str, provider,
-                               iterations):
+# triton.testing.perf_report calls the benchmarked function once per
+# line_arg (here: once per provider) for the same (shape, workload, dtype)
+# config. Latency/Mem_BW/MBU/TFLOPS are all derived from the same timing run,
+# so re-running the kernel for each provider is redundant. Cache the single
+# real measurement per config and let each provider just re-derive its metric
+# from the cached (ms, bytes_moved, flops) triple.
+_MEASUREMENT_CACHE = {}
+
+
+def _measure_gated_delta_rule(shape_name, workload_name, dtype_str,
+                              iterations):
     shape = next(s for s in MODEL_SHAPES if s.name == shape_name)
     workload = next(w for w in WORKLOADS if w.name == workload_name)
     dtype = torch.bfloat16 if dtype_str == "bf16" else torch.float16
 
     print(f"Running config: shape={shape.name}, workload={workload.name}, "
-          f"dtype={dtype_str}, Provider: {provider}", flush=True)
+          f"dtype={dtype_str}", flush=True)
     assert iterations > 5, \
         "Number of iterations should be greater than 5 to account for warmup"
 
@@ -215,40 +225,64 @@ def benchmark_gated_delta_rule(shape_name, workload_name, dtype_str, provider,
                 num_actual_tokens=kwargs["num_actual_tokens"],
                 tp_size=kwargs["tp_size"])
 
-    # warmup
-    for _ in range(5):
+    # cooldown: return the GPU to a consistent idle baseline so DVFS/thermal
+    # state left by the previous config does not bleed into this measurement.
+    torch.xpu.synchronize()
+    time.sleep(0.02)
+
+    # warmup: run for at least ~50ms (and >=5 iters) so tiny ops reach their
+    # own steady-state clock, independent of the preceding workload.
+    _t0 = time.perf_counter()
+    _n = 0
+    while _n < 5 or (time.perf_counter() - _t0) < 0.05:
         _run()
+        _n += 1
     torch.xpu.synchronize()
 
-    start_event = torch.xpu.Event(enable_timing=True)
-    end_event = torch.xpu.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(5, iterations):
-        _run()
-    end_event.record()
-    torch.xpu.synchronize()
-    ms = start_event.elapsed_time(end_event) / (iterations - 5)
+    # Robust timing: take the MIN over several batched sub-measurements.
+    # For launch-bound (~us) ops the mean is skewed by occasional OS/DVFS
+    # jitter, producing phantom run-to-run regressions; the min tracks the
+    # true steady-state floor and is stable to <1%.
+    n_timed = max(iterations - 5, 1)
+    n_rep = 8
+    per_rep = max(n_timed // n_rep, 1)
+    ms = float("inf")
+    for _ in range(n_rep):
+        start_event = torch.xpu.Event(enable_timing=True)
+        end_event = torch.xpu.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(per_rep):
+            _run()
+        end_event.record()
+        torch.xpu.synchronize()
+        ms = min(ms, start_event.elapsed_time(end_event) / per_rep)
+
+    bytes_moved = estimate_bytes_moved(kwargs, intermediates)
+    flops = estimate_flops(kwargs)
+    clear_xpu_cache()
+    return ms, bytes_moved, flops
+
+
+def benchmark_gated_delta_rule(shape_name, workload_name, dtype_str, provider,
+                               iterations):
+    cache_key = (shape_name, workload_name, dtype_str)
+    if cache_key not in _MEASUREMENT_CACHE:
+        _MEASUREMENT_CACHE[cache_key] = _measure_gated_delta_rule(
+            shape_name, workload_name, dtype_str, iterations)
+    ms, bytes_moved, flops = _MEASUREMENT_CACHE[cache_key]
 
     if provider == "delta":
-        clear_xpu_cache()
         return 1000 * ms  # us
     if provider == "delta_memBandwidth":
-        bytes_moved = estimate_bytes_moved(kwargs, intermediates)
-        clear_xpu_cache()
         return (bytes_moved / 1e9) / (ms / 1000)  # GB/s
     if provider == "delta_MBU":
         hardware_presets = get_hardware_preset(torch.xpu.get_device_name())
         if hardware_presets is None:
-            clear_xpu_cache()
             return float("nan")
         peak_bw = hardware_presets["memory_bandwidth_GBs"]
-        bytes_moved = estimate_bytes_moved(kwargs, intermediates)
         bw = (bytes_moved / 1e9) / (ms / 1000)
-        clear_xpu_cache()
         return (bw / peak_bw) * 100
     if provider == "delta_TFLOPS":
-        flops = estimate_flops(kwargs)
-        clear_xpu_cache()
         return flops / (ms / 1000) / 1e12
     raise ValueError(f"Unknown provider {provider}")
 
@@ -267,14 +301,14 @@ def get_benchmark(configs, iterations=20):
                 "delta_TFLOPS",
             ],
             line_names=[
-                "GatedDeltaRule(us)",
-                "GatedDeltaRule_memBandwidth(GB/s)",
-                "GatedDeltaRule_MBU (%)",
-                "GatedDeltaRule_TFLOPS",
+                "Latency(us)",
+                "Mem_Bandwidth(GB/s)",
+                "MBU (%)",
+                "TFLOPS",
             ],
             styles=[("blue", "-"), ("purple", "-"), ("red", "-"),
                     ("green", "-")],
-            ylabel="Latency (us)",
+            ylabel="Value",
             plot_name="gated-delta-rule",
             args={},
         ))
@@ -301,7 +335,9 @@ if __name__ == "__main__":
     torch.set_default_device("xpu")
     torch.xpu.set_device("xpu:0")
 
-    configs = gen_perf_configs("bf16")
+    dtype_str = normalize_dtype_str(args.dtype)
+    print(f"Benchmarking dtype: {dtype_str}", flush=True)
+    configs = gen_perf_configs(dtype_str)
     benchmark = get_benchmark(configs, iterations=iterations)
     save_path = ensure_save_path_exists(args.save_path)
     benchmark.run(print_data=True, save_path=save_path)
