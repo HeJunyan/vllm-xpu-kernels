@@ -413,10 +413,10 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
     # XE4_ADMA_LOAD, and bs_op_selector required by the low-precision
     # (mxfp8/nvfp4) grouped GEMM vendored from
     # xiaoli/low_precision_moe_grouped_gemm. PR #563 (dynamic descriptor update)
-    # is merged into this revision. TODO: switch to a release tag/version in
-    # future
+    # and PR #605 (Fix XE4 ADMA alignment validation) are both merged into this
+    # revision. TODO: switch to a release tag/version in future
     set(CUTLASS_REVISION
-        "a69377d32b088b620527bc83f8a4d10cd5b38067"
+        "e5097396a69862201d1717ef2d1cbb23f5f7fd9b"
         CACHE STRING "CUTLASS revision to use")
   else()
     set(CUTLASS_REVISION
@@ -424,41 +424,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
         CACHE STRING "CUTLASS revision to use")
   endif()
 
-  if(BUILD_ON_SIMULATOR_JGS)
-    # PR #563 (dynamic descriptor update) is now merged into master_next at the
-    # pinned revision above. Apply PR #605 (Fix XE4 ADMA alignment validation
-    # for SYCL device builds) which is still under review. The patch is fetched
-    # at configure time from the GitHub API into the build directory; it is NOT
-    # stored in this repository.
-    set(_PR605_PATCH_URL
-        "https://api.github.com/repos/intel-innersource/libraries.ai.cutlass.internal/pulls/605"
-    )
-    set(_PR605_PATCH_FILE "${CMAKE_BINARY_DIR}/cutlass-pr-605.patch")
-    file(
-      DOWNLOAD "${_PR605_PATCH_URL}" "${_PR605_PATCH_FILE}"
-      HTTPHEADER "Accept: application/vnd.github.v3.patch"
-      NETRC OPTIONAL
-      STATUS _pr605_download_status)
-    list(GET _pr605_download_status 0 _pr605_download_err)
-    if(NOT _pr605_download_err EQUAL 0)
-      message(
-        FATAL_ERROR
-          "Failed to download CUTLASS PR #605 patch: ${_pr605_download_status}\n"
-          "URL: ${_PR605_PATCH_URL}\n"
-          "Ensure ~/.netrc has a valid GitHub token for api.github.com.")
-    endif()
-    set(_VLLM_CUTLASS_PATCH_CMD
-        git
-        apply
-        --whitespace=nowarn
-        "${_PR605_PATCH_FILE}"
-        ||
-        git
-        apply
-        --reverse
-        --check
-        "${_PR605_PATCH_FILE}")
-  else()
+  if(NOT BUILD_ON_SIMULATOR_JGS)
     set(_VLLM_CUTLASS_PATCH_CMD "")
   endif()
 
