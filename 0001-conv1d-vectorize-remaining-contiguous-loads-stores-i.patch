@@ -1,0 +1,114 @@
+From af0b7053b264c831564a4b8ac8a382adb044691f Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Mon, 22 Jun 2026 10:23:04 +0000
+Subject: [PATCH] conv1d: vectorize remaining contiguous loads/stores in
+ causal_conv1d_kernel
+
+Complete the vectorization of causal_conv1d_kernel so every contiguous
+global access uses a single vector message:
+  - conv_weights load: the Width taps of each channel are contiguous, so
+    load them with a width-templated vector message (new load_vecN<N>,
+    falls back to scalar for non-native widths like 5).
+  - conv_states_tmp store (prefill) and conv_states_ptr store (decode):
+    gather the strided source from registers and emit one store_vec_t
+    over elems_per_item.
+
+Throughput is unchanged at the bandwidth-saturated working points
+(b64/b128 already sit at the ~450 GB/s GDDR6 roofline); the change is
+kept for consistency and reduces SEND-message count on the weight/state
+paths. Marginally helps the not-yet-saturated b256/b512.
+Correctness: tests/gdn_attn/test_causal_conv1d.py 96/96 passed.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ csrc/xpu/gdn_attn/causal_conv1d.hpp | 45 ++++++++++++++++++++++-------
+ 1 file changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/csrc/xpu/gdn_attn/causal_conv1d.hpp b/csrc/xpu/gdn_attn/causal_conv1d.hpp
+index 2d2fa1e..4b8500b 100644
+--- a/csrc/xpu/gdn_attn/causal_conv1d.hpp
++++ b/csrc/xpu/gdn_attn/causal_conv1d.hpp
+@@ -121,6 +121,24 @@ struct causal_conv1d_kernel {
+     }
+   }
+ 
++  // Load N contiguous T values. Uses a single vector message when N is a
++  // natively-supported, safely-aligned vector width; otherwise per-element.
++  template <int N>
++  static inline void load_vecN(const T* ptr, T (&dst)[N]) {
++    if constexpr (N == 2 || N == 4 || N == 8 || N == 16) {
++      sycl::vec<T, N> in = *reinterpret_cast<const sycl::vec<T, N>*>(ptr);
++#pragma unroll
++      for (int i = 0; i < N; ++i) {
++        dst[i] = in[i];
++      }
++    } else {
++#pragma unroll
++      for (int i = 0; i < N; ++i) {
++        dst[i] = ptr[i];
++      }
++    }
++  }
++
+   [[sycl::reqd_sub_group_size(sub_group_size)]] void
+   operator()(sycl::nd_item<2> item) const {
+     const int token_id = item.get_group(0);
+@@ -273,14 +291,16 @@ struct causal_conv1d_kernel {
+          (has_initial_state != nullptr && has_initial_state[batch_id]));
+     T* conv_states_ptr = conv_states + states_id * conv_states_stride_0;
+ 
+-    // load weights
++    // load weights. For a given channel the Width taps are contiguous in
++    // conv_weights, so load them with a single vector message per channel.
+     T local_weights[Width * elems_per_item];
+ #pragma unroll
+-    for (int i = 0; i < Width; ++i) {
++    for (int e = 0; e < elems_per_item; ++e) {
++      T wtmp[Width];
++      load_vecN<Width>(&conv_weights[(reordered_elems_id + e) * Width], wtmp);
+ #pragma unroll
+-      for (int e = 0; e < elems_per_item; ++e) {
+-        local_weights[Width * e + i] =
+-            conv_weights[(reordered_elems_id + e) * Width + i];
++      for (int i = 0; i < Width; ++i) {
++        local_weights[Width * e + i] = wtmp[i];
+       }
+     }
+ 
+@@ -353,23 +373,28 @@ struct causal_conv1d_kernel {
+       if (seq_end_offset - 1 == token_id) {
+ #pragma unroll
+         for (int i = 0; i < Width - 1; ++i) {
++          T stmp[elems_per_item];
+ #pragma unroll
+           for (int e = 0; e < elems_per_item; ++e) {
+-            conv_states_tmp
+-                [batch_id * (Width - 1) * conv_elems + i * conv_elems +
+-                 reordered_elems_id + e] = local_input[Width * e + i + 1];
++            stmp[e] = local_input[Width * e + i + 1];
+           }
++          store_vec_t(
++              &conv_states_tmp[batch_id * (Width - 1) * conv_elems +
++                               i * conv_elems + reordered_elems_id],
++              stmp);
+         }
+       }
+     } else {
+ // update states inplace if decode
+ #pragma unroll
+       for (int i = 0; i < Width - 1; ++i) {
++        T stmp[elems_per_item];
+ #pragma unroll
+         for (int e = 0; e < elems_per_item; ++e) {
+-          conv_states_ptr[i * conv_elems + reordered_elems_id + e] =
+-              local_input[Width * e + i + 1];
++          stmp[e] = local_input[Width * e + i + 1];
+         }
++        store_vec_t(
++            &conv_states_ptr[i * conv_elems + reordered_elems_id], stmp);
+       }
+     }
+ 
+-- 
+2.43.0
+
