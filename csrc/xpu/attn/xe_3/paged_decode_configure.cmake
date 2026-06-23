@@ -16,7 +16,7 @@
 # qgroup,headsize,pagesize[,causal,local,sink] - If boolean flags omitted, all 8
 # combinations are generated
 #
-# XE3 note: Only page sizes 64/128 and head sizes 64-256 are supported.
+# XE3 note: head sizes 64-256 plus 512/576 (MLA decode) are supported.
 # =============================================================================
 
 # Default config path (can be overridden via cmake
@@ -76,7 +76,7 @@ function(paged_decode_configure FILENAME_SUFFIX)
   # Policy Configuration Mapping (XE3)
   # =============================================================================
   # Maps (q_group_size, head_size, page_size) to policy type names XE3 supports:
-  # qgroup 8/16, headsize 64-256, pagesize 64/128
+  # qgroup 8/16, headsize 64-576, pagesize 64/128 (512/576 for MLA decode)
 
   # Q-group size 8 policies
   set(policy_8_64_16 "decode_policy_q8_h64_p16")
@@ -84,24 +84,30 @@ function(paged_decode_configure FILENAME_SUFFIX)
   set(policy_8_128_16 "decode_policy_q8_h128_p16")
   set(policy_8_192_16 "decode_policy_q8_h192_p16")
   set(policy_8_256_16 "decode_policy_q8_h256_p16")
+  set(policy_8_512_16 "decode_policy_q8_h512_p16")
 
   set(policy_8_64_32 "decode_policy_q8_h64_p32")
   set(policy_8_96_32 "decode_policy_q8_h96_p32")
   set(policy_8_128_32 "decode_policy_q8_h128_p32")
   set(policy_8_192_32 "decode_policy_q8_h192_p32")
   set(policy_8_256_32 "decode_policy_q8_h256_p32")
+  set(policy_8_512_32 "decode_policy_q8_h512_p32")
 
   set(policy_8_64_64 "decode_policy_q8_h64_p64")
   set(policy_8_96_64 "decode_policy_q8_h96_p64")
   set(policy_8_128_64 "decode_policy_q8_h128_p64")
   set(policy_8_192_64 "decode_policy_q8_h192_p64")
   set(policy_8_256_64 "decode_policy_q8_h256_p64")
+  set(policy_8_512_64 "decode_policy_q8_h512_p64")
+  set(policy_8_576_64 "decode_policy_q8_h576_p64")
 
   set(policy_8_64_128 "decode_policy_q8_h64_p128")
   set(policy_8_96_128 "decode_policy_q8_h96_p128")
   set(policy_8_128_128 "decode_policy_q8_h128_p128")
   set(policy_8_192_128 "decode_policy_q8_h192_p128")
   set(policy_8_256_128 "decode_policy_q8_h256_p128")
+  set(policy_8_512_128 "decode_policy_q8_h512_p128")
+  set(policy_8_576_128 "decode_policy_q8_h576_p128")
 
   # Q-group size 16 policies
   set(policy_16_64_16 "decode_policy_q16_h64_p16")
@@ -109,28 +115,34 @@ function(paged_decode_configure FILENAME_SUFFIX)
   set(policy_16_128_16 "decode_policy_q16_h128_p16")
   set(policy_16_192_16 "decode_policy_q16_h192_p16")
   set(policy_16_256_16 "decode_policy_q16_h256_p16")
+  set(policy_16_512_16 "decode_policy_q16_h512_p16")
 
   set(policy_16_64_32 "decode_policy_q16_h64_p32")
   set(policy_16_96_32 "decode_policy_q16_h96_p32")
   set(policy_16_128_32 "decode_policy_q16_h128_p32")
   set(policy_16_192_32 "decode_policy_q16_h192_p32")
   set(policy_16_256_32 "decode_policy_q16_h256_p32")
+  set(policy_16_512_32 "decode_policy_q16_h512_p32")
 
   set(policy_16_64_64 "decode_policy_q16_h64_p64")
   set(policy_16_96_64 "decode_policy_q16_h96_p64")
   set(policy_16_128_64 "decode_policy_q16_h128_p64")
   set(policy_16_192_64 "decode_policy_q16_h192_p64")
   set(policy_16_256_64 "decode_policy_q16_h256_p64")
+  set(policy_16_512_64 "decode_policy_q16_h512_p64")
+  set(policy_16_576_64 "decode_policy_q16_h576_p64")
 
   set(policy_16_64_128 "decode_policy_q16_h64_p128")
   set(policy_16_96_128 "decode_policy_q16_h96_p128")
   set(policy_16_128_128 "decode_policy_q16_h128_p128")
   set(policy_16_192_128 "decode_policy_q16_h192_p128")
   set(policy_16_256_128 "decode_policy_q16_h256_p128")
+  set(policy_16_512_128 "decode_policy_q16_h512_p128")
+  set(policy_16_576_128 "decode_policy_q16_h576_p128")
 
   # Configuration space dimensions (for "all" mode)
   set(qgroup_list "8" "16")
-  set(headsize_list "64" "96" "128" "192" "256")
+  set(headsize_list "64" "96" "128" "192" "256" "512" "576")
   set(pagesize_list "16" "32" "64" "128")
 
   # =============================================================================

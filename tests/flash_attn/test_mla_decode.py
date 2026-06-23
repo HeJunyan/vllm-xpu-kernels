@@ -22,6 +22,20 @@ from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
 DEVICE = "xpu"
 
 
+# Mini-scope overrides: shrink the full parametrization (2 block_sizes x
+# 3 seq sets x 3 num_heads_q = 18 cases) down to 2 representative cases.
+# Keep both meaningful q_packed values (num_heads_q=1 and 8) on a single
+# block_size / seq set. num_heads_q=16 is excluded (skipped anyway at
+# head_size_qk=576 due to Intel Xe SLM limits).
+MINI_PYTEST_PARAMS = {
+    "test_mla_decode_deepseek_v3": {
+        "block_size": [64],
+        "query_lens,kv_lens": [([1], [129])],
+        "num_heads_q": [1, 8],
+    },
+}
+
+
 def _ref_mla_decode(
     q_nope: torch.Tensor,        # [tokens, h_q, lora]
     q_pe: torch.Tensor,          # [tokens, h_q, rope]
