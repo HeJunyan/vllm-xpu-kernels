@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import random
+
 import pytest
 import torch
 
@@ -10,7 +12,8 @@ from vllm_xpu_kernels.fused_moe_interface import (cutlass_grouped_gemm,
                                                   cutlass_grouped_gemm_xe2)
 
 pytestmark = pytest.mark.skipif(
-    not torch.ops._xpu_C.is_bmg(0) and not torch.ops._xpu_C.is_pvc(0),
+    not torch.xpu.is_available() or
+    (not torch.ops._xpu_C.is_bmg(0) and not torch.ops._xpu_C.is_pvc(0)),
     reason="XE2 CUTLASS tests only run on BMG or PVC.")
 
 DEVICE = "xpu"
@@ -35,6 +38,11 @@ MINI_PYTEST_PARAMS = {
     }
 }
 
+def random_partition(size_a: int, target: int):
+    cuts = sorted(random.sample(range(target + size_a - 1), size_a - 1))
+    cuts = [-1] + cuts + [target + size_a - 1]
+    result = [cuts[i + 1] - cuts[i] - 1 for i in range(size_a)]
+    return result
 
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)

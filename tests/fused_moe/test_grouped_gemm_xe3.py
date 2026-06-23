@@ -34,7 +34,8 @@ def maybe_warm_up_cri_grouped_gemm() -> None:
     _CRI_GROUPED_GEMM_WARMED_UP = True
 
 pytestmark = pytest.mark.skipif(
-    not torch.ops._xpu_C.is_cri(0) and not torch.ops._xpu_C.is_nvl_p(0),
+    not torch.xpu.is_available() or
+    (not torch.ops._xpu_C.is_cri(0) and not torch.ops._xpu_C.is_nvl_p(0)),
     reason="XE3 tests only run on CRI or NVL_P.")
 
 DEVICE = "cpu"

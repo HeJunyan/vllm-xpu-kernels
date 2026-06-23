@@ -5,19 +5,17 @@ import pytest
 import torch
 
 import vllm_xpu_kernels._xpu_C  # noqa: F401
-from tests.fused_moe.test_grouped_gemm_xe3 import (data_to_mx_scale,
-                                                   bfloat16_to_fp4_e2m1fn_x2,
-                                                   fp4_e2m1fn_x2_to_float,
-                                                   hp_from_1x128,
-                                                   hp_from_128x128,
-                                                   maybe_warm_up_cri_grouped_gemm)
+from tests.fused_moe.test_grouped_gemm_xe3 import (
+    bfloat16_to_fp4_e2m1fn_x2, data_to_mx_scale, fp4_e2m1fn_x2_to_float,
+    hp_from_1x128, hp_from_128x128, maybe_warm_up_cri_grouped_gemm)
 from tests.utils import seed_everything
 from vllm_xpu_kernels.fused_moe_interface import (quant_fp8_act,
                                                   quant_mxfp_act,
                                                   xpu_fused_moe)
 
 pytestmark = pytest.mark.skipif(
-    not torch.ops._xpu_C.is_cri(0) and not torch.ops._xpu_C.is_nvl_p(0),
+    not torch.xpu.is_available() or
+    (not torch.ops._xpu_C.is_cri(0) and not torch.ops._xpu_C.is_nvl_p(0)),
     reason="XE3 tests only run on CRI or NVL_P.")
 
 DEVICE = "cpu"

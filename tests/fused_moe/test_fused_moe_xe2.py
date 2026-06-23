@@ -10,7 +10,8 @@ from tests.utils import format_tc, seed_everything
 from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
 
 pytestmark = pytest.mark.skipif(
-    not torch.ops._xpu_C.is_bmg(0) and not torch.ops._xpu_C.is_pvc(0),
+    not torch.xpu.is_available() or
+    (not torch.ops._xpu_C.is_bmg(0) and not torch.ops._xpu_C.is_pvc(0)),
     reason="XE2 CUTLASS tests only run on BMG or PVC.")
 
 DEVICE = "xpu"

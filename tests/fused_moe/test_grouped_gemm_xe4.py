@@ -9,6 +9,7 @@ from tests.utils import seed_everything
 from vllm_xpu_kernels.fused_moe_interface import cutlass_grouped_gemm
 
 pytestmark = pytest.mark.skipif(
+    not torch.xpu.is_available() or
     not torch.ops._xpu_C.is_jgs(0),
     reason="XE4 tests only run on JGS.")
 
@@ -102,8 +103,11 @@ def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
     else:
         bias = None
 
-    output_dtype = torch.float16 if dtype == torch.float16 else torch.float32 # FIXME: bf16 output acc issue
-    output = torch.empty((sum(rows_per_expert), n), dtype=output_dtype, device=DEVICE)
+    # FIXME: bf16 output acc issue
+    output_dtype = torch.float16 if dtype == torch.float16 else torch.float32 
+    output = torch.empty((sum(rows_per_expert), n),
+                         dtype=output_dtype,
+                         device=DEVICE)
     output_kernel = output.to(KERNEL_DEVICE)
     cutlass_grouped_gemm(_to_kernel(input_A), None, _to_kernel(input_B), None,
                          _to_kernel(bias), output_kernel,
@@ -125,7 +129,8 @@ def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
         pre_token_sum += cur_token_num
     ref = torch.cat(ref, dim=0)
 
-    torch.testing.assert_close(output.to(torch.float32), ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(output.to(torch.float32),
+                               ref, rtol=1e-2, atol=1e-2)
 
 
 # =====================================================================
