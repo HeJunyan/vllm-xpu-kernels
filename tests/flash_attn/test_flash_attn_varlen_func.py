@@ -37,6 +37,26 @@ FP8KV = [torch.float8_e4m3fn, None]
 # where each layer view has a larger physical page stride.
 NUM_LAYERS = [2, 16]
 
+# Keep decode UTs aligned with
+# csrc/xpu/attn/kernel_configs/paged_decode_default.conf.  The decode kernel
+# uses qgroup=8 for these NUM_HEADS shapes, causal=false for decode, and the
+# boolean config fields map to (local = window_size != (-1, -1), sink).
+PAGED_DECODE_CASES = [
+    pytest.param(64, 16, (-1, -1), False, id="h64-b16-global-nosink"),
+    pytest.param(64, 64, (-1, -1), False, id="h64-b64-global-nosink"),
+    pytest.param(64, 64, (-1, -1), True, id="h64-b64-global-sink"),
+    pytest.param(128, 64, (-1, -1), False, id="h128-b64-global-nosink"),
+]
+
+MINI_PAGED_DECODE_CASES = [
+    case for case in PAGED_DECODE_CASES
+    if case.values[2] in [(-1, -1), (127, -1)]
+]
+
+CROSS_LAYER_PAGED_DECODE_CASES = [
+    pytest.param(64, (-1, -1), id="h64-global"),
+]
+
 
 def ref_paged_attn(query: torch.Tensor,
                    key_cache: torch.Tensor,
@@ -157,15 +177,8 @@ MINI_PYTEST_PARAMS = {
     "test_decode_with_paged_kv": {
         "seq_lens": [[(1, 1025), (1, 523), (1, 37)]],
         "num_heads": [(8, 2)],
-        "head_size": [64, 128],
+        "head_size,block_size,window_size,is_sink": MINI_PAGED_DECODE_CASES,
         "num_blocks": [64],
-        "window_size": [(-1, -1), (127, -1)],
-    },
-    "test_decode_with_paged_kv_mla": {
-        "seq_lens": [[(1, 1025), (1, 523), (1, 37)]],
-        "num_heads": [(8, 1)],
-        "head_size_kv": [(192, 128)],
-        "num_blocks": [2048],
     },
     "test_varlen_with_cross_layer_paged_kv": {
         "seq_lens": [[(1, 1328), (5, 18), (129, 463)]],
@@ -178,9 +191,8 @@ MINI_PYTEST_PARAMS = {
     "test_decode_with_cross_layer_paged_kv": {
         "seq_lens": [[(1, 1025), (1, 523), (1, 37)]],
         "num_heads": [(8, 2)],
-        "head_size": [64, 128],
+        "head_size,window_size": CROSS_LAYER_PAGED_DECODE_CASES,
         "num_blocks": [64],
-        "window_size": [(-1, -1), (127, -1)],
         "num_layers": [2],
     }
 }
@@ -523,16 +535,14 @@ def test_varlen_with_interleaved_paged_kv(
 @pytest.mark.parametrize("seq_lens",
                          [[(1, 523), (1, 37), (1, 2011)], [(1, 13000)]])
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("head_size,block_size,window_size,is_sink",
+                         PAGED_DECODE_CASES)
 @pytest.mark.parametrize("dtype", DTYPES, ids=format_tc)
 @pytest.mark.parametrize("soft_cap", SOFT_CAPS)
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("fa_version", [2])
 @pytest.mark.parametrize("q_dtype", QDTYPES, ids=format_tc)
-@pytest.mark.parametrize("is_sink", SINK)
 @pytest.mark.parametrize("fp8_dtype", FP8KV, ids=format_tc)
-@pytest.mark.parametrize("window_size", SLIDING_WINDOWS)
 @torch.inference_mode()
 def test_decode_with_paged_kv(
     seq_lens: list[tuple[int, int]],
@@ -1080,11 +1090,11 @@ def test_varlen_with_cross_layer_paged_kv(
 
 @pytest.mark.parametrize("seq_lens", [[(1, 523), (1, 37), (1, 2011)]])
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", [64, 128])
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=format_tc)
 @pytest.mark.parametrize("num_layers", NUM_LAYERS)
-@pytest.mark.parametrize("window_size", [(-1, -1), (127, -1)])
+@pytest.mark.parametrize("head_size,window_size",
+                         CROSS_LAYER_PAGED_DECODE_CASES)
 @pytest.mark.parametrize("fp8_dtype", FP8KV, ids=format_tc)
 @torch.inference_mode()
 def test_decode_with_cross_layer_paged_kv(
