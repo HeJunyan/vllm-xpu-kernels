@@ -6,6 +6,11 @@ import torch
 
 import vllm_xpu_kernels._xpu_C  # noqa: F401
 
+pytestmark = pytest.mark.skipif(
+    not torch.xpu.is_available() or
+    (not torch.ops._xpu_C.is_bmg(0) and not torch.ops._xpu_C.is_pvc(0)),
+    reason="MQA logits tests only run on BMG or PVC.")
+
 DEVICES = ["xpu:0"]
 
 
