@@ -19,6 +19,25 @@ def _is_mini_scope():
     return False
 
 
+def pytest_ignore_collect(collection_path, config):
+    """In mini scope, avoid collecting non-mini WAN test files early.
+
+    This keeps terminal collection summary aligned with the effective test set.
+    """
+    if not _is_mini_scope():
+        return False
+
+    path_str = str(collection_path).replace("\\", "/")
+    if "/wan_ut/" not in path_str and not path_str.startswith("wan_ut/"):
+        return False
+
+    base = os.path.basename(path_str)
+    if base.startswith("test_") and base.endswith(".py"):
+        return "test_wan22_kernels_mini" not in base
+
+    return False
+
+
 def pytest_collection_modifyitems(config, items):
     """In mini scope, only filter tests inside wan_ut.
 
@@ -29,6 +48,7 @@ def pytest_collection_modifyitems(config, items):
         return
 
     filtered = []
+    removed = []
     for item in items:
         nodeid = item.nodeid
         # Only apply mini filtering to WAN UT subtree.
@@ -38,6 +58,13 @@ def pytest_collection_modifyitems(config, items):
 
         if "test_wan22_kernels_mini" in nodeid:
             filtered.append(item)
+        else:
+            removed.append(item)
+
+    # If any items are pruned at this stage, report them as deselected
+    # so pytest terminal summary remains semantically accurate.
+    if removed:
+        config.hook.pytest_deselected(items=removed)
 
     items[:] = filtered
 
