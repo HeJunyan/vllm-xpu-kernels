@@ -4,7 +4,7 @@
 import math
 import os
 import random
-
+import sys
 import pytest
 import torch
 import torch.nn.functional as F
@@ -28,7 +28,7 @@ from test_gdn_attn import (  # noqa: E402
 
 # QWEN NEXT shape
 NUM_TOKENS = [1, 32, 1024, 8192]
-BATCH_SIZE = [32]
+BATCH_SIZE = [1, 32]
 NUM_K_HEADS = [16]
 NUM_K_DIMS = [128]
 NUM_V_HEADS = [32]
@@ -386,6 +386,18 @@ def test_causal_conv1d(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
     num_decodes = batch_size - num_prefills
     cache_batch_size = 200
 
+    print ("\033[4;34m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// num_actual_tokens is :", num_actual_tokens, " batch_size is :", batch_size,
+        " num_k_heads is :", num_k_heads, " head_k_dim is :", head_k_dim,
+        " num_v_heads is :", num_v_heads, " head_v_dim is :", head_v_dim,
+        " width is :", width, " tp_size is :", tp_size,
+        " has_bias is :", has_bias, " activation is :", activation,
+        " reorder_input is :", reorder_input, " mode is :", mode, " dtype is :", dtype)
+
+    print ("\033[4;34m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "///  num_decodes is :", num_decodes, "  num_prefills is : ", num_prefills,
+        "  batch_size is : ", batch_size)
+
     mixed_qkvz_size = num_k_heads // tp_size * (
         2 * head_k_dim + 2 * head_v_dim * num_v_heads // num_k_heads)
     mixed_ba_size = num_k_heads // tp_size * (2 * num_v_heads // num_k_heads)
@@ -397,11 +409,17 @@ def test_causal_conv1d(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
                                       dtype=dtype,
                                       device=device)
 
+    print ("\033[4;34m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// mixed_qkvz_size is :", mixed_qkvz_size, " mixed_ba_size is :", mixed_ba_size)
+
     mixed_qkv_size = num_k_heads // tp_size * (
         2 * head_k_dim + head_v_dim * num_v_heads // num_k_heads)
     conv_state = torch.randn((cache_batch_size, width - 1, mixed_qkv_size),
                              dtype=dtype,
                              device=device)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// mixed_qkv_size is :", mixed_qkv_size, " conv_state is :", conv_state.shape)
+
     ref_conv_state = conv_state.clone()
 
     conv_weights = torch.randn((mixed_qkv_size, width),
@@ -411,18 +429,35 @@ def test_causal_conv1d(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
     if has_bias:
         conv_bias = torch.randn((mixed_qkv_size), dtype=dtype, device=device)
 
+
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// conv_weights is :", conv_weights.shape, " conv_bias is :", conv_bias.shape if has_bias else conv_bias)
+
     prefill_batches = simple_random_distribute(num_actual_tokens - num_decodes,
                                                batch_size - num_decodes)
     token_batches = torch.cat([torch.ones([num_decodes]),
                                prefill_batches]).to(device)
     perm = torch.randperm(token_batches.size(0)).to(device)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// prefill_batches is :", prefill_batches.shape, prefill_batches)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// token_batches is :", token_batches.shape, token_batches)
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// perm is : ", perm.shape, perm)
+
     shuffled_tensor = token_batches[perm]
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// shuffled_tensor is : ", shuffled_tensor.shape, shuffled_tensor)
+
     non_spec_query_start_loc = torch.cat([
         torch.zeros([1], device=device),
         torch.cumsum(shuffled_tensor, dim=0)
     ]).to(torch.int32)
 
     # Decode mode should always have initial_state
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// non_spec_query_start_loc is : ", non_spec_query_start_loc.shape, non_spec_query_start_loc)
+
     if mode == "decode":
         has_initial_state = torch.ones(batch_size,
                                        dtype=torch.bool,
@@ -430,11 +465,17 @@ def test_causal_conv1d(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
     else:
         has_initial_state = perm < num_decodes
 
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// has_initial_state is :", has_initial_state.shape, has_initial_state)
+
     non_spec_state_indices_tensor = torch.tensor(random.sample(
         range(cache_batch_size), batch_size),
                                                  device=device,
                                                  dtype=torch.int32)
 
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// non_spec_state_indices_tensor is :", non_spec_state_indices_tensor.shape, non_spec_state_indices_tensor)
+ 
     core_attn_out = torch.zeros(
         (num_actual_tokens, num_v_heads // tp_size, head_v_dim),
         dtype=dtype,
@@ -442,6 +483,8 @@ def test_causal_conv1d(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
     )
     z = torch.empty_like(core_attn_out)
 
+    print ("\033[4;33m!!!!@  test \033[0m @", __file__, ":",sys._getframe(0).f_lineno,
+        "/// core_attn_out is :", core_attn_out.shape, "   z is :", z.shape)
     intermediates = torch.ops._xpu_C.causal_conv1d(
         z,
         projected_states_qkvz,
