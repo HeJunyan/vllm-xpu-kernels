@@ -399,6 +399,9 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
   # when building.
+  set(CUTLASS_REVISION_CRI "71ddc8dc059d24bf26158be87c868d1f11b07b69")
+  set(CUTLASS_REVISION_JGS "e5097396a69862201d1717ef2d1cbb23f5f7fd9b")
+  set(CUTLASS_REVISION_DEFAULT "cd763790ad2f74d7294435ecf77682bac0062c3a")
   if(VLLM_XPU_ENABLE_XE3)
     # Bumped to PR #570 (libraries.ai.cutlass.internal) which improves MXFP4/8
     # perf when M is unaligned by folding the scalar scale-load fallback into
@@ -406,7 +409,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
     # rounds the surface width up to 4-byte alignment internally). Built on top
     # of PR #549 / v0.1.0_next.
     set(CUTLASS_REVISION
-        "71ddc8dc059d24bf26158be87c868d1f11b07b69"
+        ${CUTLASS_REVISION_CRI}
         CACHE STRING "CUTLASS revision to use")
   elseif(BUILD_ON_SIMULATOR_JGS)
     # Bumped to latest master_next (provides Xe4BlockScaledConfig,
@@ -416,11 +419,11 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
     # and PR #605 (Fix XE4 ADMA alignment validation) are both merged into this
     # revision. TODO: switch to a release tag/version in future
     set(CUTLASS_REVISION
-        "e5097396a69862201d1717ef2d1cbb23f5f7fd9b"
+        ${CUTLASS_REVISION_JGS}
         CACHE STRING "CUTLASS revision to use")
   else()
     set(CUTLASS_REVISION
-        "cd763790ad2f74d7294435ecf77682bac0062c3a"
+        ${CUTLASS_REVISION_DEFAULT}
         CACHE STRING "CUTLASS revision to use")
   endif()
 
