@@ -1,0 +1,18 @@
+{
+  "cutlass": {
+    "repo": "https://github.com/intel-innersource/libraries.ai.cutlass.internal",
+    "revisions": {
+      "cri": "71ddc8dc059d24bf26158be87c868d1f11b07b69",
+      "jgs": "e5097396a69862201d1717ef2d1cbb23f5f7fd9b",
+      "default": "cd763790ad2f74d7294435ecf77682bac0062c3a"
+    }
+  },
+  "onednn": {
+    "repo": "https://github.com/intel-innersource/libraries.performance.math.onednn",
+    "branches": {
+      "cri": "prv-gpu",
+      "jgs": "prv-xe4",
+      "default": null
+    }
+  }
+}
