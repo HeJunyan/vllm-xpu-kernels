@@ -29,7 +29,7 @@ def maybe_warm_up_cri_grouped_gemm() -> None:
     _b = torch.randn(1, _k, _n, dtype=torch.bfloat16, device="xpu")
     _o = torch.zeros(_m, _n, dtype=torch.bfloat16, device="xpu")
     cutlass_grouped_gemm(_a, None, _b, None, None, _o, [_m], _n, _k, 1)
-    torch.xpu.synchronize()
+    torch.xpu.current_stream().synchronize()
     del _a, _b, _o
     _CRI_GROUPED_GEMM_WARMED_UP = True
 
