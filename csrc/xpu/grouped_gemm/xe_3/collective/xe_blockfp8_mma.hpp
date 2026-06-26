@@ -451,7 +451,7 @@ struct CollectiveMma<
       gemm_n_offsets(n) = sizeof_bits_v<ElementB> < 8 ? n * 32 : n * 16;
     }
 
-    constexpr int barrier_scope = 2;
+    constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
 
     constexpr int k_reload_factor = cute::max(GROUP_K / BLK_K, 1);
 

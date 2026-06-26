@@ -149,6 +149,10 @@ endif()
 if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
   message(STATUS "Building on CRI simulator, enable XE3 kernels.")
   set(VLLM_XPU_ENABLE_XE3 ON)
+  # The CRI cutlass revision (v0.1.0_next) is incompatible with the in-tree XE2
+  # kernels (changed cute barrier/algorithm APIs). XE2 kernels never run on the
+  # CRI simulator, so disable them for this build.
+  set(VLLM_XPU_ENABLE_XE2 OFF)
   set(VLLM_XPU_ENABLE_XE4 OFF)
   set(VLLM_XPU_ENABLE_XE_DEFAULT OFF)
   set(ONEDNN_BRANCH
@@ -399,15 +403,15 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
   # when building.
-  set(CUTLASS_REVISION_CRI "71ddc8dc059d24bf26158be87c868d1f11b07b69")
+  set(CUTLASS_REVISION_CRI "1f3f35279")
   set(CUTLASS_REVISION_JGS "e5097396a69862201d1717ef2d1cbb23f5f7fd9b")
   set(CUTLASS_REVISION_DEFAULT "cd763790ad2f74d7294435ecf77682bac0062c3a")
   if(VLLM_XPU_ENABLE_XE3)
-    # Bumped to PR #570 (libraries.ai.cutlass.internal) which improves MXFP4/8
-    # perf when M is unaligned by folding the scalar scale-load fallback into
-    # the regular optimized block-scaled mainloop (the 2D scale loader now
-    # rounds the surface width up to 4-byte alignment internally). Built on top
-    # of PR #549 / v0.1.0_next.
+    # Bumped to the latest v0.1.0_next HEAD (libraries.ai.cutlass.internal).
+    # Notably folds in PR #671, which refactored the Xe block-scaled MXFP
+    # collective (split xe_mma_blockscaled_mxfp.hpp into native/fallback and
+    # removed MainloopIntelXeXMX16BlockScaledImpl); the in-tree MXFP grouped
+    # GEMM wrapper is ported to match. Built on top of PR #549 / v0.1.0_next.
     set(CUTLASS_REVISION
         ${CUTLASS_REVISION_CRI}
         CACHE STRING "CUTLASS revision to use")

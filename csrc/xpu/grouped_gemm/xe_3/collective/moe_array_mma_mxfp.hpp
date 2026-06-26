@@ -39,7 +39,12 @@
 #include "cute/algorithm/functional.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/algorithm/gemm.hpp"
-#include "cutlass/gemm/collective/xe_mma_blockscaled_mxfp.hpp"
+// cutlass v0.1.0_next (PR #671) refactored the monolithic
+// xe_mma_blockscaled_mxfp.hpp into native/fallback/scale_traits headers.
+// Including the native header pulls in the fallback + scale_traits headers and
+// provides the CollectiveMma specializations for both the native (Int
+// GroupSize) and fallback (tuple GroupSize) block-scaled mainloops.
+#include "cutlass/gemm/collective/xe_mma_blockscaled_native.hpp"
 /////////////////////////////////////////////////////////////////////////////////////////////////
 namespace cutlass::gemm {
 
@@ -357,7 +362,7 @@ struct CollectiveMma<
     SmemCopyAtomB_,
     TransformB_>
     : public CollectiveMma<
-          MainloopIntelXeXMX16BlockScaledImpl<
+          MainloopIntelXeXMX16BlockScaled<
               Stages,
               cute::tuple<cute::_1, cute::_1, cute::Int<32>>>,
           TileShape_,
@@ -377,7 +382,7 @@ struct CollectiveMma<
  public:
   using DispatchPolicy = MainloopMXFPXGroupUnaligned<Stages, Schedule>;
   using Base = CollectiveMma<
-      MainloopIntelXeXMX16BlockScaledImpl<
+      MainloopIntelXeXMX16BlockScaled<
           Stages,
           cute::tuple<cute::_1, cute::_1, cute::Int<32>>>,
       TileShape_,
