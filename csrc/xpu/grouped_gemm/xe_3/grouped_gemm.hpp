@@ -140,8 +140,13 @@ at::Tensor grouped_gemm_func(
       using moe_policy = grouped_gemm::moe_bf16_mid_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);
     } else {
-      using moe_policy = grouped_gemm::moe_bf16_decode_policy;
-      CALL_KERNEL_WITH_POLICY(moe_policy);
+      if (K >= 1024) {
+        using moe_policy = grouped_gemm::moe_bf16_decode_k64_policy;
+        CALL_KERNEL_WITH_POLICY(moe_policy);
+      } else {
+        using moe_policy = grouped_gemm::moe_bf16_decode_policy;
+        CALL_KERNEL_WITH_POLICY(moe_policy);
+      }
     }
   } else if (A_dtype == at::kHalf) {
     if (avg_tokens_cnt > 32) {
@@ -163,8 +168,11 @@ at::Tensor grouped_gemm_func(
     // need the scalar scale-load fallback.
     if (avg_tokens_cnt > 32) {
       DISPATCH_PREFILL_TILE(moe_mxfp8, kMXFP8);
-    } else {
+    } else if (avg_tokens_cnt > 4) {
       using moe_policy = grouped_gemm::moe_mxfp8_mid_policy;
+      CALL_KERNEL_WITH_POLICY(moe_policy);
+    } else {
+      using moe_policy = grouped_gemm::moe_mxfp8_decode_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);
     }
   } else if (
@@ -172,8 +180,11 @@ at::Tensor grouped_gemm_func(
       ptr_A_scale->dtype() == at::kFloat8_e8m0fnu) {
     if (avg_tokens_cnt > 32) {
       DISPATCH_PREFILL_TILE(moe_mxfp4, kMXFP4);
-    } else {
+    } else if (avg_tokens_cnt > 4) {
       using moe_policy = grouped_gemm::moe_mxfp4_mid_policy;
+      CALL_KERNEL_WITH_POLICY(moe_policy);
+    } else {
+      using moe_policy = grouped_gemm::moe_mxfp4_decode_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);
     }
   } else if (

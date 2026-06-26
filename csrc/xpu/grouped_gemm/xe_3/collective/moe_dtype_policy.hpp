@@ -264,10 +264,32 @@ class moe_fp16_mid_policy : public moe_fp16_policy {
   CALL_GENERATE_GEMM();
 };
 
+// Decode regime (avg M per expert <= 4, total_M tiny): the case is memory-bound
+// on the B-weight load and the only parallelism is groups * N-tiles. Use a small
+// (8,64,32) tile so the N dimension is carved into many narrow tiles, maximizing
+// the number of concurrent workgroups to saturate DRAM. Widening BLK_N (e.g. 256)
+// or BLK_M starves occupancy and regresses bandwidth; shrinking both is the win.
 class moe_bf16_decode_policy : public moe_bf16_policy {
  public:
-  using TileShape = Shape<_16, _128, _32>;
-  using SGLayout = Layout<Shape<_1, _8, _1>, Stride<_8, _1, _0>>;
+  using TileShape = Shape<_8, _64, _32>;
+  using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
+// Decode with a long contraction (e.g. gate_up_proj K=2048): keep the narrow
+// (8,64) tile for occupancy, but widen BLK_K 32 -> 64 to halve the K-loop trip
+// count, giving larger contiguous weight loads and better DRAM efficiency. The
+// register footprint stays tiny. Only profitable when K is large enough to fill
+// the pipeline; short-K decode (down_proj K=768) regresses, so dispatch selects
+// this only for K >= 1024.
+class moe_bf16_decode_k64_policy : public moe_bf16_policy {
+ public:
+  using TileShape = Shape<_8, _64, _64>;
+  using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
       Layout<TileShape>,
@@ -277,8 +299,8 @@ class moe_bf16_decode_policy : public moe_bf16_policy {
 
 class moe_fp16_decode_policy : public moe_fp16_policy {
  public:
-  using TileShape = Shape<_16, _128, _32>;
-  using SGLayout = Layout<Shape<_1, _8, _1>, Stride<_8, _1, _0>>;
+  using TileShape = Shape<_8, _64, _32>;
+  using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
       Layout<TileShape>,
@@ -376,6 +398,25 @@ class moe_mxfp8_mid_policy : public moe_mxfp8_policy {
   CALL_GENERATE_GEMM();
 };
 
+// Decode regime (avg M per expert <= 4): the mid tile's BLK_M=128 makes the
+// systolic array grind 128 masked rows for a single real token. Shrink to a
+// narrow (8,64,32) tile so the few real rows stop wasting DPAS passes and the
+// N dimension splits into many tiles for high workgroup occupancy on this
+// memory-bound shape. The decode K-loop is short, so a shallower 2-stage
+// pipeline (vs 4) trims fill/drain overhead that otherwise dominates the floor.
+class moe_mxfp8_decode_policy : public moe_mxfp8_policy {
+ public:
+  using TileShape = Shape<_8, _64, _32>;
+  using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  static constexpr int PipelineStages = 2;
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopMXFPXGroup<PipelineStages>;
+  CALL_GENERATE_GEMM();
+};
+
 // MXFP4
 class moe_mxfp4_policy : public moe_policy_base {
  public:
@@ -442,6 +483,21 @@ class moe_mxfp4_mid_policy : public moe_mxfp4_policy {
  public:
   using TileShape = Shape<_128, _128, _128>;
   using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
+// Decode regime (avg M per expert <= 4): shrink to the narrow (8,64,32) tile for
+// the same occupancy reason as mxfp8 -- many small N-tiles to saturate DRAM on a
+// memory-bound, single-token decode. The default 4-stage pipeline is kept
+// (Stages=2 regressed FP4 here).
+class moe_mxfp4_decode_policy : public moe_mxfp4_policy {
+ public:
+  using TileShape = Shape<_8, _64, _32>;
+  using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
       Layout<TileShape>,
