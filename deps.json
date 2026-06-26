@@ -8,11 +8,11 @@
     }
   },
   "onednn": {
-    "repo": "https://github.com/intel-innersource/libraries.performance.math.onednn",
-    "branches": {
-      "cri": "prv-gpu",
-      "jgs": "prv-xe4",
-      "default": null
+    "repo": "https://github.com/uxlfoundation/oneDNN",
+    "revisions": {
+      "cri": "main",
+      "jgs": {"repo": "https://github.com/intel-innersource/libraries.performance.math.onednn", "revision": "c70e30885c1efc054d302747c16c1ba40f54ed32"},
+      "default": "80afa71049cd69a3df32adcccb623b12cd7baa22"
     }
   }
 }
