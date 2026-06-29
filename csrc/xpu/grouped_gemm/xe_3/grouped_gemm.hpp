@@ -166,7 +166,17 @@ at::Tensor grouped_gemm_func(
     // handles unaligned M directly (the 2D scale loader rounds the
     // surface width up to 4-byte alignment internally), so we no longer
     // need the scalar scale-load fallback.
-    if (avg_tokens_cnt > 32) {
+    if (ptr_B.dtype() == at::kFloat4_e2m1fn_x2) {
+      // W4A8: MXFP8 activation (A=e4m3) x MXFP4 weight (B=e2m1). Same e8m0
+      // block scales as the symmetric recipes; only the weight is 4-bit.
+      if (avg_tokens_cnt > 32) {
+        using moe_policy = grouped_gemm::moe_w4a8_policy;
+        CALL_KERNEL_WITH_POLICY(moe_policy);
+      } else {
+        using moe_policy = grouped_gemm::moe_w4a8_mid_policy;
+        CALL_KERNEL_WITH_POLICY(moe_policy);
+      }
+    } else if (avg_tokens_cnt > 32) {
       DISPATCH_PREFILL_TILE(moe_mxfp8, kMXFP8);
     } else if (avg_tokens_cnt > 4) {
       using moe_policy = grouped_gemm::moe_mxfp8_mid_policy;

@@ -229,9 +229,12 @@ struct CollectiveMma<
       ElementA const* ptr_A_curr_batch =
           static_cast<ElementA const*>(mainloop_params.ptr_A) +
           expert_first_token_offset * K;
+      // B may be 8-bit (mxfp8 e4m3) or 4-bit packed (w4a8 e2m1); divide the
+      // per-expert element offset by B's packing factor (2 for 4-bit).
       ElementB const* ptr_B_curr_batch =
           static_cast<ElementB const*>(mainloop_params.ptr_B) +
-          next_group * N * K;
+          next_group * N * K /
+              (cute::is_same_v<ElementB, cutlass::float_e2m1_t> ? 2 : 1);
       ElementSF const* ptr_SFA_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
           expert_first_scale_offset * scale_k;
@@ -479,9 +482,12 @@ struct CollectiveMma<
       ElementA const* ptr_A_curr_batch =
           static_cast<ElementA const*>(mainloop_params.ptr_A) +
           expert_first_token_offset * K;
+      // B may be 8-bit (mxfp8 e4m3) or 4-bit packed (w4a8 e2m1); divide the
+      // per-expert element offset by B's packing factor (2 for 4-bit).
       ElementB const* ptr_B_curr_batch =
           static_cast<ElementB const*>(mainloop_params.ptr_B) +
-          next_group * N * K;
+          next_group * N * K /
+              (cute::is_same_v<ElementB, cutlass::float_e2m1_t> ? 2 : 1);
       ElementSF const* ptr_SFA_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
           expert_first_scale_offset * scale_k;

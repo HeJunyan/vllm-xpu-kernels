@@ -115,6 +115,12 @@ MINI_PYTEST_PARAMS = {
         "recipe": ["mxfp8", "mxfp4"],
         "has_bias": [True]
     },
+    "test_grouped_gemm_w4a8": {
+        "m,n,k": MINI_MNK_SHAPES_MXFP,
+        "e": [1, 2],
+        "topk": [1],
+        "has_bias": [True]
+    },
     "test_grouped_gemm_fp8block": {
         "m,n,k": MINI_MNK_SHAPES,
         "e": [1, 2],
@@ -353,6 +359,100 @@ def test_grouped_gemm_mxfp(m, n, k, e, topk, recipe, has_bias):
 
     print("ref: ", ref, ref.shape)
     print("ker: ", output, output.shape)
+    torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
+@pytest.mark.parametrize("e", NUM_EXPERTS)
+@pytest.mark.parametrize("topk", TOP_KS)
+@pytest.mark.parametrize("has_bias", [True, False])
+def test_grouped_gemm_w4a8(m, n, k, e, topk, has_bias):
+    # W4A8: MXFP8 activation (A, e4m3 + e8m0 scale) x MXFP4 weight
+    # (B, e2m1 + e8m0 scale). The kernel consumes A natively and upconverts the
+    # 4-bit weight to e4m3 (lossless) before the block-scaled DPAS.
+    if torch.ops._xpu_C.is_nvl_p(0):
+        pytest.skip(reason="W4A8 (MXFP4 weight) is not supported on NVL_P")
+    seed_everything(8)
+    num_experts = e
+    rows_per_expert = random_partition(e, m * topk)
+    assert (len(rows_per_expert) == e)
+
+    BLOCK_SIZE = 32
+    m = sum(rows_per_expert)
+    scale_k = ceil_div(k, BLOCK_SIZE)
+    A_ref = torch.randn((m, k), device=DEVICE, dtype=torch.bfloat16)
+    B_ref = torch.randn((num_experts, n, k),
+                        device=DEVICE,
+                        dtype=torch.bfloat16)
+
+    # --- Activation A -> MXFP8 (mirrors the mxfp8 branch of the mxfp test). ---
+    A_scale = data_to_mx_scale(A_ref, BLOCK_SIZE, "mxfp8")  # (m, scale_k)
+    # cutlass PR #570 requires per-expert scale-A surface width to be a multiple
+    # of 4 elements; pad each expert's M up to 4 and store the scale MN-major.
+    padded_rows_per_expert = [(gm + 3) & ~3 for gm in rows_per_expert]
+    padded_m_total = sum(padded_rows_per_expert)
+    A_scale_k = torch.zeros((padded_m_total, scale_k),
+                            dtype=A_scale.dtype,
+                            device=DEVICE)
+    cumu_m = 0
+    cumu_padded = 0
+    for gm, gm_padded in zip(rows_per_expert, padded_rows_per_expert):
+        if gm != 0:
+            cur_slice = A_scale_k[cumu_padded:cumu_padded + gm_padded, :].view(
+                scale_k, gm_padded)[:, :gm]
+            cur_slice.copy_(A_scale[cumu_m:cumu_m + gm, :].transpose(
+                -1, -2).contiguous())
+        cumu_m += gm
+        cumu_padded += gm_padded
+    assert (A_scale_k.is_contiguous())
+    A = (A_ref.reshape(-1, BLOCK_SIZE) /
+         A_scale.reshape(m * scale_k, 1).float()).reshape(m, k)
+    A = A.clamp(min=-F8E4M3_MAX_VAL,
+                max=F8E4M3_MAX_VAL).to(torch.float8_e4m3fn)
+
+    # --- Weight B -> MXFP4 (mirrors the mxfp4 branch of the mxfp test). ---
+    B_scale = data_to_mx_scale(B_ref, BLOCK_SIZE, "mxfp4")  # (e, n, scale_k)
+    B_scale = B_scale.transpose(-1, -2).contiguous().transpose(-1, -2)
+    B = (B_ref.reshape(-1, BLOCK_SIZE) / B_scale.reshape(
+        num_experts * n * scale_k, 1).bfloat16()).reshape(num_experts, n, k)
+    B = B.clamp(min=-FP4_MAX_VAL, max=FP4_MAX_VAL)
+    B = bfloat16_to_fp4_e2m1fn_x2(B)
+
+    if has_bias:
+        bias = torch.randn((num_experts, n),
+                           dtype=torch.float32,
+                           device=DEVICE)
+    else:
+        bias = None
+    output = torch.zeros((m, n), dtype=torch.float32, device=DEVICE)
+    output_kernel = output.to(KERNEL_DEVICE)
+    cutlass_grouped_gemm(_to_kernel(A), _to_kernel(A_scale_k), _to_kernel(B),
+                         _to_kernel(B_scale), _to_kernel(bias), output_kernel,
+                         rows_per_expert, n, k, num_experts)
+    output = output_kernel.cpu()
+
+    # ref gg: dequantize A (fp8) and B (fp4) then matmul per expert.
+    A_dq = (A.float().reshape(-1, BLOCK_SIZE) *
+            A_scale.reshape(m * scale_k, 1).float()).reshape(m, k)
+    B_dq = (fp4_e2m1fn_x2_to_float(B).reshape(-1, BLOCK_SIZE) *
+            B_scale.reshape(num_experts * n * scale_k, 1).float()).reshape(
+                num_experts, n, k)
+
+    ref = []
+    pre_token_sum = 0
+    for i in range(num_experts):
+        cur_token_num = rows_per_expert[i]
+        if cur_token_num == 0:
+            continue
+        input = A_dq[pre_token_sum:pre_token_sum + cur_token_num, :]
+        weight = B_dq[i, :, :]
+        expert_output = input @ weight.T
+        if has_bias:
+            expert_output += bias[i]
+        ref.append(expert_output)
+        pre_token_sum += cur_token_num
+    ref = torch.cat(ref, dim=0)
+
     torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
 
 
