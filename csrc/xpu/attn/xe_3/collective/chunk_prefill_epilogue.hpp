@@ -158,12 +158,12 @@ class FMHAFwdEpilogue {
   CUTLASS_HOST_DEVICE
   FMHAFwdEpilogue(Params const&, SharedStorage& shared_) : shared(shared_) {}
 
-  template <typename QVCoord>
+  template <bool SumIsReduced = false, typename QVCoord, typename FragSPRow>
   CUTLASS_DEVICE void operator()(
       TensorO2D const& O,        // Global O tensor: (q,v)
       FragA& tArA,               // O accumulator:   (q,v)
       FragARow& tA_max,          // Softmax row-wise max accumulator
-      FragARow& tA_sum,          // Softmax row-wise sum accumulator
+      FragSPRow& tA_sum,         // Softmax row-wise partial sum (per-lane)
       QVCoord blk_qv,            // WG tile indices: (q,v)
       ElementSink const& tSink,  // Sink for current head
       int thr_id) {              // Work-item ID
@@ -171,8 +171,17 @@ class FMHAFwdEpilogue {
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
+    // Collapse the deferred per-lane partial row sums into the full row sum,
+    // unless the caller already performed the horizontal reduction.
+    auto tA_sum_full = [&]() -> decltype(auto) {
+      if constexpr (SumIsReduced)
+        return (tA_sum);
+      else
+        return reduce<0, ReduceMode::Horizontal>(tA_sum, sycl::plus<void>{});
+    }();
+
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+    auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum_full, thr_id);
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
@@ -211,11 +220,11 @@ class FMHAFwdEpilogue {
   // Reduce k-blocks of A and A_sum across WG, if needed.
   // Note that each k block has its own scale factor based on A_max,
   //   so A/A_sum contributions need to be rescaled to match.
-  template <typename FragA, typename FragARow>
+  template <typename FragA, typename FragARow, typename FragSPRow>
   CUTLASS_DEVICE decltype(auto) reduce_A(
       FragA& tArA,       // O accumulator:   (q,v)
       FragARow& tA_max,  // Softmax row-wise max accumulator
-      FragARow& tA_sum,  // Softmax row-wise sum accumulator
+      FragSPRow& tA_sum,  // Softmax row-wise sum accumulator (reduced)
       int thr_id) {      // Work-item ID
 
     using namespace sycl::ext::oneapi::this_work_item;

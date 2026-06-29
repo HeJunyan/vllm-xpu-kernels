@@ -65,11 +65,20 @@ struct chunk_policy_head96 {
   using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
 };
 
+
 struct chunk_policy_head128 {
-  using ShapeQK = Shape<_256, _32, _32>;
-  using ShapePV = Shape<_256, _32, _32>;
+#ifdef VLLM_XPU_ENABLE_XE2
+  using ShapeQK = Shape<_256, _64, _64>;
+  using ShapePV = Shape<_256, _64, _64>;
   using ShapeOut = Shape<_256, _128>;
   using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
+#endif
+#ifdef VLLM_XPU_ENABLE_XE3
+  using ShapeQK = Shape<_512, _64, _64>;
+  using ShapePV = Shape<_512, _64, _64>;
+  using ShapeOut = Shape<_512, _128>;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+#endif
 };
 
 struct chunk_policy_head192 {

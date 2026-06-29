@@ -202,7 +202,12 @@ inline void dispatch_by_page_size(
   }
 }
 
-void cutlass_paged_decode_impl(
+// Hidden visibility prevents this per-arch implementation symbol from being
+// exported and interposed across the XE2/XE3 kernel shared libraries (which
+// both define a symbol with this exact name/signature). Without this, the
+// XE3 wrapper could bind to the XE2 implementation at load time and launch a
+// kernel built for the wrong architecture.
+__attribute__((visibility("hidden"))) void cutlass_paged_decode_impl(
     sycl::queue& queue,
     const at::Tensor& query,      // [seq_q, heads, head_size]
     const at::Tensor& key_cache,  // [num_block, block_size, heads, head_size]

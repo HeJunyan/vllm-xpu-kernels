@@ -37,6 +37,7 @@
 #include "cute/algorithm/functional.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/algorithm/gemm.hpp"
+#include "cute/util/xe_split_barrier.hpp"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 namespace cutlass::gemm {

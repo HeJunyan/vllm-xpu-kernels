@@ -56,6 +56,7 @@ struct chunk_prefill_args_t {
   bool is_causal = false;
   bool is_local = false;
   bool is_sink = false;
+  bool is_interleaved_kv_cache = false;
   // softmax_lse output (nullptr when not requested)
   float* softmax_lse = nullptr;
   int lse_stride = 0;  // stride along seq dim (= num_heads_q)
@@ -188,7 +189,7 @@ struct KernelLauncher {
          args.total_seqlen_k,
          args.window_size_left,
          args.window_size_right,
-         args.page_stride_elements},
+         args.is_interleaved_kv_cache},
         {},
         hw_info};
 
@@ -204,7 +205,12 @@ struct KernelLauncher {
     auto params =
         FMHAKernel::to_underlying_arguments(arguments, workspace.get());
 
+    GPU_Clock timer;
+    timer.start();
     run(queue, params);
+    queue.wait();
+    double cute_time = timer.seconds();
+    printf("\nPerformance:   %6.4f  ms\n\n", cute_time * 1000);
 
     return cutlass::Status::kSuccess;
   }
@@ -231,8 +237,10 @@ struct KernelLauncher {
         syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<VLLM_GRF_SIZE>};
     compat::experimental::launch_policy policy{
         sycl_grid, sycl_block, launch_props, kernel_props};
-    compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
-        policy, queue, params);
+    // compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
+    //     policy, queue, params);
+    auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, params);
+    EventManager::getInstance().addEvent(event);
   }
 };
 

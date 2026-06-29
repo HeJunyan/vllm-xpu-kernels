@@ -1,7 +1,10 @@
 #include "fmha_xe3.h"
-// FIXME: reuse chunk_prefill from xe2 now
-#include "csrc/xpu/attn/xe_2/chunk_prefill_utils.hpp"
-#include "csrc/xpu/attn/xe_2/chunk_prefill_extern.hpp"
+#include "chunk_prefill_utils.hpp"
+#if __has_include("chunk_prefill_extern_gen.hpp")
+  #include "chunk_prefill_extern_gen.hpp"
+#else
+  #include "chunk_prefill_extern.hpp"
+#endif
 #include "csrc/xpu/attn/paged_kv_utils.h"
 
 void cutlass_chunk_prefill_xe3(
@@ -227,7 +230,7 @@ void cutlass_chunk_prefill_impl(
   // total_seqlen_k to cover the full physical extent for the 2D block
   // load surface descriptor. Without this, block loads for blocks at
   // higher physical addresses would return zeros. The page_stride_elements
-  // is also required by the paged index computation in the shared xe_2
+  // is also required by the paged index computation in the xe_3
   // mainloop; leaving it at 0 makes every paged block resolve to block 0.
   if (is_paged) {
     args.page_stride_elements =

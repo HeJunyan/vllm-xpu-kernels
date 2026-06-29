@@ -10,7 +10,8 @@
 # csrc/xpu/attn/kernel_configs/ chunk_prefill_full.conf    - All combinations
 # chunk_prefill_default.conf - Default model configs
 #
-# XE3 note: Only standard policies are generated (no b16 variants).
+# XE3 note: Both standard and b16 policies are generated for each headsize.
+# The runtime selects the b16 policy for paged requests with block_size == 16.
 # =============================================================================
 
 # Default config path
@@ -71,13 +72,22 @@ function(fmha_forward_configure FILENAME_SUFFIX)
       "chunk_policy_head128_b16" "chunk_policy_head192_b16"
       "chunk_policy_head256_b16" "chunk_policy_head512_b16")
 
-  # Map headsize to policy names (XE3: standard policies only, no b16)
+  # Map headsize to policy names. Both standard and b16 policies are generated:
+  # the runtime dispatch (fmha_xe3.cpp) selects the b16 policy whenever the
+  # request is paged with block_size == 16 (TileShapeQK[1] = 16), and the
+  # standard policy otherwise.
   set(std_policy_64 "chunk_policy_head64")
   set(std_policy_96 "chunk_policy_head96")
   set(std_policy_128 "chunk_policy_head128")
   set(std_policy_192 "chunk_policy_head192")
   set(std_policy_256 "chunk_policy_head256")
   set(std_policy_512 "chunk_policy_head512")
+  set(b16_policy_64 "chunk_policy_head64_b16")
+  set(b16_policy_96 "chunk_policy_head96_b16")
+  set(b16_policy_128 "chunk_policy_head128_b16")
+  set(b16_policy_192 "chunk_policy_head192_b16")
+  set(b16_policy_256 "chunk_policy_head256_b16")
+  set(b16_policy_512 "chunk_policy_head512_b16")
 
   set(IMPL_KV_T "fp16")
 
@@ -133,7 +143,8 @@ function(fmha_forward_configure FILENAME_SUFFIX)
 
       # Guard against malformed entries
       if("${_headsize}" MATCHES "[^0-9]" OR "${std_policy_${_headsize}}"
-                                            STREQUAL "")
+                                            STREQUAL ""
+         OR "${b16_policy_${_headsize}}" STREQUAL "")
         message(WARNING "Skipping invalid config headsize entry: ${_entry}")
         continue()
       endif()
@@ -173,11 +184,17 @@ function(fmha_forward_configure FILENAME_SUFFIX)
           endif()
         endif()
 
-        # Generate for standard policy only (XE3: no b16)
+        # Generate for both standard and b16 policies. The b16 policy is
+        # required at runtime for paged requests with block_size == 16.
         list(
           APPEND
           BUILD_TUPLES
           "${std_policy_${_headsize}}|${_paged}|${_causal}|${_local}|${_sink}|${_lse}"
+        )
+        list(
+          APPEND
+          BUILD_TUPLES
+          "${b16_policy_${_headsize}}|${_paged}|${_causal}|${_local}|${_sink}|${_lse}"
         )
       else()
         # No booleans specified: generate all 18 valid combinations
@@ -196,6 +213,11 @@ function(fmha_forward_configure FILENAME_SUFFIX)
                     APPEND
                     BUILD_TUPLES
                     "${std_policy_${_headsize}}|${IMPL_KISPAGED}|${IMPL_KISCAUSAL}|${IMPL_KISLOCAL}|${IMPL_KISSINK}|${IMPL_KISLSE}"
+                  )
+                  list(
+                    APPEND
+                    BUILD_TUPLES
+                    "${b16_policy_${_headsize}}|${IMPL_KISPAGED}|${IMPL_KISCAUSAL}|${IMPL_KISLOCAL}|${IMPL_KISSINK}|${IMPL_KISLSE}"
                   )
                 endforeach()
               endforeach()
@@ -259,7 +281,7 @@ function(fmha_forward_configure FILENAME_SUFFIX)
   endforeach()
 
   configure_file(
-    "${CMAKE_CURRENT_LIST_DIR}/../xe_2/chunk_prefill_extern.hpp.in"
+    "${CMAKE_CURRENT_LIST_DIR}/chunk_prefill_extern.hpp.in"
     "${CMAKE_CURRENT_BINARY_DIR}/chunk_prefill_extern_gen.hpp" @ONLY)
 
   # Build compile-time policy trait specializations
@@ -293,7 +315,7 @@ function(fmha_forward_configure FILENAME_SUFFIX)
   endforeach()
 
   configure_file(
-    "${CMAKE_CURRENT_LIST_DIR}/../xe_2/chunk_prefill_enabled_policies.hpp.in"
+    "${CMAKE_CURRENT_LIST_DIR}/chunk_prefill_enabled_policies.hpp.in"
     "${CMAKE_CURRENT_BINARY_DIR}/chunk_prefill_enabled_policies_gen.hpp" @ONLY)
 
   # =============================================================================

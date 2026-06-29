@@ -1,4 +1,4 @@
-#include "csrc/xpu/attn/xe_2/chunk_prefill.hpp"
+#include "csrc/xpu/attn/xe_3/chunk_prefill.hpp"
 
 using namespace cute;
 

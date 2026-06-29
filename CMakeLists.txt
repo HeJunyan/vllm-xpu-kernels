@@ -514,6 +514,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
       CACHE BOOL "DISABLE CUDA")
 
   FetchContent_MakeAvailable(cutlass-sycl)
+
   set(CUTLASS_INCLUDE_DIR
       ${cutlass-sycl_SOURCE_DIR}/include
       CACHE PATH "CUTLASS Header Library")
@@ -534,6 +535,12 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   list(APPEND VLLM_CUTLASS_FLAGS "-DCUTLASS_VERSIONS_GENERATED")
   list(APPEND VLLM_CUTLASS_FLAGS "-ftemplate-backtrace-limit=0")
   list(APPEND VLLM_CUTLASS_FLAGS "-fdiagnostics-color=always")
+  # CRI specific
+  if (BUILD_ON_SIMULATOR_CRI)
+    list(APPEND VLLM_CUTLASS_FLAGS "-DCOMPAT_PROFILING_ENABLED")
+    list(APPEND VLLM_CUTLASS_FLAGS "-DCUTLASS_SYCL_PROFILING_ENABLED")
+    list(APPEND VLLM_CUTLASS_FLAGS "-DCUTLASS_TEST_FOR_CRI")
+  endif()
 endif()
 
 set(ATTN_KERNEL_LIB_NAME "")

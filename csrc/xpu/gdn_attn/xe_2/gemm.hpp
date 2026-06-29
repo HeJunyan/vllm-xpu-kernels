@@ -35,6 +35,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <cute/tensor.hpp>
+#include <cute/util/xe_split_barrier.hpp>
 
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/platform/platform.h"

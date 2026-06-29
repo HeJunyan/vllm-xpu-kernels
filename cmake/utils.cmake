@@ -659,7 +659,7 @@ function(add_xe3_kernel_library LIBRARY_NAME)
     ${LIBRARY_NAME}
     PRIVATE ${SYCL_TLA_KERNELS_COMPILE_FLAGS} -fPIC -Wno-c++20-extensions
             -Wno-intel-compat -Wno-pragma-once-outside-header)
-  target_compile_definitions(${LIBRARY_NAME} PRIVATE -DSYCL_INTEL_TARGET=35)
+  target_compile_definitions(${LIBRARY_NAME} PRIVATE -DSYCL_INTEL_TARGET=35 -DVLLM_XPU_ENABLE_XE3)
   if(BUILD_ON_NVL)
     target_compile_definitions(${LIBRARY_NAME} PRIVATE -DVLLM_GRF_SIZE=256)
   else()
