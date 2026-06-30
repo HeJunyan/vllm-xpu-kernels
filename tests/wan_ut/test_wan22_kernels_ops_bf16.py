@@ -2747,6 +2747,157 @@ def pytest_sessionfinish(session, exitstatus):
         generate_markdown_report()
 
 
+class TestConv1x1Kernels:
+    """Test Conv2D/Conv3D kernel_size=1 — known CRI simulator crash shapes.
+
+    The simulator crashes on Conv kernel_size=1 at certain spatial sizes:
+    - Conv2d(k=1) at spatial <= 8x8 (64 elements)
+    - Conv3d(k=1) at spatial >= 32x32 (1024+ elements)
+
+    These shapes come from Wan2.2 VAE decoder:
+    - WanAttentionBlock: Conv2d(dim, dim*3, 1) and Conv2d(dim, dim, 1)
+    - WanResidualBlock.conv_shortcut: Conv3d(in_dim, out_dim, 1)
+    """
+
+    def test_conv2d_1x1_attn_proj_8x8(self):
+        """Conv2d(128, 128, k=1) @ 8x8 — VAE mid_block attention projection."""
+        if DEVICE == "cpu":
+            pytest.skip("Kernel tests require XPU")
+
+        def prepare():
+            x = torch.randn(1, 128, 8, 8, device="cpu", dtype=torch.bfloat16)
+            conv = torch.nn.Conv2d(128, 128, kernel_size=1, device="cpu", dtype=torch.bfloat16)
+            return {"x": x}, conv
+
+        def compute(tensors, operation):
+            return operation(tensors["x"])
+
+        shape_info = {
+            "batch": 1, "in_channels": 128, "out_channels": 128,
+            "kernel_h": 1, "kernel_w": 1, "output_h": 8, "output_w": 8,
+            "input_size": 1 * 128 * 8 * 8, "weight_size": 128 * 128,
+            "output_size": 1 * 128 * 8 * 8,
+        }
+        result = benchmark_with_metrics("Conv2D 1x1 attn_proj 8×8", prepare, compute, "conv2d", shape_info)
+        if result:
+            print(f"\n{result['name']}: {result['avg_ms']:.3f}ms, {result['tflops']:.2f} TFLOPs")
+
+    def test_conv2d_1x1_attn_qkv_8x8(self):
+        """Conv2d(128, 384, k=1) @ 8x8 — VAE mid_block attention QKV."""
+        if DEVICE == "cpu":
+            pytest.skip("Kernel tests require XPU")
+
+        def prepare():
+            x = torch.randn(1, 128, 8, 8, device="cpu", dtype=torch.bfloat16)
+            conv = torch.nn.Conv2d(128, 384, kernel_size=1, device="cpu", dtype=torch.bfloat16)
+            return {"x": x}, conv
+
+        def compute(tensors, operation):
+            return operation(tensors["x"])
+
+        shape_info = {
+            "batch": 1, "in_channels": 128, "out_channels": 384,
+            "kernel_h": 1, "kernel_w": 1, "output_h": 8, "output_w": 8,
+            "input_size": 1 * 128 * 8 * 8, "weight_size": 384 * 128,
+            "output_size": 1 * 384 * 8 * 8,
+        }
+        result = benchmark_with_metrics("Conv2D 1x1 attn_qkv 8×8", prepare, compute, "conv2d", shape_info)
+        if result:
+            print(f"\n{result['name']}: {result['avg_ms']:.3f}ms, {result['tflops']:.2f} TFLOPs")
+
+    def test_conv2d_1x1_attn_proj_16x16(self):
+        """Conv2d(128, 128, k=1) @ 16x16 — should PASS (reference)."""
+        if DEVICE == "cpu":
+            pytest.skip("Kernel tests require XPU")
+
+        def prepare():
+            x = torch.randn(1, 128, 16, 16, device="cpu", dtype=torch.bfloat16)
+            conv = torch.nn.Conv2d(128, 128, kernel_size=1, device="cpu", dtype=torch.bfloat16)
+            return {"x": x}, conv
+
+        def compute(tensors, operation):
+            return operation(tensors["x"])
+
+        shape_info = {
+            "batch": 1, "in_channels": 128, "out_channels": 128,
+            "kernel_h": 1, "kernel_w": 1, "output_h": 16, "output_w": 16,
+            "input_size": 1 * 128 * 16 * 16, "weight_size": 128 * 128,
+            "output_size": 1 * 128 * 16 * 16,
+        }
+        result = benchmark_with_metrics("Conv2D 1x1 attn_proj 16×16", prepare, compute, "conv2d", shape_info)
+        if result:
+            print(f"\n{result['name']}: {result['avg_ms']:.3f}ms, {result['tflops']:.2f} TFLOPs")
+
+    def test_conv3d_1x1_shortcut_16x16(self):
+        """Conv3d(4, 8, k=1) @ (1,16,16) — VAE conv_shortcut (should PASS)."""
+        if DEVICE == "cpu":
+            pytest.skip("Kernel tests require XPU")
+
+        def prepare():
+            x = torch.randn(1, 4, 1, 16, 16, device="cpu", dtype=torch.bfloat16)
+            conv = torch.nn.Conv3d(4, 8, kernel_size=1, device="cpu", dtype=torch.bfloat16)
+            return {"x": x}, conv
+
+        def compute(tensors, operation):
+            return operation(tensors["x"])
+
+        shape_info = {
+            "batch": 1, "in_channels": 4, "out_channels": 8,
+            "kernel_h": 1, "kernel_w": 1, "output_h": 16, "output_w": 16,
+            "input_size": 1 * 4 * 1 * 16 * 16, "weight_size": 8 * 4,
+            "output_size": 1 * 8 * 1 * 16 * 16,
+        }
+        result = benchmark_with_metrics("Conv3D 1x1 shortcut 16×16", prepare, compute, "conv3d", shape_info)
+        if result:
+            print(f"\n{result['name']}: {result['avg_ms']:.3f}ms, {result['tflops']:.2f} TFLOPs")
+
+    def test_conv3d_1x1_shortcut_32x32(self):
+        """Conv3d(4, 8, k=1) @ (1,32,32) — VAE conv_shortcut (CRASHES SIM)."""
+        if DEVICE == "cpu":
+            pytest.skip("Kernel tests require XPU")
+
+        def prepare():
+            x = torch.randn(1, 4, 1, 32, 32, device="cpu", dtype=torch.bfloat16)
+            conv = torch.nn.Conv3d(4, 8, kernel_size=1, device="cpu", dtype=torch.bfloat16)
+            return {"x": x}, conv
+
+        def compute(tensors, operation):
+            return operation(tensors["x"])
+
+        shape_info = {
+            "batch": 1, "in_channels": 4, "out_channels": 8,
+            "kernel_h": 1, "kernel_w": 1, "output_h": 32, "output_w": 32,
+            "input_size": 1 * 4 * 1 * 32 * 32, "weight_size": 8 * 4,
+            "output_size": 1 * 8 * 1 * 32 * 32,
+        }
+        result = benchmark_with_metrics("Conv3D 1x1 shortcut 32×32", prepare, compute, "conv3d", shape_info)
+        if result:
+            print(f"\n{result['name']}: {result['avg_ms']:.3f}ms, {result['tflops']:.2f} TFLOPs")
+
+    def test_conv3d_1x1_real_wan22_720p(self):
+        """Conv3d(256, 512, k=1) @ (1,180,320) — real Wan2.2-A14B at 720p (CRASHES SIM)."""
+        if DEVICE == "cpu":
+            pytest.skip("Kernel tests require XPU")
+
+        def prepare():
+            x = torch.randn(1, 256, 1, 180, 320, device="cpu", dtype=torch.bfloat16)
+            conv = torch.nn.Conv3d(256, 512, kernel_size=1, device="cpu", dtype=torch.bfloat16)
+            return {"x": x}, conv
+
+        def compute(tensors, operation):
+            return operation(tensors["x"])
+
+        shape_info = {
+            "batch": 1, "in_channels": 256, "out_channels": 512,
+            "kernel_h": 1, "kernel_w": 1, "output_h": 180, "output_w": 320,
+            "input_size": 1 * 256 * 1 * 180 * 320, "weight_size": 512 * 256,
+            "output_size": 1 * 512 * 1 * 180 * 320,
+        }
+        result = benchmark_with_metrics("Conv3D 1x1 real Wan2.2 720p", prepare, compute, "conv3d", shape_info)
+        if result:
+            print(f"\n{result['name']}: {result['avg_ms']:.3f}ms, {result['tflops']:.2f} TFLOPs")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
     # Ensure report is generated even when run as script

@@ -310,8 +310,9 @@ class TestMXFP8Mini:
         weights_bf16 = torch.randn((n, k), dtype=torch.bfloat16, device="xpu") * 0.01
 
         def run():
-            inputs_lp, inputs_scale = self._to_mxfp(inputs_bf16, format="mxfp8")
-            weights_lp, weights_scale = self._to_mxfp(weights_bf16, format="mxfp8")
+            # to_mxfp returns (scale_e8m0, data_fp8)
+            inputs_scale, inputs_lp = self._to_mxfp(inputs_bf16, format="mxfp8")
+            weights_scale, weights_lp = self._to_mxfp(weights_bf16, format="mxfp8")
             weights_t = weights_lp.transpose(0, 1).contiguous()
             return self._fp8_gemm(
                 inputs_lp, weights_t, torch.bfloat16,
@@ -387,6 +388,81 @@ class TestConvMini:
             return conv(x)
 
         benchmark_fn("Conv3D VAE [1, 3, 4, 16, 16]->[1, 128, 4, 16, 16]", run)
+
+
+class TestConv1x1Mini:
+    """Conv2D/Conv3D kernel_size=1 tests — known CRI simulator crash shapes.
+
+    These test the specific configurations that crash the CRI simulator:
+    - Conv2d(k=1) at spatial <= 8x8
+    - Conv3d(k=1) at spatial >= 32x32
+    See: sanity_tests.txt "Known CRI Simulator Crash Shapes" section.
+    """
+
+    def test_conv2d_1x1_attn_proj_8x8(self):
+        """Conv2d(128, 128, k=1) @ 8x8 — VAE attention projection (CRASHES SIM)."""
+        if DEVICE == "cpu":
+            pytest.skip("Kernel tests require XPU")
+
+        x = torch.randn(1, 128, 8, 8, device="xpu", dtype=torch.bfloat16)
+        conv = torch.nn.Conv2d(128, 128, kernel_size=1, device="xpu", dtype=torch.bfloat16)
+
+        def run():
+            return conv(x)
+
+        benchmark_fn("Conv2D 1x1 [1, 128, 8, 8]", run)
+
+    def test_conv2d_1x1_attn_qkv_8x8(self):
+        """Conv2d(128, 384, k=1) @ 8x8 — VAE attention QKV (CRASHES SIM)."""
+        if DEVICE == "cpu":
+            pytest.skip("Kernel tests require XPU")
+
+        x = torch.randn(1, 128, 8, 8, device="xpu", dtype=torch.bfloat16)
+        conv = torch.nn.Conv2d(128, 384, kernel_size=1, device="xpu", dtype=torch.bfloat16)
+
+        def run():
+            return conv(x)
+
+        benchmark_fn("Conv2D 1x1 QKV [1, 128, 8, 8]", run)
+
+    def test_conv2d_1x1_16x16(self):
+        """Conv2d(128, 128, k=1) @ 16x16 — should PASS."""
+        if DEVICE == "cpu":
+            pytest.skip("Kernel tests require XPU")
+
+        x = torch.randn(1, 128, 16, 16, device="xpu", dtype=torch.bfloat16)
+        conv = torch.nn.Conv2d(128, 128, kernel_size=1, device="xpu", dtype=torch.bfloat16)
+
+        def run():
+            return conv(x)
+
+        benchmark_fn("Conv2D 1x1 [1, 128, 16, 16]", run)
+
+    def test_conv3d_1x1_shortcut_16x16(self):
+        """Conv3d(4, 8, k=1) @ (1,16,16) — VAE conv_shortcut (should PASS)."""
+        if DEVICE == "cpu":
+            pytest.skip("Kernel tests require XPU")
+
+        x = torch.randn(1, 4, 1, 16, 16, device="xpu", dtype=torch.bfloat16)
+        conv = torch.nn.Conv3d(4, 8, kernel_size=1, device="xpu", dtype=torch.bfloat16)
+
+        def run():
+            return conv(x)
+
+        benchmark_fn("Conv3D 1x1 [1, 4, 1, 16, 16]", run)
+
+    def test_conv3d_1x1_shortcut_32x32(self):
+        """Conv3d(4, 8, k=1) @ (1,32,32) — VAE conv_shortcut (CRASHES SIM)."""
+        if DEVICE == "cpu":
+            pytest.skip("Kernel tests require XPU")
+
+        x = torch.randn(1, 4, 1, 32, 32, device="xpu", dtype=torch.bfloat16)
+        conv = torch.nn.Conv3d(4, 8, kernel_size=1, device="xpu", dtype=torch.bfloat16)
+
+        def run():
+            return conv(x)
+
+        benchmark_fn("Conv3D 1x1 [1, 4, 1, 32, 32]", run)
 
 
 if __name__ == "__main__":
