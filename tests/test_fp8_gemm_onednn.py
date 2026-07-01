@@ -236,10 +236,11 @@ def test_fp8_gemm_per_channel(fp8_dtype, out_dtype, is_nt, batch, mnk_factors):
 @pytest.mark.parametrize("out_dtype", OUT_DTYPES)
 @pytest.mark.parametrize("is_nt", [True, False])
 @pytest.mark.parametrize("is_mbk", [True, False])
+@pytest.mark.parametrize("scale_layout", ["flat_1d", "row_2d"])
 @pytest.mark.parametrize("batch", BATCHES)
 @pytest.mark.parametrize("mnk_factors", MNK_FACTORS)
-def test_fp8_gemm_w8a16_per_channel(fp8_dtype, out_dtype, is_nt, is_mbk, batch,
-                                    mnk_factors):
+def test_fp8_gemm_w8a16_per_channel(fp8_dtype, out_dtype, is_nt, is_mbk,
+                                    scale_layout, batch, mnk_factors):
     seed = 1234
     torch.manual_seed(seed)
 
@@ -254,8 +255,12 @@ def test_fp8_gemm_w8a16_per_channel(fp8_dtype, out_dtype, is_nt, is_mbk, batch,
                                                  fp8_dtype=fp8_dtype)
     weight_fp8 = weight_fp8.cpu()
     scale_wei_fp8 = scale_wei_fp8.cpu()
-    # scale_wei_fp8 is [n, 1], flatten to [n] for per-channel scale
-    scale_wei_flat = scale_wei_fp8.flatten()
+    # scale_wei_fp8 is [n, 1]; exercise both the flat [n] and the [1, n]
+    # per-channel scale layouts.
+    if scale_layout == "flat_1d":
+        scale_wei = scale_wei_fp8.flatten()
+    else:
+        scale_wei = scale_wei_fp8.t().contiguous()
 
     # reference: dequantize weight then fp16/bf16 matmul
     weight_dequant = weight_fp8.to(out_dtype) * scale_wei_fp8.to(out_dtype)
@@ -270,12 +275,18 @@ def test_fp8_gemm_w8a16_per_channel(fp8_dtype, out_dtype, is_nt, is_mbk, batch,
     output_fp8 = fp8_gemm_w8a16(
         _to_kernel(input),
         _to_kernel(weight_fp8_t),
-        _to_kernel(scale_wei_flat),
+        _to_kernel(scale_wei),
         _to_kernel(torch.Tensor()),
     ).cpu()
     output_fp8 = output_fp8.transpose(0, 1) if is_mbk else output_fp8
 
-    torch.testing.assert_close(output_fp8, output_ref, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(
+        output_fp8,
+        output_ref,
+        atol=5e-2,
+        rtol=5e-2,
+        msg=f"scale_layout={scale_layout}",
+    )
 
 
 def _convert_to_mxfp8_with_hp_ref(t):
