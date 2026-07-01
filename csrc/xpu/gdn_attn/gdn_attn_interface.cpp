@@ -12,6 +12,7 @@
   #include "xe_2/l2norm.h"
   #include "xe_2/chunk_gated_delta_rule_xe2.h"
   #include "xe_2/gated_delta_rule_decode_xe2.h"
+  #include "xe_2/gemm_test_xe2.h"
 #endif
 
 
@@ -782,4 +783,36 @@ void gdn_attention(
       num_accepted_tokens,
       num_actual_tokens,
       tp_size);
+}
+
+// Test-only entry points that exercise the device GEMM primitives in
+// csrc/xpu/gdn_attn/xe_2/gemm.hpp. Not used by vLLM at runtime; they exist so
+// the primitives can be unit-tested from Python. Each runs a single work-group
+// that computes one work-group tile of C = A @ B^T (see gemm_test_xe2.hpp).
+void gdn_gemm_test(
+    torch::Tensor& C,
+    const torch::Tensor& A,
+    const torch::Tensor& B,
+    const std::optional<torch::Tensor>& k_multi,
+    const std::string& variant) {
+#ifdef VLLM_XPU_ENABLE_XE2
+  auto& queue = vllm::xpu::vllmGetQueue();
+  gdn_gemm_test_xe2(queue, C, A, B, k_multi, variant);
+#else
+  TORCH_CHECK(false, "gdn_gemm_test is only available on XE2 builds");
+#endif
+}
+
+void gdn_gemm_test_fused_2a(
+    torch::Tensor& C1,
+    torch::Tensor& C2,
+    const torch::Tensor& A1,
+    const torch::Tensor& A2,
+    const torch::Tensor& B) {
+#ifdef VLLM_XPU_ENABLE_XE2
+  auto& queue = vllm::xpu::vllmGetQueue();
+  gdn_gemm_test_fused_2a_xe2(queue, C1, C2, A1, A2, B);
+#else
+  TORCH_CHECK(false, "gdn_gemm_test_fused_2a is only available on XE2 builds");
+#endif
 }

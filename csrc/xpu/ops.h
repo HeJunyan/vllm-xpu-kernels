@@ -179,6 +179,24 @@ void gdn_attention(
     const int64_t num_actual_tokens,
     const int64_t tp_size,
     const bool reorder_input);
+
+// Test-only: exercise the device GEMM primitives in gemm.hpp
+// (gemm_TTS / gemm_STS / gemm_TSS / gemm_TTS_k_multi). Computes one
+// work-group tile of C = A @ B^T. Not used by vLLM at runtime.
+void gdn_gemm_test(
+    torch::Tensor& C,
+    const torch::Tensor& A,
+    const torch::Tensor& B,
+    const std::optional<torch::Tensor>& k_multi,
+    const std::string& variant);
+
+// Test-only: exercise gemm_TTS_fused_2A (C1 = A1 @ B^T, C2 = A2 @ B^T).
+void gdn_gemm_test_fused_2a(
+    torch::Tensor& C1,
+    torch::Tensor& C2,
+    const torch::Tensor& A1,
+    const torch::Tensor& A2,
+    const torch::Tensor& B);
 #endif
 
 bool is_bmg_g21(int64_t device_index);

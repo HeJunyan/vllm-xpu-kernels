@@ -138,6 +138,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "num_accepted_tokens, int num_actual_tokens, int "
       "tp_size, bool reorder_input) -> ()");
   xpu_ops.impl("gdn_attention", torch::kXPU, &gdn_attention);
+
+  // Test-only ops that exercise the device GEMM primitives in
+  // csrc/xpu/gdn_attn/xe_2/gemm.hpp. Not used by vLLM at runtime.
+  xpu_ops.def(
+      "gdn_gemm_test(Tensor! C, Tensor A, Tensor B, Tensor? k_multi, "
+      "str variant) -> ()");
+  xpu_ops.impl("gdn_gemm_test", torch::kXPU, &gdn_gemm_test);
+
+  xpu_ops.def(
+      "gdn_gemm_test_fused_2a(Tensor! C1, Tensor! C2, Tensor A1, Tensor A2, "
+      "Tensor B) -> ()");
+  xpu_ops.impl("gdn_gemm_test_fused_2a", torch::kXPU, &gdn_gemm_test_fused_2a);
 #endif
 
   // for empty tensor functions, we don't need dispatch key like torch::kXPU

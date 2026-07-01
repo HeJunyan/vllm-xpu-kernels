@@ -593,3 +593,30 @@ def topk_per_row_decode(
         logits.stride(1),
         top_k,
     )
+
+
+# test-only: gated-delta-net GEMM primitives (csrc/xpu/gdn_attn/xe_2/gemm.hpp)
+def gdn_gemm_test(
+    C: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    variant: str,
+    k_multi: Optional[torch.Tensor] = None,
+) -> None:
+    """Compute one work-group tile of C = A @ B^T using a gemm.hpp primitive.
+
+    variant selects the primitive under test: "TTS", "STS", "TSS" or
+    "k_multi". C must be float32 (M, N); A is (M, K); B is (N, K).
+    """
+    torch.ops._xpu_C.gdn_gemm_test(C, A, B, k_multi, variant)
+
+
+def gdn_gemm_test_fused_2a(
+    C1: torch.Tensor,
+    C2: torch.Tensor,
+    A1: torch.Tensor,
+    A2: torch.Tensor,
+    B: torch.Tensor,
+) -> None:
+    """Compute C1 = A1 @ B^T and C2 = A2 @ B^T via gemm_TTS_fused_2A."""
+    torch.ops._xpu_C.gdn_gemm_test_fused_2a(C1, C2, A1, A2, B)
