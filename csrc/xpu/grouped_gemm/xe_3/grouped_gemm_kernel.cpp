@@ -311,6 +311,9 @@ INSTANTIATE_KERNEL(moe_w4a8_mid_policy)
 INSTANTIATE_KERNEL(moe_fp8block_policy)
 INSTANTIATE_KERNEL(moe_fp8block_mid_policy)
 INSTANTIATE_KERNEL(moe_fp8block_decode_policy)
+INSTANTIATE_KERNEL(moe_fp8pertensor_policy)
+INSTANTIATE_KERNEL(moe_fp8pertensor_mid_policy)
+INSTANTIATE_KERNEL(moe_fp8pertensor_decode_policy)
 
 }  // namespace grouped_gemm
 }  // namespace gpu::cutlass_kernel

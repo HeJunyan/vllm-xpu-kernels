@@ -43,14 +43,25 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////
 namespace cutlass::gemm {
 
-template <int Stages_, class KernelSchedule = KernelMoEArrayCooperative>
+template <
+    int Stages_,
+    class KernelSchedule = KernelMoEArrayCooperative,
+    bool PerTensor_ = false>
 struct MainloopFP8BlockGroup {
   constexpr static int Stages = Stages_;
   constexpr static int SubgroupSize = 16;
+  constexpr static bool PerTensor = PerTensor_;
   using ArchTag = arch::IntelXe;
   using Schedule = KernelSchedule;
   using ClusterShape = Shape<_1, _1, _1>;
 };
+
+// Per-tensor scaled grouped FP8 GEMM: A is scaled by a single global scalar and
+// each expert's B by one scalar. Reuses the block-scaled mainloop with the
+// PerTensor flag set.
+template <int Stages_, class KernelSchedule = KernelMoEArrayCooperative>
+using MainloopFP8PerTensorGroup =
+    MainloopFP8BlockGroup<Stages_, KernelSchedule, true>;
 
 }  // namespace cutlass::gemm
 
@@ -61,6 +72,7 @@ namespace cutlass::gemm::collective {
 template <
     int Stages,
     class Schedule,
+    bool PerTensor,
     class TileShape_,
     class ElementPairA_,
     class StridePairA_,
@@ -76,7 +88,7 @@ template <
     class SmemCopyAtomB_,
     class TransformB_>
 struct CollectiveMma<
-    MainloopFP8BlockGroup<Stages, Schedule>,
+    MainloopFP8BlockGroup<Stages, Schedule, PerTensor>,
     TileShape_,
     ElementPairA_,
     StridePairA_,
@@ -92,7 +104,10 @@ struct CollectiveMma<
     SmemCopyAtomB_,
     TransformB_>
     : public CollectiveMma<
-          MainloopIntelXeXMX16BlockFp8<Stages>,
+          MainloopIntelXeXMX16BlockFp8<
+              Stages,
+              KernelMoEArrayCooperative,
+              PerTensor>,
           TileShape_,
           ElementPairA_,
           StridePairA_,
@@ -111,9 +126,12 @@ struct CollectiveMma<
   //
   // Type Aliases
   //
-  using DispatchPolicy = MainloopFP8BlockGroup<Stages, Schedule>;
+  using DispatchPolicy = MainloopFP8BlockGroup<Stages, Schedule, PerTensor>;
   using Base = CollectiveMma<
-      MainloopIntelXeXMX16BlockFp8<Stages>,
+      MainloopIntelXeXMX16BlockFp8<
+          Stages,
+          KernelMoEArrayCooperative,
+          PerTensor>,
       TileShape_,
       ElementPairA_,
       StridePairA_,
@@ -211,18 +229,33 @@ struct CollectiveMma<
     ElementB const* ptr_B_curr_batch =
         static_cast<ElementB const*>(mainloop_params.ptr_B) +
         next_group * N * K;
-    ElementSF const* ptr_SFA_curr_batch =
-        static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
-        expert_first_token_offset * scale_k;
-    ElementSF const* ptr_SFB_curr_batch =
-        static_cast<ElementSF const*>(mainloop_params.ptr_SB) +
-        next_group * scale_n * scale_k;
+    ElementSF const* ptr_SFA_curr_batch;
+    ElementSF const* ptr_SFB_curr_batch;
+    StrideScaleA dSA;
+    StrideScaleB dSB;
+    if constexpr (DispatchPolicy::PerTensor) {
+      // Per-tensor: A scale is a single global scalar (shape [1]); B scale is
+      // one scalar per expert (shape [E]). No within-tensor indexing.
+      ptr_SFA_curr_batch =
+          static_cast<ElementSF const*>(mainloop_params.ptr_SA);
+      ptr_SFB_curr_batch =
+          static_cast<ElementSF const*>(mainloop_params.ptr_SB) + next_group;
+      dSA = cutlass::make_cute_packed_stride(InternalStrideScaleA{}, {1, 1, 1});
+      dSB = cutlass::make_cute_packed_stride(InternalStrideScaleB{}, {1, 1, 1});
+    } else {
+      ptr_SFA_curr_batch =
+          static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
+          expert_first_token_offset * scale_k;
+      ptr_SFB_curr_batch =
+          static_cast<ElementSF const*>(mainloop_params.ptr_SB) +
+          next_group * scale_n * scale_k;
+      dSA = cutlass::make_cute_packed_stride(
+          InternalStrideScaleA{}, {M, scale_k, 1});
+      dSB = cutlass::make_cute_packed_stride(
+          InternalStrideScaleB{}, {scale_n, scale_k, 1});
+    }
     StrideA dA = cutlass::make_cute_packed_stride(InternalStrideA{}, {M, K, 1});
     StrideB dB = cutlass::make_cute_packed_stride(InternalStrideB{}, {N, K, 1});
-    StrideScaleA dSA = cutlass::make_cute_packed_stride(
-        InternalStrideScaleA{}, {M, scale_k, 1});
-    StrideScaleB dSB = cutlass::make_cute_packed_stride(
-        InternalStrideScaleB{}, {scale_n, scale_k, 1});
 
     return BaseArguments{
         ptr_A_curr_batch,

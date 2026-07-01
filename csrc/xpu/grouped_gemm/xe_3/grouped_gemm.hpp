@@ -200,7 +200,20 @@ at::Tensor grouped_gemm_func(
   } else if (
       A_dtype == at::kFloat8_e4m3fn && ptr_A_scale &&
       ptr_A_scale->dtype() == at::kFloat) {
-    if (avg_tokens_cnt > 32) {
+    if (ptr_A_scale->numel() == 1) {
+      // Per-tensor FP8: A scale is a single scalar [1], B scale is one scalar
+      // per expert [E].
+      if (avg_tokens_cnt > 32) {
+        using moe_policy = grouped_gemm::moe_fp8pertensor_policy;
+        CALL_KERNEL_WITH_POLICY(moe_policy);
+      } else if (avg_tokens_cnt > 4) {
+        using moe_policy = grouped_gemm::moe_fp8pertensor_mid_policy;
+        CALL_KERNEL_WITH_POLICY(moe_policy);
+      } else {
+        using moe_policy = grouped_gemm::moe_fp8pertensor_decode_policy;
+        CALL_KERNEL_WITH_POLICY(moe_policy);
+      }
+    } else if (avg_tokens_cnt > 32) {
       using moe_policy = grouped_gemm::moe_fp8block_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);
     } else if (avg_tokens_cnt > 4) {

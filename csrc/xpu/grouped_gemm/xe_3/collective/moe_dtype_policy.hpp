@@ -628,5 +628,56 @@ class moe_fp8block_decode_policy : public moe_fp8block_policy {
   CALL_GENERATE_GEMM();
 };
 
+// FP8 per-tensor: A scaled by a single global scalar (shape [1]), each
+// expert's B by one scalar (shape [E]). Same e4m3 DPAS as the block path; only
+// the scale granularity differs (selected via MainloopFP8PerTensorGroup).
+class moe_fp8pertensor_policy : public moe_policy_base {
+ public:
+  static constexpr bool NeedScale = true;
+  static constexpr int BlockSize = 128;
+  using ElementType = cutlass::float_e4m3_t;
+
+  using ElementA = ElementType;
+  using ElementB = ElementType;
+  using ElementOutput = float;
+  using ElementScaleA = float;
+  using ElementScaleB = float;
+
+  using StrideScale = cute::Stride<_1, int64_t, int64_t>;
+
+  using TileShape = Shape<_128, _128, _32>;
+  using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+
+  using GEMMDispatchPolicy =
+      cutlass::gemm::MainloopFP8PerTensorGroup<PipelineStages>;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_fp8pertensor_mid_policy : public moe_fp8pertensor_policy {
+ public:
+  using TileShape = Shape<_32, _128, _32>;
+  using SGLayout = Layout<Shape<_2, _8, _1>, Stride<_8, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_fp8pertensor_decode_policy : public moe_fp8pertensor_policy {
+ public:
+  using TileShape = Shape<_16, _128, _32>;
+  using SGLayout = Layout<Shape<_1, _8, _1>, Stride<_8, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  CALL_GENERATE_GEMM();
+};
+
 }  // namespace grouped_gemm
 }  // namespace gpu::cutlass_kernel

@@ -43,10 +43,19 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////
 namespace cutlass::gemm {
 
-template <int Stages_, class KernelSchedule = KernelMoEArrayCooperative>
+// PerTensor selects the scale-granularity of the e4m3 GEMM:
+//   false (default): 128x128 block-wise scales (A: [M, K/128], B: [N/128,
+//          K/128] per expert) -- the original behavior.
+//   true: per-tensor scales (A: a single scalar [1], B: one scalar per expert
+//          [E]) -- every block reads the same scalar.
+template <
+    int Stages_,
+    class KernelSchedule = KernelMoEArrayCooperative,
+    bool PerTensor_ = false>
 struct MainloopIntelXeXMX16BlockFp8 {
   constexpr static int Stages = Stages_;
   constexpr static int SubgroupSize = 16;
+  constexpr static bool PerTensor = PerTensor_;
   using ArchTag = arch::IntelXe;
   using Schedule = KernelSchedule;
   using ClusterShape = Shape<_1, _1, _1>;
@@ -60,6 +69,7 @@ using namespace cute;
 
 template <
     int Stages,
+    bool PerTensor,
     class TileShape_,
     class ElementPairA_,
     class StridePairA_,
@@ -75,7 +85,7 @@ template <
     class SmemCopyAtomB_,
     class TransformB_>
 struct CollectiveMma<
-    MainloopIntelXeXMX16BlockFp8<Stages>,
+    MainloopIntelXeXMX16BlockFp8<Stages, KernelMoEArrayCooperative, PerTensor>,
     TileShape_,
     ElementPairA_,
     StridePairA_,
@@ -94,7 +104,10 @@ struct CollectiveMma<
   //
   // Type Aliases
   //
-  using DispatchPolicy = MainloopIntelXeXMX16BlockFp8<Stages>;
+  using DispatchPolicy = MainloopIntelXeXMX16BlockFp8<
+      Stages,
+      KernelMoEArrayCooperative,
+      PerTensor>;
   using WorkgroupTileShape = TileShape_;
 
   using GmemTiledCopyPairA = GmemTiledCopyPairA_;
@@ -490,16 +503,27 @@ struct CollectiveMma<
       reorder(tBrB, tCrB);
 
       int k_group_idx = int(k_tile * SG_K / GROUP_K);
-      float scaleB = mainloop.ptr_SB[n_scale_idx * K_groups + k_group_idx];
       float combined_scale[sg_m_rows];
-      CUTLASS_PRAGMA_UNROLL
-      for (int i1 = 0; i1 < acc_m1; ++i1) {
+      if constexpr (DispatchPolicy::PerTensor) {
+        // Per-tensor: A has a single global scalar, B has one scalar per
+        // expert (the expert offset is already folded into ptr_SB), so every
+        // row/block reuses the same combined scale.
+        float scaleAB = mainloop.ptr_SA[0] * mainloop.ptr_SB[0];
         CUTLASS_PRAGMA_UNROLL
-        for (int i0 = 0; i0 < acc_m0; ++i0) {
-          int row = i1 * acc_m0 + i0;
-          combined_scale[row] =
-              mainloop.ptr_SA[(m_coord + row) * K_groups + k_group_idx] *
-              scaleB;
+        for (int row = 0; row < sg_m_rows; ++row) {
+          combined_scale[row] = scaleAB;
+        }
+      } else {
+        float scaleB = mainloop.ptr_SB[n_scale_idx * K_groups + k_group_idx];
+        CUTLASS_PRAGMA_UNROLL
+        for (int i1 = 0; i1 < acc_m1; ++i1) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i0 = 0; i0 < acc_m0; ++i0) {
+            int row = i1 * acc_m0 + i0;
+            combined_scale[row] =
+                mainloop.ptr_SA[(m_coord + row) * K_groups + k_group_idx] *
+                scaleB;
+          }
         }
       }
 

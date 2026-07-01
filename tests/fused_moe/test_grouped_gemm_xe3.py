@@ -127,6 +127,12 @@ MINI_PYTEST_PARAMS = {
         "topk": [1],
         "recipe": ["128x128"],
         "has_bias": [True]
+    },
+    "test_grouped_gemm_fp8_pertensor": {
+        "m,n,k": MINI_MNK_SHAPES,
+        "e": [1, 2],
+        "topk": [1],
+        "has_bias": [True]
     }
 }
 
@@ -537,6 +543,74 @@ def test_grouped_gemm_fp8block(m, n, k, e, topk, recipe, has_bias):
             continue
         input = a_ref[pre_token_sum:pre_token_sum + cur_token_num, :]
         weight = hp_from_128x128(b_fp8[i, :, :], b_scales[i, :, :])
+
+        expert_output = input @ weight.T
+        if has_bias:
+            expert_output += bias[i]
+        ref.append(expert_output)
+        pre_token_sum += cur_token_num
+    ref = torch.cat(ref, dim=0)
+
+    print("ref: ", ref, ref.shape)
+    print("ker: ", output, output.shape)
+    torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
+@pytest.mark.parametrize("e", NUM_EXPERTS)
+@pytest.mark.parametrize("topk", TOP_KS)
+@pytest.mark.parametrize("has_bias", [True, False])
+def test_grouped_gemm_fp8_pertensor(m, n, k, e, topk, has_bias):
+    # Per-tensor FP8: a single global scalar scales all of A (shape [1]); one
+    # scalar per expert scales that expert's B (shape [E]).
+    seed_everything(8)
+    num_experts = e
+    rows_per_expert = random_partition(e, m * topk)
+    assert (len(rows_per_expert) == e)
+
+    m = sum(rows_per_expert)
+
+    A_fp32 = torch.randn((m, k), device=DEVICE, dtype=torch.float32)
+    a_fp8 = A_fp32.to(torch.float8_e4m3fn)
+    a_scale = torch.randn(1, device=DEVICE, dtype=torch.float32)
+    fill_zero(a_scale)
+    assert (not (a_scale == 0).any())
+
+    B_fp32 = torch.randn((num_experts, n, k),
+                         device=DEVICE,
+                         dtype=torch.float32)
+    b_fp8 = B_fp32.to(torch.float8_e4m3fn).transpose(
+        -1, -2).contiguous().transpose(-1, -2)
+    b_scale = torch.randn(num_experts, device=DEVICE, dtype=torch.float32)
+    fill_zero(b_scale)
+    assert (not (b_scale == 0).any())
+
+    if has_bias:
+        bias = torch.randn((num_experts, n),
+                           dtype=torch.float32,
+                           device=DEVICE)
+    else:
+        bias = None
+
+    output = torch.zeros((m, n), dtype=torch.float32, device=DEVICE)
+    output_kernel = output.to(KERNEL_DEVICE)
+    cutlass_grouped_gemm(_to_kernel(a_fp8), _to_kernel(a_scale),
+                         _to_kernel(b_fp8), _to_kernel(b_scale),
+                         _to_kernel(bias), output_kernel,
+                         rows_per_expert, n, k, num_experts)
+    output = output_kernel.cpu()
+
+    # ref gg: dequantize A by the single scalar and each expert's B by its
+    # scalar, then matmul per expert.
+    ref = []
+    pre_token_sum = 0
+    a_ref = a_fp8.float() * a_scale.item()
+    for i in range(num_experts):
+        cur_token_num = rows_per_expert[i]
+        if cur_token_num == 0:
+            continue
+        input = a_ref[pre_token_sum:pre_token_sum + cur_token_num, :]
+        weight = b_fp8[i, :, :].float() * b_scale[i].item()
 
         expert_output = input @ weight.T
         if has_bias:
