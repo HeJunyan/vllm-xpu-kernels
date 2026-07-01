@@ -138,6 +138,7 @@ endif()
 
 if(VLLM_XPU_ENABLE_XE2)
   message(STATUS "Building on XE2, enable XE2 kernels.")
+  set(VLLM_XPU_ENABLE_XE_DEFAULT OFF)
 endif()
 
 if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)

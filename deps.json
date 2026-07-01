@@ -10,7 +10,7 @@
     "repo": "https://github.com/uxlfoundation/oneDNN",
     "revisions": {
       "cri": "main",
-      "default": "80afa71049cd69a3df32adcccb623b12cd7baa22"
+      "default": "main"
     }
   }
 }
