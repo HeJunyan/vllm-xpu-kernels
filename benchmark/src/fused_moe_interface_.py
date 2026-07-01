@@ -170,9 +170,7 @@ def xpu_fused_moe_CalKernelTime(hidden_states,
         rows_per_expert=rows_per_expert,
         N=2 * inter_size,
         K=hidden_size,
-        num_experts=num_experts,
-        is_B_int4=is_int4,
-        is_B_mxfp4=is_mxfp4)
+        num_experts=num_experts)
     if end_event_gemm1 is not None:
         end_event_gemm1.record()
     active_experts1 = (rows_per_expert > 0).sum().item()
@@ -210,9 +208,7 @@ def xpu_fused_moe_CalKernelTime(hidden_states,
         rows_per_expert=rows_per_expert,
         N=hidden_size,
         K=inter_size,
-        num_experts=num_experts,
-        is_B_int4=is_int4,
-        is_B_mxfp4=is_mxfp4)
+        num_experts=num_experts)
 
     if end_event_gemm2 is not None:
         end_event_gemm2.record()

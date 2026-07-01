@@ -43,6 +43,22 @@ def _get_recipe(is_fp8, is_mxfp8, is_mxfp4, is_int4, is_block_fp8):
         return "bf16"
 
 
+def _get_weights_dtype(weight, scales):
+    """Infer the quantization recipe flags from the weight/scale dtypes."""
+    weight_dtype = weight.dtype
+    is_fp8 = weight_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    is_int4 = weight_dtype in (torch.uint8, torch.int8)
+    is_mxfp4 = weight_dtype == torch.float4_e2m1fn_x2
+    is_mxfp8 = (is_fp8 and scales is not None
+                and scales.dtype in (torch.uint8, torch.float8_e8m0fnu))
+    is_block_fp8 = (is_fp8 and scales is not None
+                    and scales.dtype == torch.float32 and scales.ndim == 3)
+    is_int4 = is_int4 and scales is not None
+    is_fp8 = is_fp8 and not is_mxfp8 and not is_block_fp8
+
+    return is_fp8, is_int4, is_mxfp4, is_mxfp8, is_block_fp8
+
+
 def cutlass_grouped_gemm(input_A, input_A_scale, input_B, input_B_scale, bias,
                          output, expert_token_count, n, k, num_experts):
     num_rows_per_expert = torch.tensor(expert_token_count,
@@ -58,14 +74,11 @@ def cutlass_grouped_gemm(input_A, input_A_scale, input_B, input_B_scale, bias,
         rows_per_expert=num_rows_per_expert,
         N=n,
         K=k,
-        num_experts=num_experts,
-        is_B_int4=False,
-        is_B_mxfp4=False)
+        num_experts=num_experts)
 
 
 def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
-                             num_rows_per_expert, n, k, num_experts, is_B_int4,
-                             is_B_mxfp4):
+                             num_rows_per_expert, n, k, num_experts):
     torch.ops._xpu_C.cutlass_grouped_gemm_interface(
         ptr_A=input_A,
         ptr_A_scale=None,
@@ -76,9 +89,7 @@ def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
         rows_per_expert=num_rows_per_expert,
         N=n,
         K=k,
-        num_experts=num_experts,
-        is_B_int4=is_B_int4,
-        is_B_mxfp4=is_B_mxfp4)
+        num_experts=num_experts)
 
 
 def ceilDiv(a, b):
@@ -154,13 +165,23 @@ class XpuFusedMoe:
         ep_rank=0,
         ep_size=1,
         expert_map=None,
-        is_fp8=False,
-        is_int4=False,
-        is_mxfp4=False,
-        is_mxfp8=False,
-        is_block_fp8=False,
+        is_fp8=None,
+        is_int4=None,
+        is_mxfp4=None,
+        is_mxfp8=None,
+        is_block_fp8=None,
         gemm1_clamp_limit: Optional[float] = None,
     ):
+        # Infer the quantization recipe from the weight/scale dtypes. Explicit
+        # is_* arguments (used by the XE3 tests) still take precedence.
+        (d_fp8, d_int4, d_mxfp4, d_mxfp8,
+         d_block_fp8) = _get_weights_dtype(w13, w13_scales)
+        is_fp8 = d_fp8 if is_fp8 is None else is_fp8
+        is_int4 = d_int4 if is_int4 is None else is_int4
+        is_mxfp4 = d_mxfp4 if is_mxfp4 is None else is_mxfp4
+        is_mxfp8 = d_mxfp8 if is_mxfp8 is None else is_mxfp8
+        is_block_fp8 = d_block_fp8 if is_block_fp8 is None else is_block_fp8
+
         # 4bits support [E, N, K]
         # other types [E, K, N]
         if not is_int4 and not is_mxfp4:
@@ -369,9 +390,7 @@ class XpuFusedMoe:
             rows_per_expert=rows_per_expert,
             N=2 * self.inter_size,
             K=gemm_hidden_size,
-            num_experts=self.num_experts,
-            is_B_int4=self.is_int4,
-            is_B_mxfp4=self.is_mxfp4)
+            num_experts=self.num_experts)
 
         # Apply swiglu_limit clamping before activation
         if self.gemm1_clamp_limit is not None and self.gemm1_clamp_limit > 0:
@@ -407,9 +426,7 @@ class XpuFusedMoe:
             rows_per_expert=rows_per_expert,
             N=gemm_hidden_size,
             K=self.inter_size * self.inter_size_scale,
-            num_experts=self.num_experts,
-            is_B_int4=self.is_int4,
-            is_B_mxfp4=self.is_mxfp4)
+            num_experts=self.num_experts)
 
         torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
                                     unpermuted_row_to_permuted_row,
@@ -712,9 +729,7 @@ def xpu_fused_moe(hidden_states,
         rows_per_expert=rows_per_expert,
         N=2 * inter_size,
         K=ori_hidden_size,
-        num_experts=num_experts,
-        is_B_int4=is_int4,
-        is_B_mxfp4=is_mxfp4)
+        num_experts=num_experts)
 
     # Apply swiglu_limit clamping before activation
     if gemm1_clamp_limit is not None and gemm1_clamp_limit > 0:
@@ -761,9 +776,7 @@ def xpu_fused_moe(hidden_states,
         rows_per_expert=rows_per_expert,
         N=ori_hidden_size,
         K=inter_size * inter_size_scale,
-        num_experts=num_experts,
-        is_B_int4=is_int4,
-        is_B_mxfp4=is_mxfp4)
+        num_experts=num_experts)
 
     torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
                                 unpermuted_row_to_permuted_row,
