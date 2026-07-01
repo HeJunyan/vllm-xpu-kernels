@@ -147,8 +147,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         )),
     "BUILD_ON_SIMULATOR_CRI":
     lambda: bool(int(os.getenv("BUILD_ON_SIMULATOR_CRI", "0"))),
-    "BUILD_ON_SIMULATOR_JGS":
-    lambda: bool(int(os.getenv("BUILD_ON_SIMULATOR_JGS", "0"))),
 }
 
 # --8<-- [end:env-vars-definition]

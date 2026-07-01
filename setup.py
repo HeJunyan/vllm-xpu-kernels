@@ -569,12 +569,6 @@ if _is_enabled("BUILD_SYCL_TLA_KERNELS"):
         if _is_enabled("MOE_KERNELS_ENABLED"):
             additional_libraries["grouped_gemm_xe_3"] = (
                 "/csrc/xpu/grouped_gemm/xe_3")
-    if _is_enabled("VLLM_XPU_ENABLE_XE4"):
-        if _is_enabled("FA2_KERNELS_ENABLED"):
-            additional_libraries["attn_kernels_xe_4"] = "/csrc/xpu/attn/xe_4"
-        if _is_enabled("MOE_KERNELS_ENABLED"):
-            additional_libraries["grouped_gemm_xe_4"] = (
-                "/csrc/xpu/grouped_gemm/xe_4")
     if _is_enabled("VLLM_XPU_ENABLE_XE_DEFAULT") and _is_enabled(
             "MOE_KERNELS_ENABLED"):
         additional_libraries["grouped_gemm_xe_default"] = (

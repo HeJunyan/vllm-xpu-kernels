@@ -8,9 +8,6 @@
 #ifdef VLLM_XPU_ENABLE_XE3
   #include "xe_3/grouped_gemm_xe3.h"
 #endif
-#ifdef VLLM_XPU_ENABLE_XE4
-  #include "xe_4/grouped_gemm_xe4.h"
-#endif
 #ifdef VLLM_XPU_ENABLE_XE_DEFAULT
   #include "xe_default/grouped_gemm_xe_default.h"
 #endif
@@ -62,22 +59,6 @@ torch::Tensor cutlass_grouped_gemm_interface(
   else if (vllm::xpu::is_xe3p_arch()) {
     // Use XE3 cutlass kernel
     return cutlass_grouped_gemm_xe3(
-        ptr_A,
-        ptr_A_scale,
-        ptr_B,
-        ptr_B_scale,
-        ptr_bias,
-        ptr_D,
-        rows_per_expert,
-        N,
-        K,
-        num_experts);
-  }
-#endif
-#ifdef VLLM_XPU_ENABLE_XE4
-  else if (vllm::xpu::is_xe4_arch()) {
-    // Use XE4 cutlass kernel
-    return cutlass_grouped_gemm_xe4(
         ptr_A,
         ptr_A_scale,
         ptr_B,

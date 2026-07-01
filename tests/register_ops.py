@@ -41,7 +41,7 @@ def require_torch_ops(*ops):
     """Skip test if required torch ops are not registered.
 
     Args:
-        *ops: Strings in format "namespace.op_name" (e.g., "_C.rms_norm", "_xpu_C.is_jgs")
+        *ops: Strings in format "namespace.op_name" (e.g., "_C.rms_norm")
 
     Example:
         @pytest.mark.skipif(not require_torch_ops("_C.rms_norm"),
@@ -51,7 +51,7 @@ def require_torch_ops(*ops):
 
     Or use as a function:
         def test_something():
-            if not require_torch_ops("_C.rms_norm", "_xpu_C.is_jgs"):
+            if not require_torch_ops("_C.rms_norm"):
                 pytest.skip("Required ops not registered")
     """
     for op in ops:

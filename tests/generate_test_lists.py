@@ -74,8 +74,6 @@ CATEGORIES = [
     ("WAN Kernels", "tests/wan_ut/"),
     ("MOE / Grouped GEMM", "tests/fused_moe/test_fused_moe_xe2.py"),
     ("MOE / Grouped GEMM", "tests/fused_moe/test_grouped_gemm_xe2.py"),
-    ("MOE / Grouped GEMM", "tests/fused_moe/test_grouped_gemm_xe4.py"),
-    ("Flash Attention", "tests/flash_attn/test_flash_attn_varlen_func_xe4.py"),
     ("MOE Utils", "tests/test_moe_lora_align_sum.py"),
     ("Misc", "tests/test_xpu_memcpy_sync.py"),
     ("Misc", "tests/test_mem_alloc.py"),
@@ -180,8 +178,8 @@ def dedup_sanity_tests(tests: list[str]) -> list[str]:
                 continue
         filtered.append(t)
 
-    # Filter out xe2/xe4 tests (sanity targets CRI/XE3 simulator only)
-    filtered = [t for t in filtered if "xe2" not in t and "xe4" not in t]
+    # Filter out xe2 tests (sanity targets CRI/XE3 simulator only)
+    filtered = [t for t in filtered if "xe2" not in t]
 
     # Second pass: group by test function and pick representatives
     func_groups = defaultdict(list)

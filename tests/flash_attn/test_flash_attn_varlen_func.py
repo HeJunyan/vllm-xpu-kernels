@@ -11,16 +11,6 @@ import vllm_xpu_kernels._xpu_C  # noqa: F401
 from tests.utils import format_tc
 from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
 
-# Check if running on JGS platform (skip if ops not registered)
-try:
-    _is_jgs = torch.ops._xpu_C.is_jgs(0)
-except (AttributeError, RuntimeError):
-    # Ops not registered or not available - skip these tests
-    _is_jgs = True  # Treat as JGS to skip tests
-    pytestmark = pytest.mark.skip(reason="torch.ops._xpu_C not registered - run build steps from CLAUDE.md")
-else:
-    pytestmark = pytest.mark.skipif(_is_jgs, reason="XE2/3 tests cannot run on JGS.")
-
 NUM_HEADS = [(8, 2)]
 HEAD_SIZES = [64, 128, 256, 512]
 BLOCK_SIZES = [16, 64]

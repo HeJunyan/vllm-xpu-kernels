@@ -83,11 +83,6 @@ static inline bool is_nvl_p(at::DeviceIndex device_index = -1) {
          syclex::architecture::intel_gpu_nvl_p;
 }
 
-static inline bool is_jgs(at::DeviceIndex device_index = -1) {
-  return get_device_architecture(device_index) ==
-         syclex::architecture::intel_gpu_jgs;
-}
-
 static inline bool is_xe2_arch(at::DeviceIndex device_index = -1) {
   auto arch = get_device_architecture(device_index);
   return arch == syclex::architecture::intel_gpu_bmg_g21 ||
@@ -122,13 +117,6 @@ static inline bool is_xe3p_arch(at::DeviceIndex device_index = -1) {
   auto arch = get_device_architecture(device_index);
   return arch == syclex::architecture::intel_gpu_cri ||
          arch == syclex::architecture::intel_gpu_nvl_p;
-}
-#endif
-
-#ifdef VLLM_XPU_ENABLE_XE4
-static inline bool is_xe4_arch(at::DeviceIndex device_index = -1) {
-  auto arch = get_device_architecture(device_index);
-  return arch == syclex::architecture::intel_gpu_jgs;
 }
 #endif
 

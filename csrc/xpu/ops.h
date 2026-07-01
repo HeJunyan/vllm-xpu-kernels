@@ -127,8 +127,6 @@ bool is_cri(int64_t device_index);
 
 bool is_nvl_p(int64_t device_index);
 
-bool is_jgs(int64_t device_index);
-
 void exponential_2d_(
     torch::Tensor& tensor,
     torch::Tensor& seeds,  // should on CPU

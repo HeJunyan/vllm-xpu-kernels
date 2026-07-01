@@ -119,9 +119,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
   xpu_ops.def("is_nvl_p(int device_index) -> bool");
   xpu_ops.impl("is_nvl_p", &is_nvl_p);
 
-  xpu_ops.def("is_jgs(int device_index) -> bool");
-  xpu_ops.impl("is_jgs", &is_jgs);
-
   // test only, will not use in vllm
   xpu_ops.def(
       "exponential_2d_(Tensor! tensor, Tensor! seeds, float lambda) -> ()");

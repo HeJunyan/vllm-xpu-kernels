@@ -55,7 +55,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.impl("grouped_topk", torch::kXPU, &grouped_topk);
 
 // https://jira.devtools.intel.com/browse/CMPLRLLVM-75455
-#ifndef VLLM_XPU_ENABLE_XE4 
   // Fused Grouped TopK
   m.def(
       "fused_grouped_topk(Tensor hidden_states, Tensor gating_output, int "
@@ -64,7 +63,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "scoring_func, float routed_scaling_factor, Tensor? bias=None) -> "
       "(Tensor, Tensor)");
   m.impl("fused_grouped_topk", torch::kXPU, &fused_grouped_topk);
-#endif
   // Apply topk softmax to the gating outputs.
   m.def(
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor! "

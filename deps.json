@@ -3,7 +3,6 @@
     "repo": "https://github.com/intel-innersource/libraries.ai.cutlass.internal",
     "revisions": {
       "cri": "1f3f35279137709c4ed880c6355891e0c772cf46",
-      "jgs": "e5097396a69862201d1717ef2d1cbb23f5f7fd9b",
       "default": "cd763790ad2f74d7294435ecf77682bac0062c3a"
     }
   },
@@ -11,7 +10,6 @@
     "repo": "https://github.com/uxlfoundation/oneDNN",
     "revisions": {
       "cri": "main",
-      "jgs": {"repo": "https://github.com/intel-innersource/libraries.performance.math.onednn", "revision": "c70e30885c1efc054d302747c16c1ba40f54ed32"},
       "default": "80afa71049cd69a3df32adcccb623b12cd7baa22"
     }
   }
