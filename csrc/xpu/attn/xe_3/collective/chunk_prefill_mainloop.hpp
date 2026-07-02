@@ -544,6 +544,10 @@ struct FMHAFwdMainloop<
       update_payloads(prepared_pk, page_offset);
       prefetch_with_payloads(prefetch_k, prepared_pk, shape(pKgK(_,_,_,0)));
 
+      /* Early V-load for VV=0: overlap memory latency with softmax scalar work */
+      copy_with_multi_payloads(copy_v, prepared_v[0], tVrV);
+      update_payloads(prepared_v[0], page_offset);
+
       /* Causal masking and k remainder masking */
       if constexpr (CausalMask) {
         if (need_causal) {
@@ -627,11 +631,14 @@ struct FMHAFwdMainloop<
         reorder(tSrS, tArP);
       }
 
-      /* GEMM 2: A += P * V, split in v dimension */
+      /* GEMM 2: A += P * V, split in v dimension.
+       * VV=0 pre-loaded before softmax; VV>0 loaded inline. */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        copy_with_multi_payloads(copy_v, prepared_v[VV], tVrV);
-        update_payloads(prepared_v[VV], page_offset);
+        if (VV > 0) {
+          copy_with_multi_payloads(copy_v, prepared_v[VV], tVrV);
+          update_payloads(prepared_v[VV], page_offset);
+        }
         reorder(tVrV, tArV);
 
         CUTLASS_PRAGMA_UNROLL
