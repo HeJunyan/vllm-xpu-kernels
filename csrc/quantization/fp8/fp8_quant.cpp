@@ -8,6 +8,7 @@
 #include "utils.h"
 
 #include "quantization/fp8/fp8_quant.h"
+#include "quantization/fp8/fp8_quant_asm.h"
 #include "quantization/fp8/quant_utils.h"
 
 namespace vllm {
@@ -85,7 +86,7 @@ class scaled_fp8_quant_kernel_strided_group_shape {
     constexpr int VEC_SIZE = 4;
     if (STRIDE_J_ZERO && hidden_size % VEC_SIZE == 0) {
       // Per-tensor or per-token: single scale per row, vectorize full row
-      fp8::ConvertWithScaleOp<true, fp8_type> op{get_inv_scale(0)};
+      fp8::ScaledQuantOpAsm<true, scalar_t, fp8_type> op{get_inv_scale(0)};
       vectorize_with_alignment<VEC_SIZE>(
           token_in, token_out, hidden_size, tid, item.get_local_range(0), op);
     } else if (group_n % VEC_SIZE == 0) {
@@ -93,7 +94,7 @@ class scaled_fp8_quant_kernel_strided_group_shape {
       const int num_groups_n = hidden_size / group_n;
 
       for (int gj = 0; gj < num_groups_n; gj++) {
-        fp8::ConvertWithScaleOp<true, fp8_type> op{get_inv_scale(gj)};
+        fp8::ScaledQuantOpAsm<true, scalar_t, fp8_type> op{get_inv_scale(gj)};
         vectorize_with_alignment<VEC_SIZE>(
             token_in + gj * group_n,
             token_out + gj * group_n,
@@ -251,7 +252,7 @@ class per_token_group_quant_8bit_kernel {
     const float inverted_scale = 1.0f / (y_s);
     constexpr int VEC_SIZE = 4;
     if (can_vectorize) {
-      fp8::ConvertWithScaleOp<true, fp8_type> op{inverted_scale};
+      fp8::ScaledQuantOpAsm<true, scalar_t, fp8_type> op{inverted_scale};
       vectorize_with_alignment<VEC_SIZE>(
           group_input,
           group_output,
