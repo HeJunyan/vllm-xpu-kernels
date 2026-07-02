@@ -78,6 +78,11 @@ struct chunk_policy_head128 {
   using ShapePV = Shape<_512, _64, _64>;
   using ShapeOut = Shape<_512, _128>;
   using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+
+  using ShapeQK_Causal = Shape<_256, _64, _64>;
+  using ShapePV_Causal = Shape<_256, _64, _64>;
+  using ShapeOut_Causal = Shape<_256, _128>;
+  using SubgroupLayoutQK_Causal = Layout<Shape<_16, _1, _1>>;
 #endif
 };
 

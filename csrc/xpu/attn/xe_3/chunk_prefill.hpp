@@ -205,12 +205,16 @@ struct KernelLauncher {
     auto params =
         FMHAKernel::to_underlying_arguments(arguments, workspace.get());
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
     GPU_Clock timer;
     timer.start();
     run(queue, params);
     queue.wait();
     double cute_time = timer.seconds();
     printf("\nPerformance:   %6.4f  ms\n\n", cute_time * 1000);
+#else
+    run(queue, params);
+#endif
 
     return cutlass::Status::kSuccess;
   }
@@ -237,10 +241,12 @@ struct KernelLauncher {
         syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<VLLM_GRF_SIZE>};
     compat::experimental::launch_policy policy{
         sycl_grid, sycl_block, launch_props, kernel_props};
-    // compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
-    //     policy, queue, params);
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
     auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, params);
     EventManager::getInstance().addEvent(event);
+#else
+    compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, queue, params);
+#endif
   }
 };
 
@@ -353,9 +359,28 @@ struct FMHAConfig {
 
   static void
   kernel_dispatch(sycl::queue& queue, const chunk_prefill_args_t& args) {
-    return run<cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(
+    return run<cutlass::fmha::kernel::XeFHMAIndividualTileScheduler<Causal>>(
         queue, args);
   }
+};
+
+template <typename Policy, bool Causal, typename = void>
+struct chunk_policy_dispatch_shapes {
+  using ShapeQK = typename Policy::ShapeQK;
+  using ShapePV = typename Policy::ShapePV;
+  using ShapeOut = typename Policy::ShapeOut;
+  using SubgroupLayoutQK = typename Policy::SubgroupLayoutQK;
+};
+
+template <typename Policy>
+struct chunk_policy_dispatch_shapes<
+    Policy,
+    true,
+    cute::void_t<typename Policy::ShapeQK_Causal>> {
+  using ShapeQK = typename Policy::ShapeQK_Causal;
+  using ShapePV = typename Policy::ShapePV_Causal;
+  using ShapeOut = typename Policy::ShapeOut_Causal;
+  using SubgroupLayoutQK = typename Policy::SubgroupLayoutQK_Causal;
 };
 
 // Hidden visibility prevents these per-arch template instantiations from being
@@ -375,13 +400,19 @@ __attribute__((visibility("hidden"))) void policy_dispatch_impl(
     CutlassQKType& cuQKType,
     const chunk_prefill_args_t& args) {
   const int PipelineStages = 2;
+  // Select standard or causal-specialized tile shapes for this policy.
+  using dispatch_shapes = chunk_policy_dispatch_shapes<chunk_policy, Causal>;
+  using DispatchShapeQK = typename dispatch_shapes::ShapeQK;
+  using DispatchShapePV = typename dispatch_shapes::ShapePV;
+  using DispatchShapeOut = typename dispatch_shapes::ShapeOut;
+  using DispatchSubgroupLayoutQK = typename dispatch_shapes::SubgroupLayoutQK;
   if (cuQKType.q_type == CutlassDType::half) {
     if (cuQKType.k_type == CutlassDType::half) {
       return FMHAConfig<
-          typename chunk_policy::ShapeQK,
-          typename chunk_policy::ShapePV,
-          typename chunk_policy::ShapeOut,
-          typename chunk_policy::SubgroupLayoutQK,
+          DispatchShapeQK,
+          DispatchShapePV,
+          DispatchShapeOut,
+          DispatchSubgroupLayoutQK,
           void,
           PipelineStages,
           Paged,
@@ -395,10 +426,10 @@ __attribute__((visibility("hidden"))) void policy_dispatch_impl(
           half_t>::kernel_dispatch(queue, args);
     } else if (cuQKType.k_type == CutlassDType::float8_e4m3) {
       return FMHAConfig<
-          typename chunk_policy::ShapeQK,
-          typename chunk_policy::ShapePV,
-          typename chunk_policy::ShapeOut,
-          typename chunk_policy::SubgroupLayoutQK,
+          DispatchShapeQK,
+          DispatchShapePV,
+          DispatchShapeOut,
+          DispatchSubgroupLayoutQK,
           void,
           PipelineStages,
           Paged,
@@ -412,10 +443,10 @@ __attribute__((visibility("hidden"))) void policy_dispatch_impl(
           half_t>::kernel_dispatch(queue, args);
     } else if (cuQKType.k_type == CutlassDType::float8_e5m2) {
       return FMHAConfig<
-          typename chunk_policy::ShapeQK,
-          typename chunk_policy::ShapePV,
-          typename chunk_policy::ShapeOut,
-          typename chunk_policy::SubgroupLayoutQK,
+          DispatchShapeQK,
+          DispatchShapePV,
+          DispatchShapeOut,
+          DispatchSubgroupLayoutQK,
           void,
           PipelineStages,
           Paged,
@@ -431,10 +462,10 @@ __attribute__((visibility("hidden"))) void policy_dispatch_impl(
   } else {
     if (cuQKType.k_type == CutlassDType::bfloat16) {
       return FMHAConfig<
-          typename chunk_policy::ShapeQK,
-          typename chunk_policy::ShapePV,
-          typename chunk_policy::ShapeOut,
-          typename chunk_policy::SubgroupLayoutQK,
+          DispatchShapeQK,
+          DispatchShapePV,
+          DispatchShapeOut,
+          DispatchSubgroupLayoutQK,
           void,
           PipelineStages,
           Paged,
@@ -448,10 +479,10 @@ __attribute__((visibility("hidden"))) void policy_dispatch_impl(
           bfloat16_t>::kernel_dispatch(queue, args);
     } else if (cuQKType.k_type == CutlassDType::float8_e4m3) {
       return FMHAConfig<
-          typename chunk_policy::ShapeQK,
-          typename chunk_policy::ShapePV,
-          typename chunk_policy::ShapeOut,
-          typename chunk_policy::SubgroupLayoutQK,
+          DispatchShapeQK,
+          DispatchShapePV,
+          DispatchShapeOut,
+          DispatchSubgroupLayoutQK,
           void,
           PipelineStages,
           Paged,
@@ -465,10 +496,10 @@ __attribute__((visibility("hidden"))) void policy_dispatch_impl(
           bfloat16_t>::kernel_dispatch(queue, args);
     } else if (cuQKType.k_type == CutlassDType::float8_e5m2) {
       return FMHAConfig<
-          typename chunk_policy::ShapeQK,
-          typename chunk_policy::ShapePV,
-          typename chunk_policy::ShapeOut,
-          typename chunk_policy::SubgroupLayoutQK,
+          DispatchShapeQK,
+          DispatchShapePV,
+          DispatchShapeOut,
+          DispatchSubgroupLayoutQK,
           void,
           PipelineStages,
           Paged,
