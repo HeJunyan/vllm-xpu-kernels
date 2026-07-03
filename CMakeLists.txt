@@ -457,6 +457,11 @@ set(VLLM_XPU_INCLUDE_DIR "")
 list(APPEND VLLM_XPU_INCLUDE_DIR ${CMPLR_ROOT}/include/)
 list(APPEND VLLM_XPU_INCLUDE_DIR ${CMPLR_ROOT}/include/sycl/)
 list(APPEND VLLM_XPU_INCLUDE_DIR ${CMPLR_ROOT}/include/syclcompat/)
+# The GDN conv1d interface header now pulls in gemm.hpp (cutlass/cute) for the
+# DPAS-based conv path, so the _xpu_C extension needs the CUTLASS includes too.
+if(BUILD_SYCL_TLA_KERNELS)
+  list(APPEND VLLM_XPU_INCLUDE_DIR ${SYCL_TLA_INCLUDE_DIRS})
+endif()
 message(STATUS "VLLM_XPU_INCLUDE_DIR: ${VLLM_XPU_INCLUDE_DIR}")
 
 set(VLLM_XPU_LINK_LIBRARIES "")
@@ -630,6 +635,13 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
   # TODO: check if we need this flags list(APPEND VLLM_GPU_FLAGS
   # "-gline-tables-only")
 
+  # The GDN conv1d interface header includes gemm.hpp (cutlass/cute), which
+  # requires the CUTLASS SYCL defines to select the SYCL (not CUDA) code paths.
+  set(VLLM_XPU_C_COMPILE_FLAGS ${VLLM_GPU_COMPILE_FLAGS})
+  if(BUILD_SYCL_TLA_KERNELS AND GDN_KERNELS_ENABLED)
+    list(APPEND VLLM_XPU_C_COMPILE_FLAGS ${VLLM_CUTLASS_FLAGS})
+  endif()
+
   if(ONEDNN_FOUND)
     set(_ONEDNN_SRC)
     file(GLOB _ONEDNN_SRC csrc/xpu/onednn/*.cpp)
@@ -649,7 +661,7 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
     SOURCES
     ${VLLM_EXT_XPU_SRC}
     COMPILE_FLAGS
-    ${VLLM_GPU_COMPILE_FLAGS}
+    ${VLLM_XPU_C_COMPILE_FLAGS}
     LINK_FLAGS
     ${VLLM_GPU_LINK_FLAGS}
     ARCHITECTURES

@@ -4,10 +4,28 @@
 #include <torch/all.h>
 
 #include "gdn_attn_utils.h"
+#include "gemm.hpp"
 
 namespace gdn {
 
 static constexpr int conv1d_tile_size = 8;
+
+// Map the SYCL storage element type to the cutlass element type expected by the
+// XE DPAS MMA atom used in gemm.hpp (gemm_TTS). The conv1d kernel stores data as
+// sycl::half / sycl::ext::oneapi::bfloat16, but the DPAS path needs the
+// bit-compatible cutlass numeric types.
+template <typename U>
+struct conv_cute_elem {
+  using type = U;
+};
+template <>
+struct conv_cute_elem<sycl::half> {
+  using type = cutlass::half_t;
+};
+template <>
+struct conv_cute_elem<sycl::ext::oneapi::bfloat16> {
+  using type = cutlass::bfloat16_t;
+};
 
 // SLM-tiled conv1d kernel for XE2 prefill path.
 //
@@ -59,6 +77,9 @@ struct chunk_causal_conv1d_tiled_kernel {
       const int& qkvz_elems,
       const int& conv_elems,
       const int& num_virtual_tokens,
+      T* gemm_A,
+      T* gemm_B,
+      float* gemm_res,
       char* slm_data,
       const bool fuse_l2norm)
       : q_out(q_out),
@@ -88,6 +109,9 @@ struct chunk_causal_conv1d_tiled_kernel {
         qkvz_elems(qkvz_elems),
         conv_elems(conv_elems),
         num_virtual_tokens(num_virtual_tokens),
+        gemm_A(gemm_A),
+        gemm_B(gemm_B),
+        gemm_res(gemm_res),
         slm_data(slm_data),
         fuse_l2norm(fuse_l2norm) {}
 
@@ -103,7 +127,7 @@ struct chunk_causal_conv1d_tiled_kernel {
     return (qkv_dim + feats_per_wg - 1) / feats_per_wg;
   }
 
-  static inline sycl::nd_range<2> get_nd_range(
+  static inline sycl::nd_range<3> get_nd_range(
       const int num_tiles,
       const int num_k_heads,
       const int head_k_dim,
@@ -111,9 +135,9 @@ struct chunk_causal_conv1d_tiled_kernel {
       const int head_v_dim) {
     int num_feat_chunks =
         get_num_feat_chunks(head_k_dim, num_v_heads, num_k_heads, head_v_dim);
-    sycl::range<2> local(1, wg_size);
-    sycl::range<2> global(num_tiles * num_feat_chunks, num_k_heads);
-    return sycl::nd_range<2>(global * local, local);
+    sycl::range<3> local(1, 1, wg_size);
+    sycl::range<3> global(num_tiles * num_feat_chunks, num_k_heads, wg_size);
+    return sycl::nd_range<3>(global, local);
   }
 
   static constexpr int meta_ints = 5;
@@ -122,6 +146,21 @@ struct chunk_causal_conv1d_tiled_kernel {
   static constexpr int slm_meta_bytes = meta_ints * sizeof(int);
   static constexpr int feats_per_wg = wg_size * elems_per_item;
   static constexpr int slm_data_elems = (TileT + Width - 1) * feats_per_wg;
+
+  // ---- Block-diagonal gemm_TTS formulation of the depthwise conv1d ----
+  // The per-workgroup feature slab (feats_per_wg=256) is split into GEMM_NT
+  // n-tiles of GEMM_N=64 output channels. For each n-tile the conv is written
+  // as a single 64x64 DPAS tile:  C[t,c] = sum_{c',w} A[t, c'*Width+w] *
+  // B[c, c'*Width+w], with A an im2col view of the staged input and B the
+  // block-diagonal depthwise weight matrix (B[c,c'*Width+w] = weight[c][w] iff
+  // c==c', else 0). This reduces to C[t,c] = sum_w input[t+w][c]*weight[c][w].
+  static constexpr int GEMM_M = 64;               // WG tile M (>= TileT)
+  static constexpr int GEMM_N = 64;               // channels per n-tile
+  static constexpr int GEMM_NT = feats_per_wg / GEMM_N;  // n-tiles per WG (=4)
+  static constexpr int GEMM_K = GEMM_N * Width;   // im2col contraction dim
+  static constexpr int gemm_A_elems_per_wg = GEMM_M * GEMM_K;
+  static constexpr int gemm_res_elems_per_wg = GEMM_NT * GEMM_M * GEMM_N;
+  static constexpr int gemm_B_elems_per_slab = GEMM_NT * GEMM_N * GEMM_K;
   static constexpr int num_subgroups_per_wg = wg_size / sub_group_size;
   // 2 floats per subgroup: one for Q partial sum, one for K partial sum
   static constexpr int norm_slm_bytes =
@@ -137,7 +176,7 @@ struct chunk_causal_conv1d_tiled_kernel {
   static inline void act_silu(float& x) { act_swish(x, 1.0f); }
 
   [[sycl::reqd_sub_group_size(sub_group_size)]] void
-  operator()(sycl::nd_item<2> item) const {
+  operator()(sycl::nd_item<3> item) const {
     const int k_head_id = item.get_group(1);
     const int local_id = item.get_local_linear_id();
 
@@ -334,6 +373,111 @@ struct chunk_causal_conv1d_tiled_kernel {
     sycl::group_barrier(item.get_group());
 
     // ========================================================================
+    // Phase 1b: Depthwise conv1d via block-diagonal gemm_TTS (DPAS)
+    // ========================================================================
+    // gemm_TTS is a work-group-collaborative DPAS matmul that reads its
+    // operands from global memory, so this runs before the per-item
+    // feat_valid early-return below (all 64 items must reach the WG barriers
+    // and the MMA). Results are written to the gemm_res scratch and consumed
+    // by the epilogue. The float instantiation keeps the scalar MAC path.
+    if constexpr (!std::is_same_v<T, float>) {
+      using namespace cute;
+      using ElemCV = typename conv_cute_elem<T>::type;
+      using WGTile = Shape<_64, _64, _32>;
+      using SGLayout = Layout<Shape<_2, _2, _1>, Stride<_2, _1, _0>>;
+      auto mma_op = XE_DPAS_TT<8, float, ElemCV>{};
+      using MMA = typename TiledMMAHelper<
+          MMA_Atom<decltype(mma_op)>,
+          Layout<WGTile>,
+          SGLayout>::TiledMMA;
+      MMA mma{};
+      auto wg_tile = mma.tile_mnk();
+      auto thr_mma = mma.get_slice(local_id);
+
+      const int wg_id = combined_id * num_k_heads + k_head_id;
+      const int a_off = wg_id * gemm_A_elems_per_wg;
+      const int res_off = wg_id * gemm_res_elems_per_wg;
+      const int b_off =
+          (feat_chunk_id * num_k_heads + k_head_id) * gemm_B_elems_per_slab;
+
+      // Build the block-diagonal weight matrix B for this feature slab: each
+      // valid item writes the Width weights of each of its elems_per_item
+      // output channels onto the diagonal. Tiles sharing (feat_chunk,k_head)
+      // write identical values (benign races); off-diagonal entries stay zero
+      // (the buffer is zero-initialized by the host).
+      if (feat_valid) {
+        const int nt = local_feat / GEMM_N;
+        const int row = local_feat - nt * GEMM_N;
+        T* b_slab = gemm_B + b_off + nt * (GEMM_N * GEMM_K);
+#pragma unroll
+        for (int e = 0; e < elems_per_item; ++e) {
+          const int row_e = row + e;
+#pragma unroll
+          for (int w = 0; w < Width; ++w) {
+            b_slab[row_e * GEMM_K + row_e * Width + w] =
+                conv_weights[(reordered_feat + e) * Width + w];
+          }
+        }
+      }
+      sycl::group_barrier(item.get_group());
+
+      // One 64x64 DPAS tile per n-tile of GEMM_N output channels.
+      for (int nt = 0; nt < GEMM_NT; ++nt) {
+        // im2col: A[t, c*Width+w] = staged_input[(t+w), nt*GEMM_N + c].
+        // Item local_id fills row local_id; rows >= TileT are padding rows,
+        // zeroed so the MMA never dereferences out-of-range SLM slots.
+        T* a_wg = gemm_A + a_off;
+        if (local_id < TileT) {
+          for (int c = 0; c < GEMM_N; ++c) {
+#pragma unroll
+            for (int w = 0; w < Width; ++w) {
+              a_wg[local_id * GEMM_K + c * Width + w] =
+                  slm_input[(local_id + w) * feats_per_wg + nt * GEMM_N + c];
+            }
+          }
+        } else {
+          for (int k = 0; k < GEMM_K; ++k) {
+            a_wg[local_id * GEMM_K + k] = static_cast<T>(0);
+          }
+        }
+        sycl::group_barrier(item.get_group());
+
+        auto A_tensor = make_tensor(
+            make_gmem_ptr(reinterpret_cast<ElemCV*>(a_wg)),
+            make_layout(
+                make_shape(GEMM_M, GEMM_K), make_stride(GEMM_K, _1{})));
+        auto B_tensor = make_tensor(
+            make_gmem_ptr(reinterpret_cast<ElemCV*>(
+                gemm_B + b_off + nt * (GEMM_N * GEMM_K))),
+            make_layout(
+                make_shape(GEMM_N, GEMM_K), make_stride(GEMM_K, _1{})));
+
+        float* res_ptr = gemm_res + res_off + nt * (GEMM_M * GEMM_N);
+        auto D_tensor = make_tensor(
+            make_gmem_ptr(res_ptr),
+            make_layout(
+                make_shape(GEMM_M, GEMM_N), make_stride(GEMM_N, _1{})));
+
+        Tensor cD = make_identity_tensor(D_tensor.shape());
+        Tensor gD =
+            local_tile(cD, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
+
+        auto copy_D = get_block_2d_copy_D<void>(mma, D_tensor);
+        auto thr_copy_D = copy_D.get_slice(local_id);
+        auto tCrD_s = thr_copy_D.partition_sg_fragment_S(gD);
+        auto tCgD = thr_copy_D.partition_D(gD);
+        auto tCrC = thr_mma.partition_sg_fragment_C(gD);
+
+        clear(tCrC);
+        gemm_TTS(A_tensor, B_tensor, tCrC, 0, 0, mma);
+        reorder(tCrC, tCrD_s);
+        copy(copy_D, tCrD_s, tCgD);
+
+        sycl::group_barrier(item.get_group());
+      }
+    }
+
+    // ========================================================================
     // Phase 2: Each item computes conv1d for its own feature lanes
     // ========================================================================
     if (!feat_valid) return;
@@ -341,14 +485,18 @@ struct chunk_causal_conv1d_tiled_kernel {
     bool is_q = (feat < q_dim);
     bool is_k = (!is_q && feat < q_dim + k_dim);
 
-    // Load weights from global (only Width * elems_per_item = 16 values)
+    // Load weights from global (only Width * elems_per_item = 16 values).
+    // Only the scalar (float) MAC path consumes these; the DPAS path reads its
+    // results from gemm_res.
     T local_weights[Width * elems_per_item];
+    if constexpr (std::is_same_v<T, float>) {
 #pragma unroll
-    for (int w = 0; w < Width; ++w) {
+      for (int w = 0; w < Width; ++w) {
 #pragma unroll
-      for (int e = 0; e < elems_per_item; ++e) {
-        local_weights[w * elems_per_item + e] =
-            conv_weights[(reordered_feat + e) * Width + w];
+        for (int e = 0; e < elems_per_item; ++e) {
+          local_weights[w * elems_per_item + e] =
+              conv_weights[(reordered_feat + e) * Width + w];
+        }
       }
     }
 
@@ -360,7 +508,9 @@ struct chunk_causal_conv1d_tiled_kernel {
       }
     }
 
-    // Conv1d: for each output token t, read SLM slots [t, t+Width)
+    // Conv1d: for each output token t, gather the pre-activation result. The
+    // DPAS path reads C[t,c] from gemm_res (computed by gemm_TTS above); the
+    // scalar float path performs the depthwise MAC directly from SLM.
     for (int t = 0; t < tile_tokens; ++t) {
       float res[elems_per_item];
 #pragma unroll
@@ -368,14 +518,27 @@ struct chunk_causal_conv1d_tiled_kernel {
         res[e] = 0.0f;
       }
 
+      if constexpr (std::is_same_v<T, float>) {
 #pragma unroll
-      for (int w = 0; w < Width; ++w) {
-        int slot = t + w;
+        for (int w = 0; w < Width; ++w) {
+          int slot = t + w;
+#pragma unroll
+          for (int e = 0; e < elems_per_item; ++e) {
+            res[e] +=
+                static_cast<float>(
+                    slm_input[slot * feats_per_wg + local_feat + e]) *
+                static_cast<float>(local_weights[w * elems_per_item + e]);
+          }
+        }
+      } else {
+        const int nt = local_feat / GEMM_N;
+        const int row = local_feat - nt * GEMM_N;
+        const int wg_id = combined_id * num_k_heads + k_head_id;
+        const int res_base =
+            wg_id * gemm_res_elems_per_wg + nt * (GEMM_M * GEMM_N) + t * GEMM_N;
 #pragma unroll
         for (int e = 0; e < elems_per_item; ++e) {
-          res[e] += static_cast<float>(
-                        slm_input[slot * feats_per_wg + local_feat + e]) *
-                    static_cast<float>(local_weights[w * elems_per_item + e]);
+          res[e] = gemm_res[res_base + row + e];
         }
       }
 
@@ -623,6 +786,9 @@ struct chunk_causal_conv1d_tiled_kernel {
   const int qkvz_elems;
   const int conv_elems;
   const int num_virtual_tokens;
+  T* gemm_A;
+  T* gemm_B;
+  float* gemm_res;
   char* slm_data;
   const bool fuse_l2norm;
 };
@@ -672,9 +838,33 @@ void tiled_kernel_launcher(
 
   int slm_bytes = KERNEL_MAIN::get_slm_bytes();
 
+  // Global scratch for the block-diagonal gemm_TTS conv path (non-float only).
+  // gemm_A / gemm_res are per-workgroup; gemm_B is shared per (feat_chunk,
+  // k_head) feature slab and must be zero-initialized (off-diagonal entries).
+  T* gemm_A = nullptr;
+  T* gemm_B = nullptr;
+  float* gemm_res = nullptr;
+  sycl::event memset_ev;
+  bool use_gemm = !std::is_same_v<T, float>;
+  if (use_gemm) {
+    int num_feat_chunks = KERNEL_MAIN::get_num_feat_chunks(
+        head_k_dim, num_v_heads, num_k_heads, head_v_dim);
+    size_t num_wgs =
+        static_cast<size_t>(num_tiles) * num_feat_chunks * num_k_heads;
+    size_t a_elems = num_wgs * KERNEL_MAIN::gemm_A_elems_per_wg;
+    size_t res_elems = num_wgs * KERNEL_MAIN::gemm_res_elems_per_wg;
+    size_t b_elems = static_cast<size_t>(num_feat_chunks) * num_k_heads *
+        KERNEL_MAIN::gemm_B_elems_per_slab;
+    gemm_A = sycl::malloc_device<T>(a_elems, queue);
+    gemm_B = sycl::malloc_device<T>(b_elems, queue);
+    gemm_res = sycl::malloc_device<float>(res_elems, queue);
+    memset_ev = queue.memset(gemm_B, 0, b_elems * sizeof(T));
+  }
+
   queue.submit([&](sycl::handler& cgh) {
+    if (use_gemm) cgh.depends_on(memset_ev);
     auto slm = sycl::local_accessor<char, 1>(sycl::range<1>(slm_bytes), cgh);
-    cgh.parallel_for(range_main, [=](sycl::nd_item<2> item) {
+    cgh.parallel_for(range_main, [=](sycl::nd_item<3> item) {
       char* slm_ptr =
           slm.template get_multi_ptr<sycl::access::decorated::no>().get_raw();
 
@@ -706,11 +896,22 @@ void tiled_kernel_launcher(
           qkvz_elems,
           conv_elems,
           num_virtual_tokens,
+          gemm_A,
+          gemm_B,
+          gemm_res,
           slm_ptr,
           fuse_l2norm);
       task(item);
     });
   });
+
+  // Scratch must outlive the main kernel; wait before freeing.
+  if (use_gemm) {
+    queue.wait();
+    sycl::free(gemm_A, queue);
+    sycl::free(gemm_B, queue);
+    sycl::free(gemm_res, queue);
+  }
 
   // Update conv states from tmp buffer
   if (num_prefills > 0) {
