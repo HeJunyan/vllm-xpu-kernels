@@ -359,6 +359,11 @@ def generate_po(dry_run: bool = False, keep_seq_lens: list[int] = None) -> str:
         tests = collect_tests(scope)
         print(f"  Collected {len(tests)} tests", file=sys.stderr)
 
+        # qwen3_235b_a22b: only include mxfp4 kernels
+        if "qwen3_235b_a22b" in scope:
+            tests = [t for t in tests if "mxfp4" in t]
+            print(f"  After mxfp4 filter: {len(tests)} tests", file=sys.stderr)
+
         # Dedup: keep only specific seq_lens and num_heads0
         tests = dedup_po_tests(tests, keep_seq_lens)
         print(f"  After dedup: {len(tests)} tests", file=sys.stderr)
