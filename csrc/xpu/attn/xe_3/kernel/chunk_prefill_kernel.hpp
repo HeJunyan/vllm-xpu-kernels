@@ -273,7 +273,7 @@ class XeFMHAFwdKernel {
           cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
 
       // calc sg level seq_len_kv
-      const int seq_len =
+      const int sg_seq_len =
           LocalMask ? cute::min(
                           seq_len_kv,
                           full_tile_offset + seq_coord + q_sg_tile +
@@ -281,22 +281,22 @@ class XeFMHAFwdKernel {
           : CausalMask
               ? cute::min(seq_len_kv, full_tile_offset + seq_coord + q_sg_tile)
               : seq_len_kv;
-      const int k_block0 =
+      const int sg_k_block0 =
           LocalMask
               ? cute::max(
                     seq_coord + full_tile_offset - params.mainloop.local_left,
                     0) /
                     get<1>(TileShapeQK{})
               : 0;
-      const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
-      const int k_blocks_causal =
+      const int sg_k_blocks = cute::ceil_div(sg_seq_len, get<1>(TileShapeQK{}));
+      const int sg_k_blocks_causal =
           CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{})
                      : 0;
       // Local mask "safe" block bounds: K blocks in [l_safe, r_safe] lie fully
       // within the local window, so the per-element local masking can be
       // skipped for them. Only tiles with K < l_safe (need left mask) or
       // K > r_safe (need right mask) require the masking pass.
-      const int k_block_local_l_safe =
+      const int sg_k_block_local_l_safe =
           LocalMask ? cute::ceil_div(
                           cute::max(
                               seq_coord + q_sg_tile - 1 + full_tile_offset -
@@ -304,12 +304,51 @@ class XeFMHAFwdKernel {
                               0),
                           get<1>(TileShapeQK{}))
                     : 0;
-      const int k_block_local_r_safe =
+      const int sg_k_block_local_r_safe =
           LocalMask
               ? (seq_coord + full_tile_offset + params.mainloop.local_right +
                  1) / get<1>(TileShapeQK{}) -
                     1
               : 0;
+
+      // The mainloop wraps each K iteration in a workgroup-scoped barrier
+      // pair, so every subgroup in the workgroup must execute the same
+      // K-loop trip count. Reduce the per-SG bounds across the WG:
+      //   k_block0        = min across WG (start no later than any SG)
+      //   k_blocks        = max across WG (end no earlier than any SG)
+      //   seq_len         = max across WG (common LocalMask upper bound)
+      //   k_blocks_causal = min across WG (turn on causal masking no later
+      //                                    than any SG needs it)
+      //   k_block_local_l_safe = max across WG (left mask off no earlier
+      //                                         than any SG needs it on)
+      //   k_block_local_r_safe = min across WG (right mask on no earlier
+      //                                         than any SG needs it on)
+      // Per-element causal / local / remainder masking inside the mainloop
+      // handles the widened range safely for SGs that didn't need it.
+      auto wg = sycl::ext::oneapi::this_work_item::get_work_group<3>();
+      const int k_block0 =
+          LocalMask
+              ? sycl::reduce_over_group(wg, sg_k_block0, sycl::minimum<int>{})
+              : 0;
+      const int k_blocks =
+          (CausalMask || LocalMask)
+              ? sycl::reduce_over_group(wg, sg_k_blocks, sycl::maximum<int>{})
+              : sg_k_blocks;
+      const int seq_len = LocalMask ? sycl::reduce_over_group(
+                                          wg, sg_seq_len, sycl::maximum<int>{})
+                                    : sg_seq_len;
+      const int k_blocks_causal =
+          CausalMask ? sycl::reduce_over_group(
+                           wg, sg_k_blocks_causal, sycl::minimum<int>{})
+                     : 0;
+      const int k_block_local_l_safe =
+          LocalMask ? sycl::reduce_over_group(
+                          wg, sg_k_block_local_l_safe, sycl::maximum<int>{})
+                    : 0;
+      const int k_block_local_r_safe =
+          LocalMask ? sycl::reduce_over_group(
+                          wg, sg_k_block_local_r_safe, sycl::minimum<int>{})
+                    : 0;
 
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
       if constexpr (is_var_len) {

@@ -300,7 +300,6 @@ def flash_attn_varlen_func(
     paged KV cache support.
 
     Args:
-    Args:
         q, k, v: Query, key, value tensors.
         max_seqlen_q: Maximum query sequence length in the batch.
         cu_seqlens_q: Cumulative sequence lengths for queries.

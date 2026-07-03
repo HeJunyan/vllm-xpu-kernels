@@ -358,7 +358,8 @@ def test_varlen_with_paged_kv(
                                         causal=is_casual,
                                         block_table=block_tables_xpu,
                                         window_size=window_size,
-                                        s_aux=sink_xpu)
+                                        s_aux=sink_xpu,
+                                        is_mix_batch=False)
     else:
         output = flash_attn_varlen_func(q_xpu,
                                         k_xpu,
@@ -377,7 +378,8 @@ def test_varlen_with_paged_kv(
                                         causal=is_casual,
                                         block_table=None,
                                         window_size=window_size,
-                                        s_aux=sink_xpu)
+                                        s_aux=sink_xpu,
+                                        is_mix_batch=False)
     output = output.cpu()
 
     ref_output = ref_paged_attn(
@@ -497,7 +499,8 @@ def test_varlen_with_interleaved_paged_kv(
                                     causal=is_casual,
                                     block_table=block_tables,
                                     window_size=window_size,
-                                    s_aux=sink)
+                                    s_aux=sink,
+                                    is_mix_batch=False)
 
     key_cache_ref = key_cache.contiguous()
     value_cache_ref = value_cache.contiguous()
