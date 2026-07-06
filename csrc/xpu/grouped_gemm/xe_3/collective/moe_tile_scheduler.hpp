@@ -225,6 +225,33 @@ class PersistentTileSchedulerMoE {
     K_ = K;
     num_experts_ = num_experts;
     rows_per_expert_ = rows_per_expert;
+
+    // Direction 2: precompute the total number of valid work tiles across all
+    // groups so that the end-of-work detection in
+    // get_current_work_for_linear_idx() can take the cheap
+    // `linear_idx >= blocks_across_problem_` early-out instead of running the
+    // swizzle/divmod scan in get_work_idx_m_and_n(). The tile layout is linear
+    // across groups, so the first invalid linear index is exactly the sum over
+    // groups of round_up(ceil(M_g/cta_m)) * round_up(ceil(N/cta_n)), matching
+    // the per-group total_tiles computed in get_work_idx_m_and_n().
+    uint64_t total_work_tiles = 0;
+    auto const& sp = scheduler_params;
+    uint64_t ctas_along_n =
+        sp.divmod_cta_shape_n_.divide(N_ + sp.divmod_cta_shape_n_.divisor - 1);
+    uint64_t problem_blocks_n = round_up(
+        ctas_along_n,
+        (uint64_t(1) << sp.log_swizzle_size_) * sp.cluster_shape_.n());
+    for (int g = 0; g < int(num_experts_); ++g) {
+      int64_t M_g = rows_per_expert_[g];
+      uint64_t ctas_along_m =
+          sp.divmod_cta_shape_m_.divide(M_g + sp.divmod_cta_shape_m_.divisor - 1);
+      uint64_t problem_blocks_m = round_up(
+          ctas_along_m,
+          (uint64_t(1) << sp.log_swizzle_size_) * sp.cluster_shape_.m());
+      total_work_tiles += problem_blocks_m * problem_blocks_n;
+    }
+    scheduler_params.blocks_across_problem_ = total_work_tiles;
+    scheduler_params.pre_processed_problem_shapes = true;
 #else
     CUTLASS_ASSERT(false && "This line should never be reached");
 #endif

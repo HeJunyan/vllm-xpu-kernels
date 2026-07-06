@@ -225,7 +225,7 @@ struct CollectiveMma<
     // per-expert M dimension of scale-A up to 4; here we use the padded M
     // (and the padded cumulative offset) for the scale-A stride and ptr.
     int32_t scale_M = (M + 3) & ~int32_t(3);
-    if (cute::is_same_v<ElementA, cutlass::float_e4m3_t>) {
+    if constexpr (cute::is_same_v<ElementA, cutlass::float_e4m3_t>) {
       ElementA const* ptr_A_curr_batch =
           static_cast<ElementA const*>(mainloop_params.ptr_A) +
           expert_first_token_offset * K;
@@ -259,7 +259,7 @@ struct CollectiveMma<
           dSA,
           ptr_SFB_curr_batch,
           dSB};
-    } else if (cute::is_same_v<ElementA, cutlass::float_e2m1_t>) {
+    } else if constexpr (cute::is_same_v<ElementA, cutlass::float_e2m1_t>) {
       ElementA const* ptr_A_curr_batch =
           static_cast<ElementA const*>(mainloop_params.ptr_A) +
           expert_first_token_offset * K / 2;
@@ -478,7 +478,7 @@ struct CollectiveMma<
     // per-expert M dimension of scale-A up to 4; here we use the padded M
     // (and the padded cumulative offset) for the scale-A stride and ptr.
     int32_t scale_M = (M + 3) & ~int32_t(3);
-    if (cute::is_same_v<ElementA, cutlass::float_e4m3_t>) {
+    if constexpr (cute::is_same_v<ElementA, cutlass::float_e4m3_t>) {
       ElementA const* ptr_A_curr_batch =
           static_cast<ElementA const*>(mainloop_params.ptr_A) +
           expert_first_token_offset * K;
@@ -512,7 +512,7 @@ struct CollectiveMma<
           dSA,
           ptr_SFB_curr_batch,
           dSB};
-    } else if (cute::is_same_v<ElementA, cutlass::float_e2m1_t>) {
+    } else if constexpr (cute::is_same_v<ElementA, cutlass::float_e2m1_t>) {
       ElementA const* ptr_A_curr_batch =
           static_cast<ElementA const*>(mainloop_params.ptr_A) +
           expert_first_token_offset * K / 2;

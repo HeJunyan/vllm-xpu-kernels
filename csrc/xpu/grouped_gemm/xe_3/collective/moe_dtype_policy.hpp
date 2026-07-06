@@ -269,31 +269,39 @@ class moe_fp16_mid_policy : public moe_fp16_policy {
 // (8,64,32) tile so the N dimension is carved into many narrow tiles, maximizing
 // the number of concurrent workgroups to saturate DRAM. Widening BLK_N (e.g. 256)
 // or BLK_M starves occupancy and regresses bandwidth; shrinking both is the win.
+// Decode, short contraction (e.g. down_proj K=768): widen BLK_N 64 -> 128 so the
+// E=2 launch collapses to a single 32-core wave (N*E/128 <= 32 tiles), and lift
+// the prefetch pipeline 2 -> 4 stages to hide weight-DRAM latency. BLK_K stays 32
+// because k64 regresses at short K (see k64 policy below).
 class moe_bf16_decode_policy : public moe_bf16_policy {
  public:
-  using TileShape = Shape<_8, _64, _32>;
+  using TileShape = Shape<_8, _128, _32>;
   using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
       Layout<TileShape>,
       SGLayout>::TiledMMA;
+  static constexpr int PipelineStages = 4;
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopMoE16Group<PipelineStages>;
   CALL_GENERATE_GEMM();
 };
 
-// Decode with a long contraction (e.g. gate_up_proj K=2048): keep the narrow
-// (8,64) tile for occupancy, but widen BLK_K 32 -> 64 to halve the K-loop trip
-// count, giving larger contiguous weight loads and better DRAM efficiency. The
-// register footprint stays tiny. Only profitable when K is large enough to fill
-// the pipeline; short-K decode (down_proj K=768) regresses, so dispatch selects
-// this only for K >= 1024.
+// Decode with a long contraction (e.g. gate_up_proj K=2048): widen BLK_N 64 ->
+// 128 (single 32-core wave for E=2) and BLK_K 32 -> 64 so the B 2D-block loads
+// become larger contiguous DRAM bursts and the K-loop trip count halves, plus a
+// 4-stage prefetch pipeline to hide the long-K latency. Register footprint stays
+// tiny. Only profitable when K is large enough to fill the pipeline; short-K
+// decode (down_proj K=768) regresses, so dispatch selects this only for K >= 1024.
 class moe_bf16_decode_k64_policy : public moe_bf16_policy {
  public:
-  using TileShape = Shape<_8, _64, _64>;
+  using TileShape = Shape<_8, _128, _64>;
   using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
       Layout<TileShape>,
       SGLayout>::TiledMMA;
+  static constexpr int PipelineStages = 4;
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopMoE16Group<PipelineStages>;
   CALL_GENERATE_GEMM();
 };
 
@@ -399,20 +407,23 @@ class moe_mxfp8_mid_policy : public moe_mxfp8_policy {
 };
 
 // Decode regime (avg M per expert <= 4): the mid tile's BLK_M=128 makes the
-// systolic array grind 128 masked rows for a single real token. Shrink to a
-// narrow (8,64,32) tile so the few real rows stop wasting DPAS passes and the
-// N dimension splits into many tiles for high workgroup occupancy on this
-// memory-bound shape. The decode K-loop is short, so a shallower 2-stage
-// pipeline (vs 4) trims fill/drain overhead that otherwise dominates the floor.
+// systolic array grind 128 masked rows for a single real token, so keep BLK_M=8
+// (the DPAS atom minimum) to stop wasting passes on the few real rows. The
+// production decode shapes are *not* tiny -- gate_up is N=1536,K=2048 and
+// down_proj is N=2048,K=768 -- i.e. a long, weight-DRAM-bound GEMV. Tuning for
+// those: BLK_N=128 keeps E=2 to a single 32-core wave (N*E/128 <= 32 tiles) and
+// BLK_K=64 makes the B 2D-block loads 8 KB contiguous bursts instead of 2 KB,
+// which together lifted gate_up from ~429 to ~524 GB/s. A 4-stage prefetch
+// pipeline (vs 2) hides the 64-k-tile DRAM latency; deeper gives no further win.
 class moe_mxfp8_decode_policy : public moe_mxfp8_policy {
  public:
-  using TileShape = Shape<_8, _64, _32>;
+  using TileShape = Shape<_8, _128, _64>;
   using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
       Layout<TileShape>,
       SGLayout>::TiledMMA;
-  static constexpr int PipelineStages = 2;
+  static constexpr int PipelineStages = 4;
   using GEMMDispatchPolicy = cutlass::gemm::MainloopMXFPXGroup<PipelineStages>;
   CALL_GENERATE_GEMM();
 };
@@ -490,13 +501,13 @@ class moe_mxfp4_mid_policy : public moe_mxfp4_policy {
   CALL_GENERATE_GEMM();
 };
 
-// Decode regime (avg M per expert <= 4): shrink to the narrow (8,64,32) tile for
-// the same occupancy reason as mxfp8 -- many small N-tiles to saturate DRAM on a
-// memory-bound, single-token decode. The default 4-stage pipeline is kept
-// (Stages=2 regressed FP4 here).
+// Decode regime (avg M per expert <= 4): same memory-bound single-token GEMV as
+// mxfp8. Widen BLK_N 64 -> 128 so E=2 collapses to a single 32-core wave and
+// BLK_K 32 -> 64 for larger contiguous weight bursts; the inherited 4-stage
+// pipeline hides DRAM latency (Stages=2 regressed FP4 here).
 class moe_mxfp4_decode_policy : public moe_mxfp4_policy {
  public:
-  using TileShape = Shape<_8, _64, _32>;
+  using TileShape = Shape<_8, _128, _64>;
   using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
