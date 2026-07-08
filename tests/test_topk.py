@@ -70,12 +70,13 @@ def test_fused_topk_softmax(n_token: int, n_hidden: int, n_expert: int,
 @pytest.mark.parametrize("topk", [2, 4, 8])
 @pytest.mark.parametrize("renormalize", [True, False])
 @pytest.mark.parametrize("has_bias", [True, False])
+@pytest.mark.parametrize("routed_scaling_factor", [1.0, 2.5])
 @pytest.mark.parametrize("dtype",
                          [torch.float16, torch.bfloat16, torch.float32],
                          ids=format_tc)
 def test_fused_topk_sigmoid(n_token: int, n_hidden: int, n_expert: int,
                             topk: int, renormalize: bool, has_bias: bool,
-                            dtype: torch.dtype):
+                            routed_scaling_factor: float, dtype: torch.dtype):
     seed_everything(0)
     hidden_states = torch.randn((n_token, n_hidden), dtype=dtype, device=DEVICE)
     gating_output = torch.randn((n_token, n_expert), dtype=dtype, device=DEVICE)
@@ -88,14 +89,16 @@ def test_fused_topk_sigmoid(n_token: int, n_hidden: int, n_expert: int,
         gating_output=gating_output,
         topk=topk,
         renormalize=renormalize,
-        bias=bias)
+        bias=bias,
+        routed_scaling_factor=routed_scaling_factor)
 
     test_topk_weights, test_topk_ids = fused_topk_sigmoid(
         hidden_states=hidden_states.to(KERNEL_DEVICE),
         gating_output=gating_output.to(KERNEL_DEVICE),
         topk=topk,
         renormalize=renormalize,
-        bias=bias.to(KERNEL_DEVICE) if bias is not None else None)
+        bias=bias.to(KERNEL_DEVICE) if bias is not None else None,
+        routed_scaling_factor=routed_scaling_factor)
 
     test_topk_weights = test_topk_weights.to(DEVICE)
     test_topk_ids = test_topk_ids.to(DEVICE)
