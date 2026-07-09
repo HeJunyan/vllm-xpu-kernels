@@ -327,7 +327,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   endif()
   if(AOT_DEVICES)
     list(APPEND SYCL_DEVICE_LINK_FLAGS -fsycl-targets=spir64_gen
-        -Xsycl-target-backend=spir64_gen)
+         -Xsycl-target-backend=spir64_gen)
   endif()
 
   # Final link option be like: icpx -fsycl -fsycl-target=spir64_gen
@@ -355,7 +355,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
   # when building.
-  set(CUTLASS_REVISION_CRI "1f3f35279")
+  set(CUTLASS_REVISION_CRI "0523a8089254ee0d354af5f2e7bd7ac801ec1214")
   set(CUTLASS_REVISION_DEFAULT "cd763790ad2f74d7294435ecf77682bac0062c3a")
   if(VLLM_XPU_ENABLE_XE3)
     # Bumped to the latest v0.1.0_next HEAD (libraries.ai.cutlass.internal).
@@ -452,7 +452,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   list(APPEND VLLM_CUTLASS_FLAGS "-ftemplate-backtrace-limit=0")
   list(APPEND VLLM_CUTLASS_FLAGS "-fdiagnostics-color=always")
   # CRI specific
-  if (BUILD_ON_SIMULATOR_CRI)
+  if(BUILD_ON_SIMULATOR_CRI)
     list(APPEND VLLM_CUTLASS_FLAGS "-DCOMPAT_PROFILING_ENABLED")
     list(APPEND VLLM_CUTLASS_FLAGS "-DCUTLASS_SYCL_PROFILING_ENABLED")
     list(APPEND VLLM_CUTLASS_FLAGS "-DCUTLASS_TEST_FOR_CRI")

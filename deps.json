@@ -2,7 +2,7 @@
   "cutlass": {
     "repo": "https://github.com/intel-innersource/libraries.ai.cutlass.internal",
     "revisions": {
-      "cri": "1f3f35279137709c4ed880c6355891e0c772cf46",
+      "cri": "0523a8089254ee0d354af5f2e7bd7ac801ec1214",
       "default": "cd763790ad2f74d7294435ecf77682bac0062c3a"
     }
   },
