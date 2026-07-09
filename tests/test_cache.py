@@ -47,7 +47,7 @@ DEVICES = [
     f"xpu:{i}" for i in range(1 if torch.xpu.device_count() == 1 else 2)
 ]
 
-KV_CACHE_DTYPE = ["auto"]  # FIXME: will add "fp8" when accuracy is improved
+KV_CACHE_DTYPE = ["auto", "fp8"]  # FIXME: will add "fp8" when accuracy is improved
 
 # For now, disable "test_aot_dispatch_dynamic" since there are some
 # bugs related to this test in PyTorch 2.4.

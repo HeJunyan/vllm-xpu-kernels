@@ -62,7 +62,7 @@ class silu_and_mul_per_block_quant_kernel {
       group_scale =
           std::max(group_max / 127.0f, std::numeric_limits<float>::epsilon());
     } else {
-      const float fp8_max = static_cast<float>(fp8::quant_type_max_v<out_t>);
+      constexpr float fp8_max = fp8::fp8_max_f<out_t>::value;
       group_scale =
           sycl::max(group_max / fp8_max, fp8::min_scaling_factor<out_t>::val());
       if (scale_ub != nullptr) {

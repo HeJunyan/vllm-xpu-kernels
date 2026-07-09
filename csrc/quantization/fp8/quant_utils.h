@@ -5,6 +5,8 @@
 #include <c10/util/Float8_e4m3fn.h>
 #include <c10/util/Float8_e5m2.h>
 
+#include "quantization/utils.h"
+
 namespace vllm {
 
 enum class Fp8KVCacheDataType {
@@ -15,18 +17,51 @@ enum class Fp8KVCacheDataType {
 
 namespace fp8 {
 
-
-template <
-    typename T,
-    typename = std::enable_if_t<
-        std::is_same_v<T, at::Float8_e5m2> ||
-        std::is_same_v<T, at::Float8_e4m3fn>>>
-struct quant_type_max {
-  static constexpr T val() { return std::numeric_limits<T>::max(); }
+template <typename Tout>
+struct fp8_max_f;
+template <>
+struct fp8_max_f<at::Float8_e4m3fn> {
+  static constexpr float value = 448.0f;
+};
+template <>
+struct fp8_max_f<at::Float8_e5m2> {
+  static constexpr float value = 57344.0f;
 };
 
-template <typename T>
-static constexpr T quant_type_max_v = quant_type_max<T>::val();
+template <typename scalar_t>
+inline float thread_max_vec(
+    scalar_t const* input,
+    int64_t const num_elems,
+    int const tid,
+    int const step) {
+  // Vectorized input/output to better utilize memory bandwidth.
+  using vec4_t = ::vec4_t<scalar_t>;
+  vec4_t const* vectorized_in = reinterpret_cast<vec4_t const*>(input);
+
+  int64_t const num_vec_elems = num_elems >> 2;
+  float absmax_val = 0.0f;
+
+#pragma unroll 4
+  for (int64_t i = tid; i < num_vec_elems; i += step) {
+    vec4_t in_vec = vectorized_in[i];
+    absmax_val =
+        sycl::max(absmax_val, sycl::fabs(static_cast<float>(in_vec.val[0])));
+    absmax_val =
+        sycl::max(absmax_val, sycl::fabs(static_cast<float>(in_vec.val[1])));
+    absmax_val =
+        sycl::max(absmax_val, sycl::fabs(static_cast<float>(in_vec.val[2])));
+    absmax_val =
+        sycl::max(absmax_val, sycl::fabs(static_cast<float>(in_vec.val[3])));
+  }
+
+  // Handle the remaining elements if num_elems is not divisible by 4
+  for (int64_t i = num_vec_elems * 4 + tid; i < num_elems; i += step) {
+    absmax_val =
+        sycl::max(absmax_val, sycl::fabs(static_cast<float>(input[i])));
+  }
+
+  return absmax_val;
+}
 
 template <
     typename T,
@@ -34,26 +69,7 @@ template <
         std::is_same_v<T, at::Float8_e5m2> ||
         std::is_same_v<T, at::Float8_e4m3fn>>>
 struct min_scaling_factor {
-  static inline float val() { return 1.0f / (quant_type_max_v<T> * 512.0f); }
-};
-
-// Used by vectorization_utils to copy/convert one element
-template <typename OutT, typename InT, Fp8KVCacheDataType kv_dt>
-struct CopyWithScaleOp {
-  float scale;
-
-  inline void operator()(OutT& dst, const InT src) const {
-    if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-      dst = static_cast<OutT>(src);
-    } else {
-      float x = (float)src / scale;
-      if constexpr (kv_dt == Fp8KVCacheDataType::kFp8E4M3) {
-        dst = static_cast<at::Float8_e4m3fn>(x);
-      } else if constexpr (kv_dt == Fp8KVCacheDataType::kFp8E5M2) {
-        dst = static_cast<at::Float8_e5m2>(x);
-      }
-    }
-  }
+  static inline float val() { return 1.0f / (fp8_max_f<T>::value * 512.0f); }
 };
 
 // convert a float value to fp8 type with scaling
@@ -63,7 +79,7 @@ struct ConvertWithScaleOp {
 
   inline void operator()(fp8_type& dst, float const src) const {
     float x = is_scale_inverted ? (src * scale) : (src / scale);
-    const float fp8_max = static_cast<float>(quant_type_max_v<fp8_type>);
+    constexpr float fp8_max = fp8_max_f<fp8_type>::value;
     float r = sycl::fmax(-fp8_max, sycl::fmin(x, fp8_max));
     dst = static_cast<fp8_type>(r);
   }
@@ -81,32 +97,36 @@ struct ConvertWithScaleOp {
     if (SRC_DTYPE == at::ScalarType::Float) {                                  \
       FN(float, float, vllm::Fp8KVCacheDataType::kAuto);                       \
     } else if (SRC_DTYPE == at::ScalarType::Half) {                            \
-      FN(at::Half, at::Half, vllm::Fp8KVCacheDataType::kAuto);                 \
+      FN(sycl::half, sycl::half, vllm::Fp8KVCacheDataType::kAuto);             \
     } else if (SRC_DTYPE == at::ScalarType::BFloat16) {                        \
-      FN(at::BFloat16, at::BFloat16, vllm::Fp8KVCacheDataType::kAuto);         \
+      FN(sycl::ext::oneapi::bfloat16,                                          \
+         sycl::ext::oneapi::bfloat16,                                          \
+         vllm::Fp8KVCacheDataType::kAuto);                                     \
     } else {                                                                   \
       TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);   \
     }                                                                          \
   } else {                                                                     \
     if (KV_DTYPE == "fp8" || KV_DTYPE == "fp8_e4m3") {                         \
       if (SRC_DTYPE == at::ScalarType::Float) {                                \
-        FN(float, at::Float8_e4m3fn, vllm::Fp8KVCacheDataType::kFp8E4M3);      \
+        FN(float, uint8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);                \
       } else if (SRC_DTYPE == at::ScalarType::Half) {                          \
-        FN(at::Half, at::Float8_e4m3fn, vllm::Fp8KVCacheDataType::kFp8E4M3);   \
+        FN(sycl::half, uint8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);           \
       } else if (SRC_DTYPE == at::ScalarType::BFloat16) {                      \
-        FN(at::BFloat16,                                                       \
-           at::Float8_e4m3fn,                                                  \
+        FN(sycl::ext::oneapi::bfloat16,                                        \
+           uint8_t,                                                            \
            vllm::Fp8KVCacheDataType::kFp8E4M3);                                \
       } else {                                                                 \
         TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE); \
       }                                                                        \
     } else if (KV_DTYPE == "fp8_e5m2") {                                       \
       if (SRC_DTYPE == at::ScalarType::Float) {                                \
-        FN(float, at::Float8_e5m2, vllm::Fp8KVCacheDataType::kFp8E5M2);        \
+        FN(float, uint8_t, vllm::Fp8KVCacheDataType::kFp8E5M2);                \
       } else if (SRC_DTYPE == at::ScalarType::Half) {                          \
-        FN(at::Half, at::Float8_e5m2, vllm::Fp8KVCacheDataType::kFp8E5M2);     \
+        FN(sycl::half, uint8_t, vllm::Fp8KVCacheDataType::kFp8E5M2);           \
       } else if (SRC_DTYPE == at::ScalarType::BFloat16) {                      \
-        FN(at::BFloat16, at::Float8_e5m2, vllm::Fp8KVCacheDataType::kFp8E5M2); \
+        FN(sycl::ext::oneapi::bfloat16,                                        \
+           uint8_t,                                                            \
+           vllm::Fp8KVCacheDataType::kFp8E5M2);                                \
       } else {                                                                 \
         TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE); \
       }                                                                        \

@@ -206,7 +206,7 @@ class act_and_mul_quant_vec_kernel {
     const int64_t bound = d_ / VEC_SIZE;
 
     const float inv_scale = 1.0f / (*scale_);
-    const float fp8_max = static_cast<float>(fp8::quant_type_max_v<fp8_type>);
+    constexpr float fp8_max = fp8::fp8_max_f<fp8_type>::value;
 
     // x and y halves are laid out contiguously: [x0..xd-1, y0..yd-1]
     const auto* v_x =

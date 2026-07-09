@@ -26,7 +26,7 @@ static inline int8_t float_to_int8_rn(float const x) {
 // ---------------------------------------------------------------------------
 template <typename fp8_type>
 static inline fp8_type float_to_fp8(float const x) {
-  const float fp8_max = static_cast<float>(fp8::quant_type_max_v<fp8_type>);
+  constexpr float fp8_max = fp8::fp8_max_f<fp8_type>::value;
   return static_cast<fp8_type>(sycl::fmax(-fp8_max, sycl::fmin(x, fp8_max)));
 }
 

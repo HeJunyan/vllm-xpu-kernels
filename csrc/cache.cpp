@@ -5,6 +5,7 @@
 #include <string>
 
 #include "dispatch_utils.h"
+#include "quantization/fp8/fp8_quant_asm.h"
 #include "quantization/fp8/quant_utils.h"
 #include "quantization/utils.h"
 #include "utils.h"
@@ -164,8 +165,12 @@ class reshape_and_cache_flash_kernel {
         value_cache_ + block_idx * block_stride_ + block_offset * page_stride_;
 
     constexpr int VEC_SIZE = (sizeof(scalar_t) == 2) ? 8 : 4;
-    float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *k_scale_;
-    float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *v_scale_;
+    // CopyWithScaleOp multiplies, so it needs the inverted scale (1/scale).
+    // k_scale_/v_scale_ are dequant scales (vLLM convention), so invert here.
+    float k_scale_val =
+        (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : 1.0f / *k_scale_;
+    float v_scale_val =
+        (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : 1.0f / *v_scale_;
 
     fp8::CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
     fp8::CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
@@ -447,7 +452,7 @@ class indexer_k_quant_and_cache_kernel {
     const int64_t dst_offset = block_idx * cache_block_size_ * cache_stride_ +
                                block_offset * head_dim_ + head_dim_idx;
 
-    fp8::CopyWithScaleOp<cache_t, scalar_t, kv_dt> op{scale};
+    fp8::CopyWithScaleOp<cache_t, scalar_t, kv_dt> op{1.0f / scale};
     for (int i = 0; i < VEC_SIZE; i++) {
       op(kv_cache_[dst_offset + i], k_vals[i]);
     }
@@ -1247,7 +1252,7 @@ class convert_fp8_kernel {
               static_cast<Tout>(static_cast<float>(fp8_val) * scale_);
         } else {
           // Quantize: FP16/BF16/FP32 -> FP8 (stored as uint8_t)
-          float fp8_max = vllm::fp8::quant_type_max_v<fp8_dtype>;
+          constexpr float fp8_max = vllm::fp8::fp8_max_f<fp8_dtype>::value;
           float x = static_cast<float>(src_cache_[idx]) / scale_;
           x = sycl::fmax(-fp8_max, sycl::fmin(x, fp8_max));
           auto fp8_val = static_cast<fp8_dtype>(x);

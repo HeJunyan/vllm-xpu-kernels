@@ -97,7 +97,7 @@ class rms_norm_dynamic_per_token_quant_kernel {
         computed_scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
       } else {
         // FP8
-        const float fp8_max = static_cast<float>(fp8::quant_type_max_v<out_t>);
+        constexpr float fp8_max = fp8::fp8_max_f<out_t>::value;
         const float clamped_absmax =
             (scale_ub != nullptr) ? sycl::min(absmax, *scale_ub) : absmax;
         computed_scale = sycl::max(
@@ -121,7 +121,7 @@ class rms_norm_dynamic_per_token_quant_kernel {
             sycl::max(sycl::min(sycl::rint(q), 127.0f), -128.0f));
       } else {
         // FP8
-        const float fp8_max = static_cast<float>(fp8::quant_type_max_v<out_t>);
+        constexpr float fp8_max = fp8::fp8_max_f<out_t>::value;
         token_output[i] =
             static_cast<out_t>(sycl::max(sycl::min(q, fp8_max), -fp8_max));
       }
@@ -227,8 +227,7 @@ class rms_norm_per_block_quant_kernel {
           group_scale = (group_absmax > 0.0f) ? (group_absmax / 127.0f) : 1.0f;
         } else {
           // FP8
-          const float fp8_max =
-              static_cast<float>(fp8::quant_type_max_v<out_t>);
+          constexpr float fp8_max = fp8::fp8_max_f<out_t>::value;
           group_scale = sycl::max(
               group_absmax / fp8_max, fp8::min_scaling_factor<out_t>::val());
         }
@@ -253,8 +252,7 @@ class rms_norm_per_block_quant_kernel {
               sycl::max(sycl::min(sycl::rint(q), 127.0f), -128.0f));
         } else {
           // FP8
-          const float fp8_max =
-              static_cast<float>(fp8::quant_type_max_v<out_t>);
+          constexpr float fp8_max = fp8::fp8_max_f<out_t>::value;
           token_output[col] =
               static_cast<out_t>(sycl::max(sycl::min(q, fp8_max), -fp8_max));
         }
@@ -332,7 +330,7 @@ class rms_norm_static_fp8_quant_kernel {
 
     // Invert scale to avoid division
     const float scale_inv = 1.0f / (*scale);
-    const float fp8_max = static_cast<float>(fp8::quant_type_max_v<out_t>);
+    constexpr float fp8_max = fp8::fp8_max_f<out_t>::value;
 
     // Pass 2: normalize, apply weight, quantize — same vectorization as Pass 1
     const auto* v_w = reinterpret_cast<const vec_t*>(weight);
@@ -426,7 +424,7 @@ class fused_add_rms_norm_static_fp8_quant_kernel {
 
     // Invert scale to avoid division
     const float scale_inv = 1.0f / (*scale);
-    const float fp8_max = static_cast<float>(fp8::quant_type_max_v<out_t>);
+    constexpr float fp8_max = fp8::fp8_max_f<out_t>::value;
 
     // Pass 2: normalize from residual, apply weight, quantize
     const auto* v_w = reinterpret_cast<const vec_t*>(weight);
