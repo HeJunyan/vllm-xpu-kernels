@@ -62,8 +62,8 @@ def require_torch_ops(*ops):
 
 
 # layer norm ops
-def rms_norm(out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
-             epsilon: float) -> None:
+def rms_norm(out: torch.Tensor, input: torch.Tensor,
+             weight: Optional[torch.Tensor], epsilon: float) -> None:
     # TODO: Remove this contiguous call when the kernel is updated to support
     # non-contiguous input
     input_contiguous = input.contiguous()
@@ -71,7 +71,8 @@ def rms_norm(out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
 
 
 def fused_add_rms_norm(input: torch.Tensor, residual: torch.Tensor,
-                       weight: torch.Tensor, epsilon: float) -> None:
+                       weight: Optional[torch.Tensor],
+                       epsilon: float) -> None:
     torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
 
 
