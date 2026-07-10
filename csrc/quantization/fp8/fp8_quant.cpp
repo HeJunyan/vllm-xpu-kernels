@@ -9,6 +9,7 @@
 
 #include "quantization/fp8/fp8_quant_asm.h"
 #include "quantization/fp8/quant_utils.h"
+#include "quant_ns.h"
 
 namespace vllm {
 
@@ -423,6 +424,8 @@ class segmented_max_reduction_strided {
 
 }  // namespace vllm
 
+namespace VLLM_QUANT_NS {
+
 void static_scaled_fp8_quant(
     torch::Tensor& out,          // [..., d]
     torch::Tensor const& input,  // [..., d]
@@ -779,3 +782,5 @@ void dynamic_per_token_scaled_fp8_quant(
             });
       });
 }
+
+}  // namespace VLLM_QUANT_NS

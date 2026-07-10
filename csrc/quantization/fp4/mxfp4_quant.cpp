@@ -9,6 +9,7 @@
 #include "utils.h"
 
 #include "quantization/fp4/mxfp4_quant.h"
+#include "quant_ns.h"
 
 // per_token_group_quant_mxfp4
 //
@@ -21,6 +22,9 @@
 //                           May be column-major (see below).
 //   group_size            – block size; must be 32 for the MX format
 //   eps                   – absolute minimum to avoid log2(0); default 1e-10
+//
+namespace VLLM_QUANT_NS {
+
 void per_token_group_quant_mxfp4(
     const torch::Tensor& input,
     torch::Tensor& output_q,
@@ -93,3 +97,5 @@ void per_token_group_quant_mxfp4(
         });
       });
 }
+
+}  // namespace VLLM_QUANT_NS

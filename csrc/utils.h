@@ -107,6 +107,13 @@ static inline bool is_xe3_arch(at::DeviceIndex device_index = -1) {
          arch == syclex::architecture::intel_gpu_wcl;
 }
 
+static inline bool is_xe3p_arch(at::DeviceIndex device_index = -1) {
+  auto arch = get_device_architecture(device_index);
+  return arch == syclex::architecture::intel_gpu_cri ||
+         arch == syclex::architecture::intel_gpu_nvl_p;
+}
+
+
 static inline std::optional<std::string> getEnv(const char* name) {
   if (const char* val = std::getenv(name)) return val;
   return std::nullopt;
@@ -120,14 +127,6 @@ static inline bool force_xe_default_kernel() {
   }
   return false;
 }
-
-#ifdef VLLM_XPU_ENABLE_XE3
-static inline bool is_xe3p_arch(at::DeviceIndex device_index = -1) {
-  auto arch = get_device_architecture(device_index);
-  return arch == syclex::architecture::intel_gpu_cri ||
-         arch == syclex::architecture::intel_gpu_nvl_p;
-}
-#endif
 
 template <typename T>
 struct SyclTypeTrait {

@@ -147,7 +147,6 @@ if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
   # The CRI cutlass revision (v0.1.0_next) is incompatible with the in-tree XE2
   # kernels (changed cute barrier/algorithm APIs). XE2 kernels never run on the
   # CRI simulator, so disable them for this build.
-  set(VLLM_XPU_ENABLE_XE2 OFF)
   set(VLLM_XPU_ENABLE_XE_DEFAULT OFF)
   set(ONEDNN_GIT_REPO
       "https://github.com/uxlfoundation/oneDNN.git"
@@ -601,6 +600,40 @@ endif()
 #
 
 #
+# quant_asm_xe_3 shared library — Xe3(p)-only hand-written asm quant impl.
+#
+if(VLLM_XPU_ENABLE_XE3 AND BASIC_KERNELS_ENABLED)
+  message(STATUS "Enabling quant_asm_xe_3 library (Xe3 asm quant impl).")
+
+  set(QUANT_ASM_SRC "csrc/quant_asm_entry.cpp")
+
+  add_library(quant_asm_xe_3 SHARED ${QUANT_ASM_SRC})
+  set_property(TARGET quant_asm_xe_3 PROPERTY CXX_STANDARD 20)
+
+  target_compile_options(quant_asm_xe_3 PRIVATE ${VLLM_GPU_COMPILE_FLAGS} -fPIC)
+  # Ensure the asm path is on regardless of how VLLM_GPU_COMPILE_FLAGS is built.
+  target_compile_definitions(quant_asm_xe_3 PRIVATE VLLM_XPU_ENABLE_XE3=1)
+  target_include_directories(quant_asm_xe_3 PRIVATE csrc ${VLLM_XPU_INCLUDE_DIR})
+
+  target_link_libraries(quant_asm_xe_3 PRIVATE torch ${TORCH_LIBRARIES})
+
+  # Xe3-only AOT device link flags. Unlike VLLM_GPU_LINK_FLAGS (which may also
+  # carry Xe2 devices such as bmg/pvc in a combined build), this library is a
+  # pure Xe3(p) asm impl and must only AOT-compile for Xe3 devices (cri/nvl).
+  set(QUANT_ASM_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
+  if(XE3_AOT_DEVICES)
+    list(APPEND QUANT_ASM_LINK_FLAGS "-device ${XE3_AOT_DEVICES}")
+  endif()
+  target_link_options(quant_asm_xe_3 PRIVATE ${QUANT_ASM_LINK_FLAGS})
+
+  # Ship alongside the extensions; global rpath is already $ORIGIN.
+  set_target_properties(quant_asm_xe_3 PROPERTIES LIBRARY_OUTPUT_DIRECTORY
+                                                 "${CMAKE_BINARY_DIR}/")
+  install(TARGETS quant_asm_xe_3 LIBRARY DESTINATION vllm_xpu_kernels
+                                        COMPONENT quant_asm_xe_3)
+endif()
+
+#
 # _C extension
 #
 if(BASIC_KERNELS_ENABLED)
@@ -615,6 +648,7 @@ if(BASIC_KERNELS_ENABLED)
       "csrc/torch_bindings.cpp"
       "csrc/quantization/fp8/fp8_quant.cpp"
       "csrc/quantization/fp4/mxfp4_quant.cpp"
+      "csrc/quant_dispatch.cpp"
       "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cpp"
       "csrc/xpu_view.cpp"
       "csrc/attention/merge_attn_states.cpp"
@@ -643,6 +677,14 @@ if(BASIC_KERNELS_ENABLED)
     USE_SABI
     3
     WITH_SOABI)
+
+  target_compile_definitions(
+    _C PRIVATE VLLM_FP8_QUANT_DISABLE_ASM=1 VLLM_MXFP4_QUANT_DISABLE_ASM=1)
+
+  if(VLLM_XPU_ENABLE_XE3 AND TARGET quant_asm_xe_3)
+    target_link_libraries(_C PRIVATE quant_asm_xe_3)
+    target_compile_definitions(_C PRIVATE VLLM_QUANT_ASM_AVAILABLE=1)
+  endif()
 
 endif()
 

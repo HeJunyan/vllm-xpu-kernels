@@ -10,6 +10,7 @@
 #include "quantization/utils.h"
 #include "utils.h"
 #include "utils/mem_cpy.h"
+#include "quant_ns.h"
 
 // FP8 E4M3 scale divisor for Intel GPU
 constexpr float kFp8E4M3ScaleDivisor = 448.f;
@@ -718,6 +719,14 @@ class gather_and_maybe_dequant_cache_kernel {
 
 }  // namespace vllm
 
+// Only reshape_and_cache_flash has an Xe3p asm quant path and is routed through
+// the runtime dispatcher (quant_dispatch.cpp). It is emitted under VLLM_QUANT_NS
+// so the fallback build (_C) and the asm build (libquant_asm_xe3.so) export distinct
+// symbols. The remaining cache ops have no asm path: they stay in the global
+// namespace and are compiled ONLY into _C (guarded out of the asm build to avoid
+// duplicate global symbols when _C links libquant_asm_xe3.so).
+
+#ifndef VLLM_QUANT_ASM_BUILD
 // KV_T is the stored data type of kv-cache.
 // CACHE_T is the data type of key and value tensors.
 // KV_DTYPE is the real data type of kv-cache.
@@ -767,6 +776,11 @@ void reshape_and_cache(
   DISPATCH_BY_KV_CACHE_DTYPE(
       key.scalar_type(), kv_cache_dtype, CALL_RESHAPE_AND_CACHE);
 }
+#endif  // VLLM_QUANT_ASM_BUILD
+
+// reshape_and_cache_flash: the only cache op with an Xe3p asm quant path.
+// Emitted under VLLM_QUANT_NS in both the fallback (_C) and asm builds.
+namespace VLLM_QUANT_NS {
 
 // KV_T is the stored data type of kv-cache.
 // CACHE_T is the data type of key and value tensors.
@@ -823,6 +837,9 @@ void reshape_and_cache_flash(
       key.scalar_type(), kv_cache_dtype, CALL_RESHAPE_AND_CACHE_FLASH);
 }
 
+}  // namespace VLLM_QUANT_NS
+
+#ifndef VLLM_QUANT_ASM_BUILD
 // KV_T is the data type of key and value tensors.
 // CACHE_T is the stored data type of kv-cache.
 // KV_DTYPE is the real data type of kv-cache.
@@ -1496,3 +1513,5 @@ void cp_gather_indexer_k_quant_cache(
     CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(32);
   }
 }
+
+#endif  // VLLM_QUANT_ASM_BUILD (all non-flash cache ops: _C-only)
