@@ -50,7 +50,21 @@ namespace xpu {
 static inline sycl::queue& vllmGetQueue(at::DeviceIndex device_index = -1) {
   auto current_stream = c10::xpu::getCurrentXPUStream(device_index);
   auto& queue = current_stream.queue();
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // create profiling queue for CRI
+  auto dev_idx =
+      (device_index == -1) ? c10::xpu::current_device() : device_index;
+  static sycl::queue profiling_queue(
+      c10::xpu::get_device_context(),
+      c10::xpu::get_raw_device(dev_idx),
+      sycl::property_list{
+          sycl::property::queue::in_order(),
+          sycl::property::queue::enable_profiling()});
+  queue.wait();
+  return profiling_queue;
+#else
   return queue;
+#endif
 }
 
 namespace syclex = sycl::ext::oneapi::experimental;

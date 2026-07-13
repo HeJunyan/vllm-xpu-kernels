@@ -104,8 +104,6 @@ void cutlass_chunk_prefill_impl(
     max_seqlen_k = key_cache.size(2);
   }
 
-  bool is_interleaved_kv = false;
-
   if (is_paged) {
     num_blocks = key_cache.size(0);
     block_size = key_cache.size(1);
@@ -139,7 +137,7 @@ void cutlass_chunk_prefill_impl(
       max_seqlen_q,
       max_seqlen_k,
       total_seqlen_q,
-      is_interleaved_kv ? total_seqlen_k * 2 : total_seqlen_k,
+      total_seqlen_k,
       is_fp8_kv ? k_scale.value().data_ptr() : nullptr,
       is_fp8_kv ? v_scale.value().data_ptr() : nullptr,
       static_cast<float>(sm_scale),

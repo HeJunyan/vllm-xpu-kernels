@@ -56,7 +56,6 @@ struct chunk_prefill_args_t {
   bool is_causal = false;
   bool is_local = false;
   bool is_sink = false;
-  bool is_interleaved_kv_cache = false;
   // softmax_lse output (nullptr when not requested)
   float* softmax_lse = nullptr;
   int lse_stride = 0;  // stride along seq dim (= num_heads_q)
@@ -189,7 +188,7 @@ struct KernelLauncher {
          args.total_seqlen_k,
          args.window_size_left,
          args.window_size_right,
-         args.is_interleaved_kv_cache},
+         args.page_stride_elements},
         {},
         hw_info};
 
@@ -242,7 +241,7 @@ struct KernelLauncher {
     compat::experimental::launch_policy policy{
         sycl_grid, sycl_block, launch_props, kernel_props};
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-    auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, params);
+    auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, queue, params);
     EventManager::getInstance().addEvent(event);
 #else
     compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, queue, params);
