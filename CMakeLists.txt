@@ -310,9 +310,8 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   list(APPEND SYCL_LINK_FLAGS "-Wno-unused-command-line-argument")
 
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_LINK_FLAGS})
-  set(SYCL_DEVICE_LINK_FLAGS
-      ${SYCL_DEVICE_LINK_FLAGS} -fsycl-max-parallel-link-jobs=64
-      -Wno-sycl-target -flink-huge-device-code)
+  set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS}
+                             -fsycl-max-parallel-link-jobs=64 -Wno-sycl-target)
   set(SYCL_DEVICE_LINK_FLAGS
       ${SYCL_DEVICE_LINK_FLAGS}
       "-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"
@@ -613,7 +612,8 @@ if(VLLM_XPU_ENABLE_XE3 AND BASIC_KERNELS_ENABLED)
   target_compile_options(quant_asm_xe_3 PRIVATE ${VLLM_GPU_COMPILE_FLAGS} -fPIC)
   # Ensure the asm path is on regardless of how VLLM_GPU_COMPILE_FLAGS is built.
   target_compile_definitions(quant_asm_xe_3 PRIVATE VLLM_XPU_ENABLE_XE3=1)
-  target_include_directories(quant_asm_xe_3 PRIVATE csrc ${VLLM_XPU_INCLUDE_DIR})
+  target_include_directories(quant_asm_xe_3 PRIVATE csrc
+                                                    ${VLLM_XPU_INCLUDE_DIR})
 
   target_link_libraries(quant_asm_xe_3 PRIVATE torch ${TORCH_LIBRARIES})
 
@@ -628,9 +628,9 @@ if(VLLM_XPU_ENABLE_XE3 AND BASIC_KERNELS_ENABLED)
 
   # Ship alongside the extensions; global rpath is already $ORIGIN.
   set_target_properties(quant_asm_xe_3 PROPERTIES LIBRARY_OUTPUT_DIRECTORY
-                                                 "${CMAKE_BINARY_DIR}/")
+                                                  "${CMAKE_BINARY_DIR}/")
   install(TARGETS quant_asm_xe_3 LIBRARY DESTINATION vllm_xpu_kernels
-                                        COMPONENT quant_asm_xe_3)
+                                         COMPONENT quant_asm_xe_3)
 endif()
 
 #
@@ -678,8 +678,8 @@ if(BASIC_KERNELS_ENABLED)
     3
     WITH_SOABI)
 
-  target_compile_definitions(
-    _C PRIVATE VLLM_FP8_QUANT_DISABLE_ASM=1 VLLM_MXFP4_QUANT_DISABLE_ASM=1)
+  target_compile_definitions(_C PRIVATE VLLM_FP8_QUANT_DISABLE_ASM=1
+                                        VLLM_MXFP4_QUANT_DISABLE_ASM=1)
 
   if(VLLM_XPU_ENABLE_XE3 AND TARGET quant_asm_xe_3)
     target_link_libraries(_C PRIVATE quant_asm_xe_3)
@@ -727,7 +727,8 @@ if(FA2_KERNELS_ENABLED)
     WITH_SOABI)
   # add FLAG for profiling queue creation
   if(BUILD_ON_SIMULATOR_CRI)
-    target_compile_definitions(_vllm_fa2_C PRIVATE CUTLASS_SYCL_PROFILING_ENABLED)
+    target_compile_definitions(_vllm_fa2_C
+                               PRIVATE CUTLASS_SYCL_PROFILING_ENABLED)
   endif()
 endif()
 
