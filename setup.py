@@ -197,6 +197,7 @@ class cmake_build_ext(build_ext):
             "MQA_LOGITS_KERNELS_ENABLED",
             "XPU_SPECIFIC_KERNELS_ENABLED",
             "XPUMEM_ALLOCATOR_ENABLED",
+            "BUILD_QUANT_ASM_XE3",
         ]
         for opt in _kernel_options:
             cmake_args.append('-D{}={}'.format(
@@ -564,7 +565,8 @@ if _is_enabled("BUILD_SYCL_TLA_KERNELS"):
             additional_libraries["grouped_gemm_xe_2"] = (
                 "/csrc/xpu/grouped_gemm/xe_2")
     if _is_enabled("VLLM_XPU_ENABLE_XE3"):
-        if _is_enabled("BASIC_KERNELS_ENABLED"):
+        if _is_enabled("BASIC_KERNELS_ENABLED") and _is_enabled(
+                "BUILD_QUANT_ASM_XE3"):
             additional_libraries["quant_asm_xe_3"] = ""
         if _is_enabled("FA2_KERNELS_ENABLED"):
             additional_libraries["attn_kernels_xe_3"] = "/csrc/xpu/attn/xe_3"
