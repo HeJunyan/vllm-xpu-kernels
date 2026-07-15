@@ -136,6 +136,8 @@ class XeFMHAFwdKernel {
   static constexpr int SharedStorageSize =
       is_empty_v<SharedStorage> ? size_t(0) : sizeof(SharedStorage);
 
+  static constexpr int kXeMaxSurfaceRows = 1 << 24;
+
   // Device side arguments
   struct KernelArguments {
     ProblemShape shape;
@@ -394,23 +396,44 @@ class XeFMHAFwdKernel {
       // Main loop
       int l_coord = is_var_len ? 0 : idx_b;
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
-      mainloop(
-          Q(_, _, head_q, l_coord),
-          K(_, _, head, l_coord),
-          V(_, _, head, l_coord),
-          tArA,
-          tA_max,
-          tA_sum,
-          blk_qv,
-          idx_b,
-          k_block0,
-          k_blocks,
-          k_blocks_causal,
-          thr_id,
-          seq_len,
-          full_tile_offset,
-          k_block_local_l_safe,
-          k_block_local_r_safe);
+      bool has_large_surface = kXeMaxSurfaceRows < total_seqlen_kv;
+      if (has_large_surface) {
+        mainloop.template operator()<true>(
+            Q(_, _, head_q, l_coord),
+            K(_, _, head, l_coord),
+            V(_, _, head, l_coord),
+            tArA,
+            tA_max,
+            tA_sum,
+            blk_qv,
+            idx_b,
+            k_block0,
+            k_blocks,
+            k_blocks_causal,
+            thr_id,
+            seq_len,
+            full_tile_offset,
+            k_block_local_l_safe,
+            k_block_local_r_safe);
+      } else {
+        mainloop.template operator()<false>(
+            Q(_, _, head_q, l_coord),
+            K(_, _, head, l_coord),
+            V(_, _, head, l_coord),
+            tArA,
+            tA_max,
+            tA_sum,
+            blk_qv,
+            idx_b,
+            k_block0,
+            k_blocks,
+            k_blocks_causal,
+            thr_id,
+            seq_len,
+            full_tile_offset,
+            k_block_local_l_safe,
+            k_block_local_r_safe);
+      }
 
       // return softmax_lse
       if constexpr (SoftmaxLSE) {
