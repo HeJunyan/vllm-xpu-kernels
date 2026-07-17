@@ -455,8 +455,14 @@ struct DecodeKernelLauncher {
       compat::experimental::launch<
           cutlass::device_kernel<ReductionSplitKernel>>(
           reduce_policy, queue, reduce_params);
-      // reduce_event.wait();
     }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+    // CRI uses a private profiling queue rather than PyTorch's current queue.
+    // Complete the work before returning so PyTorch can safely consume or
+    // release the tensors passed to this operation.
+    queue.wait_and_throw();
+#endif
   }
 };
 

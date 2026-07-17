@@ -11,6 +11,8 @@ import vllm_xpu_kernels._xpu_C  # noqa: F401
 from tests.utils import format_tc
 from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
 
+pytestmark = pytest.mark.usefixtures("reset_default_device")
+
 NUM_HEADS = [(8, 2)]
 HEAD_SIZES = [64, 128, 256, 512]
 BLOCK_SIZES = [16, 64]
