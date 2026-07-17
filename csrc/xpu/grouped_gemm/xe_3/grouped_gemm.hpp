@@ -39,10 +39,8 @@ enum class PrefillFamily { kBF16, kMXFP8, kMXFP4 };
 // fully when 256x256's last wave is short). The choice follows one rule per
 // dtype family:
 //
-//   1. MXFP8: its 256x256 tile is occupancy/scale-load bound and measures
-//      ~2.5x slower than 128x256 across every shape, so MXFP8 always uses
-//      128x256.
-//   2. BF16 / MXFP4: keep 256x256 while it keeps the cores busy; fall back to
+// BF16, MXFP8, and MXFP4 keep their base tile while it keeps the cores busy,
+// then fall back to
 //      128x256 once the final wave drops below a utilization threshold. MXFP4
 //      is 4-bit and compute-bound, so it tolerates a shorter tail wave (>=0.85)
 //      than the more wave-quantization-sensitive BF16 (>=0.90).
@@ -51,10 +49,6 @@ inline PrefillTile pick_prefill_tile(
   // Manual override for tuning/profiling.
   if (const char* env = std::getenv("XE3_GG_FORCE_TILE")) {
     return static_cast<PrefillTile>(std::atoi(env));
-  }
-
-  if (family == PrefillFamily::kMXFP8) {
-    return PrefillTile::k128x256;
   }
 
   constexpr int kCores = 32;
@@ -189,7 +183,17 @@ at::Tensor grouped_gemm_func(
       A_dtype == at::kFloat4_e2m1fn_x2 && ptr_A_scale &&
       ptr_A_scale->dtype() == at::kFloat8_e8m0fnu) {
     if (avg_tokens_cnt > 32) {
-      DISPATCH_PREFILL_TILE(moe_mxfp4, kMXFP4);
+      if (K <= 1024 && N >= 1024) {
+        if (avg_tokens_cnt <= 2048) {
+          using moe_policy = grouped_gemm::moe_mxfp4_256x128_policy;
+          CALL_KERNEL_WITH_POLICY(moe_policy);
+        } else {
+          using moe_policy = grouped_gemm::moe_mxfp4_downproj_wide_policy;
+          CALL_KERNEL_WITH_POLICY(moe_policy);
+        }
+      } else {
+        DISPATCH_PREFILL_TILE(moe_mxfp4, kMXFP4);
+      }
     } else if (avg_tokens_cnt > 4) {
       using moe_policy = grouped_gemm::moe_mxfp4_mid_policy;
       CALL_KERNEL_WITH_POLICY(moe_policy);

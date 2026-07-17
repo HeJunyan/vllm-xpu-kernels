@@ -51,7 +51,9 @@ class PersistentTileSchedulerMoE {
 
  private:
   uint64_t current_work_linear_idx_ = 0;
+  uint64_t end_work_linear_idx_ = 0;
   uint64_t total_grid_size_ = 0;
+  bool use_contiguous_ranges_ = false;
   int64_t N_ = 0;
   int64_t K_ = 0;
   int64_t num_experts_ = 0;
@@ -252,6 +254,23 @@ class PersistentTileSchedulerMoE {
     }
     scheduler_params.blocks_across_problem_ = total_work_tiles;
     scheduler_params.pre_processed_problem_shapes = true;
+
+    // Contiguous AlongM chunks improve locality for the tuned short-K MXFP4
+    // 256x256 policy. Other policies retain grid-stride scheduling, which
+    // provides better wave balance for BF16, MXFP8, and wider tiles.
+    use_contiguous_ranges_ =
+        K_ <= 1024 && scheduler_params.cta_shape_.m() == 256 &&
+        scheduler_params.cta_shape_.n() == 256;
+    if (use_contiguous_ranges_) {
+      uint64_t block_linear_idx = current_work_linear_idx_;
+      uint64_t tiles_per_workgroup =
+          (total_work_tiles + total_grid_size_ - 1) / total_grid_size_;
+      current_work_linear_idx_ = block_linear_idx * tiles_per_workgroup;
+      end_work_linear_idx_ = cute::min(
+          current_work_linear_idx_ + tiles_per_workgroup, total_work_tiles);
+    } else {
+      end_work_linear_idx_ = total_work_tiles;
+    }
 #else
     CUTLASS_ASSERT(false && "This line should never be reached");
 #endif
@@ -264,6 +283,9 @@ class PersistentTileSchedulerMoE {
 
   CUTLASS_DEVICE
   WorkTileInfo get_current_work_for_linear_idx(uint64_t linear_idx) {
+    if (linear_idx >= end_work_linear_idx_) {
+      return WorkTileInfo::invalid_work_tile();
+    }
     if (scheduler_params.pre_processed_problem_shapes &&
         linear_idx >= scheduler_params.blocks_across_problem_) {
       return WorkTileInfo::invalid_work_tile();
@@ -284,7 +306,9 @@ class PersistentTileSchedulerMoE {
 
   CUTLASS_DEVICE
   void advance_to_next_work(uint32_t advance_count = 1) {
-    current_work_linear_idx_ += total_grid_size_ * uint64_t(advance_count);
+    current_work_linear_idx_ +=
+        (use_contiguous_ranges_ ? 1 : total_grid_size_) *
+        uint64_t(advance_count);
   }
 
   // get work_idx_m, work_idx_n from linear_idx while applying swizzle
