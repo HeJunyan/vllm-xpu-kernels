@@ -25,3 +25,4 @@ pytest
 matplotlib # in benchmark, introduced by triton
 pandas # in benchmark, introduced by triton
 transformers # for model config
+scipy
