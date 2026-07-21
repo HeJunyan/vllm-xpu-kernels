@@ -25,7 +25,12 @@
 #define DECLARE_POLICY_DISPATCH_EXTERN(                          \
     POLICY, PAGED, CAUSAL, LOCAL, SINK, LSE)                     \
   extern template void                                           \
-  policy_dispatch_impl<POLICY, PAGED, CAUSAL, LOCAL, SINK, LSE>( \
+  policy_dispatch_impl<POLICY, PAGED, CAUSAL, LOCAL, SINK, LSE, false>( \
+      sycl::queue & queue,                                       \
+      CutlassQKType & cuQKType,                                  \
+      const chunk_prefill_args_t& args);                          \
+  extern template void                                           \
+  policy_dispatch_impl<POLICY, PAGED, CAUSAL, LOCAL, SINK, LSE, true>( \
       sycl::queue & queue,                                       \
       CutlassQKType & cuQKType,                                  \
       const chunk_prefill_args_t& args);

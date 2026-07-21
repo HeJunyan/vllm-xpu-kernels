@@ -142,7 +142,14 @@ function(paged_decode_configure FILENAME_SUFFIX)
 
   # Configuration space dimensions (for "all" mode)
   set(qgroup_list "8" "16")
-  set(headsize_list "64" "96" "128" "192" "256" "512" "576")
+  set(headsize_list
+      "64"
+      "96"
+      "128"
+      "192"
+      "256"
+      "512"
+      "576")
   set(pagesize_list "16" "32" "64" "128")
 
   # =============================================================================
@@ -249,19 +256,25 @@ function(paged_decode_configure FILENAME_SUFFIX)
     # Track enabled policies for extern header generation
     list(APPEND ENABLED_POLICIES "${IMPL_POLICY}")
 
-    # Construct unique filename suffix: e.g., _q8_h64_p64_fff
-    set(FILE_SUFFIX "_q${IMPL_QGROUP}_h${IMPL_HEADSIZE}_p${IMPL_PAGESIZE}_")
-    set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISCAUSAL}}")
-    set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISLOCAL}}")
-    set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISSINK}}")
+    foreach(IMPL_FULL_FP8 ${L_BOOLS})
+      # Construct unique filename suffix: e.g., _q8_h64_p64_fp8_fff
+      set(FILE_SUFFIX "_q${IMPL_QGROUP}_h${IMPL_HEADSIZE}_p${IMPL_PAGESIZE}")
+      if(IMPL_FULL_FP8)
+        set(FILE_SUFFIX "${FILE_SUFFIX}_fp8")
+      endif()
+      set(FILE_SUFFIX "${FILE_SUFFIX}_")
+      set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISCAUSAL}}")
+      set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISLOCAL}}")
+      set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISSINK}}")
 
-    # Generate .cpp file from template
-    configure_file(${FILENAME_SUFFIX}.cpp.in
-                   "${FILENAME_SUFFIX}${FILE_SUFFIX}.cpp")
+      # Generate .cpp file from template
+      configure_file(${FILENAME_SUFFIX}.cpp.in
+                     "${FILENAME_SUFFIX}${FILE_SUFFIX}.cpp")
 
-    # Add to output list
-    list(APPEND GEN_KERNEL_SRCS
-         "${CMAKE_CURRENT_BINARY_DIR}/${FILENAME_SUFFIX}${FILE_SUFFIX}.cpp")
+      # Add to output list
+      list(APPEND GEN_KERNEL_SRCS
+           "${CMAKE_CURRENT_BINARY_DIR}/${FILENAME_SUFFIX}${FILE_SUFFIX}.cpp")
+    endforeach()
   endforeach()
 
   # =============================================================================
@@ -285,7 +298,7 @@ function(paged_decode_configure FILENAME_SUFFIX)
 
   # Generate the extern header from template
   configure_file(
-    "${CMAKE_CURRENT_LIST_DIR}/../xe_2/paged_decode_extern.hpp.in"
+    "${CMAKE_CURRENT_LIST_DIR}/paged_decode_extern.hpp.in"
     "${CMAKE_CURRENT_BINARY_DIR}/paged_decode_extern_gen.hpp" @ONLY)
 
   # Build the compile-time policy trait specializations
@@ -318,7 +331,7 @@ function(paged_decode_configure FILENAME_SUFFIX)
 
   # Generate the policy-enabled traits header
   configure_file(
-    "${CMAKE_CURRENT_LIST_DIR}/../xe_2/paged_decode_enabled_policies.hpp.in"
+    "${CMAKE_CURRENT_LIST_DIR}/paged_decode_enabled_policies.hpp.in"
     "${CMAKE_CURRENT_BINARY_DIR}/paged_decode_enabled_policies_gen.hpp" @ONLY)
 
   # =============================================================================

@@ -1,6 +1,6 @@
 #include "paged_decode_xe3.h"
-#include "csrc/xpu/attn/xe_2/paged_decode_utils.hpp"
-#include "csrc/xpu/attn/xe_2/paged_decode_extern.hpp"
+#include "csrc/xpu/attn/xe_3/paged_decode_utils.hpp"
+#include "csrc/xpu/attn/xe_3/paged_decode_extern.hpp"
 #include "csrc/xpu/attn/paged_kv_utils.h"
 
 using namespace cute;
@@ -20,6 +20,7 @@ void cutlass_paged_decode_xe3(
     const at::Tensor& cu_seqlens_k,
     int max_seqlen_q,
     int max_seqlen_k,
+    std::optional<const at::Tensor>& q_scale,
     std::optional<const at::Tensor>& k_scale,
     std::optional<const at::Tensor>& v_scale,
     double sm_scale,
@@ -49,6 +50,7 @@ void cutlass_paged_decode_xe3(
       cu_seqlens_k,
       max_seqlen_q,
       max_seqlen_k,
+      q_scale,
       k_scale,
       v_scale,
       sm_scale,
@@ -81,6 +83,7 @@ void cutlass_paged_decode_impl(
     const at::Tensor& cu_seqlens_k,
     int max_seqlen_q,
     int max_seqlen_k,
+    std::optional<const at::Tensor>& q_scale,
     std::optional<const at::Tensor>& k_scale,
     std::optional<const at::Tensor>& v_scale,
     double sm_scale,
@@ -98,6 +101,8 @@ void cutlass_paged_decode_impl(
     std::optional<at::Tensor>& work_list) {
   bool is_fp8_kv = key_cache.scalar_type() == at::ScalarType::Float8_e5m2 ||
                    key_cache.scalar_type() == at::ScalarType::Float8_e4m3fn;
+  bool is_fp8_q = query.scalar_type() == at::ScalarType::Float8_e5m2 ||
+                  query.scalar_type() == at::ScalarType::Float8_e4m3fn;
   if (is_fp8_kv) {
     TORCH_CHECK(
         k_scale.has_value() && v_scale.has_value(),
@@ -165,6 +170,7 @@ void cutlass_paged_decode_impl(
       max_seqlen_k,
       total_seqlen_q,
       total_seqlen_k,
+      (is_fp8_q && q_scale.has_value()) ? q_scale.value().data_ptr() : nullptr,
       is_fp8_kv ? k_scale.value().data_ptr() : nullptr,
       is_fp8_kv ? v_scale.value().data_ptr() : nullptr,
       static_cast<float>(sm_scale),
@@ -214,6 +220,29 @@ void cutlass_paged_decode_impl(
   }
 
   CutlassQKType cuQKType = aten_to_Cutlass_qk_dtype(query, key_cache);
+
+  // Full fp8 attention: when the query itself is fp8, Q/K/V all flow through the
+  // fp8 MMAs. The output (temp_out/out) precision is independent of the fp8
+  // inputs, so carry it explicitly. q_scale/k_scale/v_scale are passed as device
+  // pointers and fused inside the kernel (q_scale and k_scale into the softmax
+  // scale, v_scale as a post-loop output rescale), so the caller passes raw
+  // per-tensor scales.
+  if (is_fp8_q) {
+    TORCH_CHECK(
+        head_size == 128,
+        "Full fp8 paged_decode only supports head dimension 128, got ",
+        head_size,
+        ".");
+    TORCH_CHECK(
+        is_fp8_kv && cuQKType.q_type == cuQKType.k_type,
+        "Full fp8 paged_decode requires Q and K/V cache to share the same fp8 "
+        "type (both e4m3 or both e5m2).");
+    TORCH_CHECK(
+        out.scalar_type() == at::ScalarType::Half ||
+            out.scalar_type() == at::ScalarType::BFloat16,
+        "Full fp8 paged_decode output must be half or bfloat16.");
+    cuQKType.o_type = aten_to_dtype(out);
+  }
 
   static constexpr int max_head_size = 576;
   TORCH_CHECK(

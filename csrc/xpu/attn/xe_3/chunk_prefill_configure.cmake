@@ -10,8 +10,8 @@
 # csrc/xpu/attn/kernel_configs/ chunk_prefill_full.conf    - All combinations
 # chunk_prefill_default.conf - Default model configs
 #
-# XE3 note: Both standard and b16 policies are generated for each headsize.
-# The runtime selects the b16 policy for paged requests with block_size == 16.
+# XE3 note: Both standard and b16 policies are generated for each headsize. The
+# runtime selects the b16 policy for paged requests with block_size == 16.
 # =============================================================================
 
 # Default config path
@@ -66,11 +66,18 @@ function(fmha_forward_configure FILENAME_SUFFIX)
 
   set(headsize_list "64" "96" "128" "192" "256" "512")
   set(policy_list
-      "chunk_policy_head64" "chunk_policy_head96" "chunk_policy_head128"
-      "chunk_policy_head192" "chunk_policy_head256" "chunk_policy_head512"
-      "chunk_policy_head64_b16" "chunk_policy_head96_b16"
-      "chunk_policy_head128_b16" "chunk_policy_head192_b16"
-      "chunk_policy_head256_b16" "chunk_policy_head512_b16")
+      "chunk_policy_head64"
+      "chunk_policy_head96"
+      "chunk_policy_head128"
+      "chunk_policy_head192"
+      "chunk_policy_head256"
+      "chunk_policy_head512"
+      "chunk_policy_head64_b16"
+      "chunk_policy_head96_b16"
+      "chunk_policy_head128_b16"
+      "chunk_policy_head192_b16"
+      "chunk_policy_head256_b16"
+      "chunk_policy_head512_b16")
 
   # Map headsize to policy names. Both standard and b16 policies are generated:
   # the runtime dispatch (fmha_xe3.cpp) selects the b16 policy whenever the
@@ -142,8 +149,8 @@ function(fmha_forward_configure FILENAME_SUFFIX)
       list(GET _parts 0 _headsize)
 
       # Guard against malformed entries
-      if("${_headsize}" MATCHES "[^0-9]" OR "${std_policy_${_headsize}}"
-                                            STREQUAL ""
+      if("${_headsize}" MATCHES "[^0-9]"
+         OR "${std_policy_${_headsize}}" STREQUAL ""
          OR "${b16_policy_${_headsize}}" STREQUAL "")
         message(WARNING "Skipping invalid config headsize entry: ${_entry}")
         continue()
@@ -247,16 +254,22 @@ function(fmha_forward_configure FILENAME_SUFFIX)
     # Track enabled policies
     list(APPEND ENABLED_POLICIES "${IMPL_POLICY}")
 
-    set(FILE_SUFFIX "${IMPL_POLICY}_")
-    set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISPAGED}}")
-    set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISCAUSAL}}")
-    set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISSINK}}")
-    set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISLOCAL}}")
-    set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISLSE}}")
-    configure_file(${FILENAME_SUFFIX}.cpp.in
-                   "${FILENAME_SUFFIX}_${FILE_SUFFIX}.cpp")
-    list(APPEND GEN_KERNEL_SRCS
-         "${CMAKE_CURRENT_BINARY_DIR}/${FILENAME_SUFFIX}_${FILE_SUFFIX}.cpp")
+    foreach(IMPL_FULL_FP8 ${L_BOOLS})
+      set(FILE_SUFFIX "${IMPL_POLICY}")
+      if(IMPL_FULL_FP8)
+        set(FILE_SUFFIX "${FILE_SUFFIX}_fp8")
+      endif()
+      set(FILE_SUFFIX "${FILE_SUFFIX}_")
+      set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISPAGED}}")
+      set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISCAUSAL}}")
+      set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISSINK}}")
+      set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISLOCAL}}")
+      set(FILE_SUFFIX "${FILE_SUFFIX}${BOOL_FLAG_${IMPL_KISLSE}}")
+      configure_file(${FILENAME_SUFFIX}.cpp.in
+                     "${FILENAME_SUFFIX}_${FILE_SUFFIX}.cpp")
+      list(APPEND GEN_KERNEL_SRCS
+           "${CMAKE_CURRENT_BINARY_DIR}/${FILENAME_SUFFIX}_${FILE_SUFFIX}.cpp")
+    endforeach()
   endforeach()
 
   # =============================================================================

@@ -111,7 +111,13 @@ __attribute__((visibility("hidden"))) void policy_dispatch_func(
         "If this is unexpected, please report at:\n"
         "  https://github.com/vllm-project/vllm-xpu-kernels/issues/364");
   } else {
-    policy_dispatch_impl<chunk_policy, Bs...>(queue, cuQKType, args);
+    const bool full_fp8 = cuQKType.q_type == CutlassDType::float8_e4m3 ||
+                          cuQKType.q_type == CutlassDType::float8_e5m2;
+    if (full_fp8) {
+      policy_dispatch_impl<chunk_policy, Bs..., true>(queue, cuQKType, args);
+    } else {
+      policy_dispatch_impl<chunk_policy, Bs..., false>(queue, cuQKType, args);
+    }
   }
 }
 
@@ -147,6 +153,7 @@ __attribute__((visibility("hidden"))) void cutlass_chunk_prefill_impl(
     const at::Tensor& cu_seqlens_k,
     int max_seqlen_q,
     int max_seqlen_k,
+    std::optional<const at::Tensor>& q_scale,
     std::optional<const at::Tensor>& k_scale,
     std::optional<const at::Tensor>& v_scale,
     double sm_scale,

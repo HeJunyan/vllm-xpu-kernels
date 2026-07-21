@@ -78,6 +78,13 @@ class FMHAFwdEpilogue {
   // softmax sink, same dtype
   static constexpr bool Sink = Sink_;
   using ElementSink = typename CollectiveMainloop::TensorQ::element_type;
+  // Full-fp8: the mainloop biases the softmax exponent by +8 (see softmax()),
+  // scaling both the P*V numerator and the row-sum denominator by 2^8. The sink
+  // term is added to the denominator here, so it must carry the same bias.
+  static constexpr bool Fp8Q =
+      cute::is_same_v<ElementSink, cutlass::float_e5m2_t> ||
+      cute::is_same_v<ElementSink, cutlass::float_e4m3_t>;
+  static constexpr int kFp8SinkOffset = Fp8Q ? 8 : 0;
 
   // Split k-reduced tiles between participating subgroups.
   // Assumption: the A tile is contiguous.
@@ -192,7 +199,8 @@ class FMHAFwdEpilogue {
       if constexpr (Sink) {
         constexpr double kLog2e = 1.4426950408889634074;
         rA_sum(i) += sycl::native::exp2(
-            static_cast<ElementA>(tSink * kLog2e) - tA_max(i));
+            static_cast<ElementA>(tSink * kLog2e) - tA_max(i) +
+            ElementA(kFp8SinkOffset));
       }
       rA_sum(i) = ElementA(1) / rA_sum(i);
     }
@@ -394,6 +402,13 @@ class DecodeFwdEpilogue {
   // softmax sink, same dtype
   static constexpr bool Sink = Sink_;
   using ElementSink = typename CollectiveMainloop::TensorQ::element_type;
+  // Full-fp8: the mainloop biases the softmax exponent by +8 (see softmax()),
+  // scaling both the P*V numerator and the row-sum denominator by 2^8. The sink
+  // term is added to the denominator here, so it must carry the same bias.
+  static constexpr bool Fp8Q =
+      cute::is_same_v<ElementSink, cutlass::float_e5m2_t> ||
+      cute::is_same_v<ElementSink, cutlass::float_e4m3_t>;
+  static constexpr int kFp8SinkOffset = Fp8Q ? 8 : 0;
 
   // Split k-reduced tiles between participating subgroups.
   // Assumption: the A tile is contiguous.
@@ -543,7 +558,8 @@ class DecodeFwdEpilogue {
       constexpr double kLog2e = 1.4426950408889634074;
       if (idx_kv_split == 0 && sg_id == 0 && thr_id < head_group_q) {
         tA_sum(0) += sycl::native::exp2(
-            static_cast<ElementA>(tSink(thr_id) * kLog2e) - tA_max(0));
+            static_cast<ElementA>(tSink(thr_id) * kLog2e) - tA_max(0) +
+            ElementA(kFp8SinkOffset));
       }
     }
 

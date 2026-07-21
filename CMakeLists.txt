@@ -457,6 +457,10 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   list(APPEND VLLM_CUTLASS_FLAGS "-DCUTLASS_ENABLE_HEADERS_ONLY")
   list(APPEND VLLM_CUTLASS_FLAGS "-DCUTLASS_ENABLE_SYCL")
   list(APPEND VLLM_CUTLASS_FLAGS "-DCUTLASS_VERSIONS_GENERATED")
+  # Enable SYCL event-based device-time profiling so the FMHA/grouped-gemm
+  # profiling harnesses (XE3_FMHA_PROFILE_ITERS / XE3_GG_PROFILE_ITERS) report
+  # simulated device time via the EventManager instead of host wall-clock.
+  list(APPEND VLLM_CUTLASS_FLAGS "-DCUTLASS_SYCL_PROFILING_ENABLED")
   list(APPEND VLLM_CUTLASS_FLAGS "-ftemplate-backtrace-limit=0")
   list(APPEND VLLM_CUTLASS_FLAGS "-fdiagnostics-color=always")
   # CRI specific

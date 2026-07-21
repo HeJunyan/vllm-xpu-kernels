@@ -107,6 +107,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
     int max_seqlen_q,
     int max_seqlen_k,
     float p_dropout,
+    std::optional<const at::Tensor>& q_scale,
     std::optional<const at::Tensor>& k_scale,
     std::optional<const at::Tensor>& v_scale,
     float softmax_scale,
@@ -124,9 +125,13 @@ std::vector<at::Tensor> mha_varlen_fwd(
     std::optional<at::Tensor>& work_list) {
   auto q_type = q.scalar_type();
   auto k_type = k.scalar_type();
+  bool q_is_fp8 = q_type == at::ScalarType::Float8_e5m2 ||
+                  q_type == at::ScalarType::Float8_e4m3fn;
   TORCH_CHECK(
-      q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
-      "VLLM Kernel XPU only supports fp16 and bf16 type");
+      q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16 ||
+          q_is_fp8,
+      "VLLM Kernel XPU only supports fp16, bf16, and fp8 (e4m3/e5m2) query "
+      "types");
 
   TORCH_CHECK(
       v.scalar_type() == k_type, "key and value must have the same dtype");
@@ -205,7 +210,10 @@ std::vector<at::Tensor> mha_varlen_fwd(
 
   if (is_prefill_only) {
     if (!out_.has_value()) {
-      out = torch::empty_like(q);
+      // For fp8 query the output cannot be fp8; default to fp16 (matches the
+      // compute dtype inferred by the Python wrapper for fp8 inputs).
+      auto out_dtype = q_is_fp8 ? at::kHalf : q_type;
+      out = torch::empty_like(q, q.options().dtype(out_dtype));
     }
     // Non-paged: always use chunk_prefill for everything
     std::optional<const at::Tensor> no_mask = std::nullopt;
@@ -220,6 +228,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
         seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        q_scale,
         k_scale,
         v_scale,
         softmax_scale,
@@ -235,7 +244,10 @@ std::vector<at::Tensor> mha_varlen_fwd(
         no_mask);
   } else if (max_seqlen_q > 1) {
     if (!out_.has_value()) {
-      out = torch::empty_like(q);
+      // For fp8 query the output cannot be fp8; default to fp16 (matches the
+      // compute dtype inferred by the Python wrapper for fp8 inputs).
+      auto out_dtype = q_is_fp8 ? at::kHalf : q_type;
+      out = torch::empty_like(q, q.options().dtype(out_dtype));
     }
     int batch_size = static_cast<int>(cu_seqlens_q.size(0)) - 1;
     at::Tensor seq_lens_q = cu_seqlens_q.slice(0, 1, batch_size + 1) -
@@ -254,6 +266,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
         seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        q_scale,
         k_scale,
         v_scale,
         softmax_scale,
@@ -305,6 +318,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
         seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        q_scale,
         k_scale,
         v_scale,
         softmax_scale,
@@ -359,11 +373,14 @@ std::vector<at::Tensor> mha_varlen_fwd(
           "tensor parallel size so num_heads_q per rank is <= 8.");
     }
 
-    // Output shape uses V's head_dim (may differ from Q/K for MLA)
+    // Output shape uses V's head_dim (may differ from Q/K for MLA).
+    // For fp8 query the output cannot be fp8; default to fp16 (matches the
+    // compute dtype inferred by the Python wrapper for fp8 inputs).
     if (!out_.has_value()) {
+      auto out_dtype = q_is_fp8 ? at::kHalf : q_type;
       out = torch::empty(
           {num_tokens, num_heads_q, v_head_dim},
-          q.options().device(q.device()));
+          q.options().dtype(out_dtype).device(q.device()));
     }
 
     int num_kv_splits = num_splits.value_or(get_num_splits(
@@ -379,7 +396,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
             ? out
             : at::empty(
                   {num_tokens, num_heads_q * num_kv_splits, v_head_dim},
-                  q.options().device(q.device()));
+                  out.options().device(out.device()));
     at::Tensor max_logits = at::empty(
         {num_tokens, num_heads_q, num_kv_splits},
         q.options().dtype(at::kFloat).device(q.device()));
@@ -408,6 +425,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
         seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        q_scale,
         k_scale,
         v_scale,
         softmax_scale,
@@ -442,7 +460,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "cu_seqlens_q, "
       "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? leftpad_k, Tensor? "
       "block_table, Tensor? alibi_slopes, "
-      "int max_seqlen_q, int max_seqlen_k, float p_dropout, Tensor? k_scale, "
+      "int max_seqlen_q, int max_seqlen_k, float p_dropout, Tensor? q_scale, "
+      "Tensor? k_scale, "
       "Tensor? v_scale, "
       "float softmax_scale, Tensor? softmax_sink, bool zero_tensors, "
       "bool is_causal, int window_size_left, int window_size_right, float "

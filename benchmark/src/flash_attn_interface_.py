@@ -291,6 +291,7 @@ def flash_attn_varlen_func_CalKernelTime(
             max_seqlen_q,
             max_seqlen_k,
             dropout_p,
+            None,
             k_descale,
             v_descale,
             softmax_scale,

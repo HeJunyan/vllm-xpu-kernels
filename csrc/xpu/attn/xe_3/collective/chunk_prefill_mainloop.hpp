@@ -66,6 +66,7 @@ static inline void barrier() {
 
 using namespace cute;
 
+
 #if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
 CUTE_DEVICE
 void
@@ -102,6 +103,44 @@ cvt_f32x2_to_bf16x2_pack(cute::intel::uint2     const& tmp,
     : "rw"(tmp)
   );
 }
+
+// FP8 packed conversion primitives (ported from
+// libraries.ai.cutlass.internal/applications/flash_attention_v2/collective/
+// xe_fmha_fwd_mainloop.hpp). Subgroup-vectorized casts used to pack the softmax
+// output P into fp8 (e4m3/e5m2) for the full-fp8 P*V GEMM.
+CUTE_DEVICE
+void cvt_f32x2_to_e5m2x2_pack(
+    float const& src0, float const& src1, cute::intel::uchar2& dst) {
+  asm(
+      "{\n"
+      ".decl IN_F0 v_type=G type=F  num_elts=16 alias=<%1,0>\n"
+      ".decl IN_F1 v_type=G type=F  num_elts=16 alias=<%2,0>\n"
+      ".decl OUT_UB v_type=G type=UB num_elts=32 alias=<%0,0>\n"
+      ".decl TMP_HF v_type=G type=HF num_elts=32 align=32\n"
+      "mov  (M1, 16) TMP_HF(0,0)<1> IN_F0(0,0)<1;1,0>\n"
+      "mov  (M1, 16) TMP_HF(0,16)<1> IN_F1(0,0)<1;1,0>\n"
+      "fcvt (M1_NM, 32) OUT_UB(0,0)<1> TMP_HF(0,0)<1;1,0>\n"
+      "}\n"
+      : "=rw"(dst)
+      : "rw"(src0), "rw"(src1));
+}
+
+CUTE_DEVICE
+void cvt_f32x2_to_e4m3x2_pack(
+    float const& src0, float const& src1, cute::intel::uchar2& dst) {
+  asm(
+      "{\n"
+      ".decl IN_F0 v_type=G type=F num_elts=16 alias=<%1,0>\n"
+      ".decl IN_F1 v_type=G type=F num_elts=16 alias=<%2,0>\n"
+      ".decl OUT_B v_type=G type=B num_elts=32 alias=<%0,0>\n"
+      ".decl TMP_HF v_type=G type=HF num_elts=32 align=32\n"
+      "mov  (M1, 16) TMP_HF(0,0)<1> IN_F0(0,0)<1;1,0>\n"
+      "mov  (M1, 16) TMP_HF(0,16)<1> IN_F1(0,0)<1;1,0>\n"
+      "fcvt (M1_NM, 32) OUT_B(0,0)<1> TMP_HF(0,0)<1;1,0>\n"
+      "}\n"
+      : "=rw"(dst)
+      : "rw"(src0), "rw"(src1));
+}
 #else
 CUTE_DEVICE
 void
@@ -118,7 +157,109 @@ cvt_f32x2_to_bf16x2_pack(cute::intel::uint2     const& /*tmp*/,
 {
   CUTE_INVALID_CONTROL_PATH("cvt_f32x2_to_bf16x2_pack requires Intel Xe SYCL device target");
 }
+CUTE_DEVICE
+void cvt_f32x2_to_e5m2x2_pack(
+    float const& /*src0*/, float const& /*src1*/, cute::intel::uchar2& /*dst*/) {
+  CUTE_INVALID_CONTROL_PATH(
+      "cvt_f32x2_to_e5m2x2_pack requires Intel Xe SYCL device target");
+}
+CUTE_DEVICE
+void cvt_f32x2_to_e4m3x2_pack(
+    float const& /*src0*/, float const& /*src1*/, cute::intel::uchar2& /*dst*/) {
+  CUTE_INVALID_CONTROL_PATH(
+      "cvt_f32x2_to_e4m3x2_pack requires Intel Xe SYCL device target");
+}
 #endif
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Reorder/convert the f32 softmax output (tSrS) into the fp8 P*V GEMM A operand
+// (tArP) for the full-fp8 datapath. When ElementP is fp8 (e4m3/e5m2) and the
+// per-work-item reorder layout matches the fused-pack layout, use the
+// subgroup-vectorized cvt primitives; otherwise fall back to the generic
+// cute::reorder. Non-fp8 ElementP is not handled here (the bf16 P path uses the
+// dedicated cvt_f32x2_to_bf16x2_* primitives inline in the mainloop).
+/////////////////////////////////////////////////////////////////////////////////////////////////
+template <class ElementP, class FragS, class FragP>
+CUTLASS_DEVICE void reorder_to_P_fp8(FragS& tSrS, FragP& tArP) {
+  using ElementS = cute::remove_cvref_t<decltype(tSrS(0))>;
+  auto p_sl0 = cute::detail::subbyte_sg_tv_swizzle<ElementS>(
+      project_strides(tSrS.tv_layout()));
+  auto p_dl0 = cute::detail::subbyte_sg_tv_swizzle<ElementP>(
+      project_strides(tArP.tv_layout()));
+  using PReorderLayout =
+      decltype(coalesce(composition(right_inverse(p_dl0), p_sl0)));
+  constexpr int kNumP = decltype(tArP.size())::value;
+  using DecodePackLayout =
+      Layout<Shape<_16, C<kNumP / 2>, _2>, Stride<_1, _32, _16>>;
+  constexpr bool kCanUseE5M2PackedReorder =
+      std::is_same_v<ElementP, cutlass::float_e5m2_t> &&
+      (std::is_same_v<
+           PReorderLayout,
+           Layout<Shape<_16, _16, _2, _2>, Stride<_1, _32, _16, _512>>> ||
+       std::is_same_v<
+           PReorderLayout,
+           Layout<Shape<_16, _16, _2, _4>, Stride<_1, _32, _16, _512>>>);
+  constexpr bool kCanUseE4M3PackedReorder =
+      std::is_same_v<ElementP, cutlass::float_e4m3_t> &&
+      (std::is_same_v<
+           PReorderLayout,
+           Layout<Shape<_16, _16, _2, _2>, Stride<_1, _32, _16, _512>>> ||
+       std::is_same_v<
+           PReorderLayout,
+           Layout<Shape<_16, _16, _2, _4>, Stride<_1, _32, _16, _512>>>);
+  constexpr bool kCanUseE5M2DecodePack =
+      std::is_same_v<ElementP, cutlass::float_e5m2_t> &&
+      std::is_same_v<PReorderLayout, DecodePackLayout>;
+  constexpr bool kCanUseE4M3DecodePack =
+      std::is_same_v<ElementP, cutlass::float_e4m3_t> &&
+      std::is_same_v<PReorderLayout, DecodePackLayout>;
+
+  if constexpr (kCanUseE5M2PackedReorder) {
+    static_assert(
+        decltype(tArP.size())::value % 64 == 0,
+        "Packed e5m2 reorder expects a multiple of 64 per-WI P elements");
+    constexpr int kBlocks = kNumP / 32;
+    Tensor tArP_pair = recast<cute::intel::uchar2>(tArP);
+    CUTLASS_PRAGMA_UNROLL
+    for (int g = 0; g < kBlocks; g++) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int p = 0; p < 16; p++) {
+        cvt_f32x2_to_e5m2x2_pack(
+            tSrS(g * 32 + p), tSrS(g * 32 + p + 16), tArP_pair(g * 16 + p));
+      }
+    }
+  } else if constexpr (kCanUseE4M3PackedReorder) {
+    static_assert(
+        decltype(tArP.size())::value % 64 == 0,
+        "Packed e4m3 reorder expects a multiple of 64 per-WI P elements");
+    constexpr int kBlocks = kNumP / 32;
+    Tensor tArP_pair = recast<cute::intel::uchar2>(tArP);
+    CUTLASS_PRAGMA_UNROLL
+    for (int g = 0; g < kBlocks; g++) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int p = 0; p < 16; p++) {
+        cvt_f32x2_to_e4m3x2_pack(
+            tSrS(g * 32 + p), tSrS(g * 32 + p + 16), tArP_pair(g * 16 + p));
+      }
+    }
+  } else if constexpr (kCanUseE5M2DecodePack) {
+    constexpr int kHalf = kNumP / 2;
+    Tensor tArP_pair = recast<cute::intel::uchar2>(tArP);
+    CUTLASS_PRAGMA_UNROLL
+    for (int p = 0; p < kHalf; p++) {
+      cvt_f32x2_to_e5m2x2_pack(tSrS(p), tSrS(p + kHalf), tArP_pair(p));
+    }
+  } else if constexpr (kCanUseE4M3DecodePack) {
+    constexpr int kHalf = kNumP / 2;
+    Tensor tArP_pair = recast<cute::intel::uchar2>(tArP);
+    CUTLASS_PRAGMA_UNROLL
+    for (int p = 0; p < kHalf; p++) {
+      cvt_f32x2_to_e4m3x2_pack(tSrS(p), tSrS(p + kHalf), tArP_pair(p));
+    }
+  } else {
+    reorder(tSrS, tArP);
+  }
+}
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -255,6 +396,12 @@ struct FMHAFwdMainloop<
 
   static constexpr bool Fp8KV =
       is_any_of_v<ElementK, float_e5m2_t, float_e4m3_t>;
+  // Full-fp8 path: the query is also fp8, so the Q*K DPAS GEMM runs natively in
+  // fp8. The per-tensor q/k descales are folded into the softmax scale and the
+  // softmax exponent is biased (see softmax()) so the packed P operand fits the
+  // fp8 dynamic range.
+  static constexpr bool Fp8Q =
+      is_any_of_v<ElementQ, float_e5m2_t, float_e4m3_t>;
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PagedKV = PagedKV_;
@@ -264,6 +411,7 @@ struct FMHAFwdMainloop<
     ElementS const scale;
     void* const scale_k;
     void* const scale_v;
+    void* const scale_q;
 
     // Paged KV Cache
     const int* ptr_page_table;
@@ -298,6 +446,7 @@ struct FMHAFwdMainloop<
         val,
         args.scale_k,
         args.scale_v,
+        args.scale_q,
         args.ptr_page_table,
         args.page_size,
         args.max_pages_per_seq,
@@ -482,10 +631,23 @@ struct FMHAFwdMainloop<
     bool check_remainder_k = (seq_len % tile_k != 0);
 
     // FP8 KV Scale: Currently we only support per-tensor scale for KV
+    ElementS effective_scale = params.scale;
     float scale_k = 1.f, scale_v = 1.f;
     if constexpr (Fp8KV) {
       scale_k = *static_cast<const float*>(params.scale_k);
       scale_v = *static_cast<const float*>(params.scale_v);
+    }
+    // Full-fp8: fold the per-tensor q/k descales into the softmax scale (S = Q·K
+    // is linear in Q and K) and defer scale_v to a single post-loop output
+    // rescale (O = sum P_i·V_i is linear in V). K/V are then consumed directly
+    // as fp8 by the DPAS GEMMs, so the per-element dequantize is skipped.
+    if constexpr (Fp8Q) {
+      effective_scale = params.scale * ElementS(scale_k);
+      if (params.scale_q != nullptr) {
+        effective_scale =
+            effective_scale *
+            ElementS(*static_cast<const float*>(params.scale_q));
+      }
     }
 
     constexpr int kAtomsPerD =
@@ -524,7 +686,7 @@ struct FMHAFwdMainloop<
         update_payloads(prepared_k[D], page_offset);
         reorder(tKrK, tSrK);
 
-        if constexpr (Fp8KV) {
+        if constexpr (Fp8KV && !Fp8Q) {
           dequantize(tSrK, scale_k);
         }
 
@@ -570,16 +732,22 @@ struct FMHAFwdMainloop<
       }
       /* k masking for remainder tiles */
       if (check_remainder_k && K == blk_k1 - 1) {
-        FragSCol k_rem_mask;
-        int k = get<0>(tKgK(0, 0, 0, K, 0)) + get_sub_group().get_local_id()[0];
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
-          k_rem_mask(i) =
-              (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
-        }
+        // Mask KV columns that fall past the logical sequence length. Derive the
+        // per-element column coordinate from the MMA C partition (the same layout
+        // as tSrS) rather than from the copy-K partition + broadcast: the copy
+        // and MMA-output subgroup layouts need not agree on how lanes map to KV
+        // columns, and a mismatch would mask the wrong columns (leaving garbage
+        // scores in the remainder that inflate the softmax row-max -> P == 0 ->
+        // inf). This mirrors the LocalMask/CausalMask coordinate handling above.
+        Tensor cKrem = make_identity_tensor(make_shape(seq_len, seq_len));
+        Tensor gKrem = local_tile(
+            cKrem, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+        auto cS_rem = thr_mma_qk.partition_C(gKrem);
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < tSrS.size(); i++) {
-          tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
+          if (get<1>(cS_rem(i)) >= seq_len) {
+            tSrS(i) = ElementS(-INFINITY);
+          }
         }
       }
       /* Local masking */
@@ -605,7 +773,7 @@ struct FMHAFwdMainloop<
       }
 
       /* Apply softmax (deferred row-sum hreduce) */
-      auto [rescale, tS_partial_sum] = softmax(tSrS, tA_max, tA_sum);
+      auto [rescale, tS_partial_sum] = softmax(effective_scale, tSrS, tA_max, tA_sum);
       auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
       constexpr int kSumSize = decltype(tA_sum.size())::value;
       constexpr bool kSumDivVT = (kSumSize % VTiles == 0);
@@ -628,7 +796,7 @@ struct FMHAFwdMainloop<
         }
       }
       else {
-        reorder(tSrS, tArP);
+        reorder_to_P_fp8<ElementP>(tSrS, tArP);
       }
 
       /* GEMM 2: A += P * V, split in v dimension.
@@ -653,12 +821,20 @@ struct FMHAFwdMainloop<
                         tS_partial_sum(i);
           }
         }
-        if constexpr (Fp8KV) {
+        if constexpr (Fp8KV && !Fp8Q) {
           dequantize(tArV, scale_v);
         }
         cute::gemm(mma_pv, tArP, tArV, tArA(_,_,_,VV));
       }
 
+    }
+
+    // Full-fp8: apply the deferred per-tensor V scale once after the K loop.
+    if constexpr (Fp8Q) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tArA.size(); ++i) {
+        tArA(i) *= ElementA(scale_v);
+      }
     }
   }
 
@@ -668,9 +844,18 @@ struct FMHAFwdMainloop<
   // is collapsed once in the epilogue (reduce<0, Horizontal>).
   CUTLASS_DEVICE
   auto softmax(
+      ElementS scale,             // Effective softmax scale (fp8 q/k descales folded in)
       FragS& tS,                  // Softmax src/dst block
       FragARow& tA_max,           // Softmax row-wise max accumulator
       FragSPartialRow& tA_sum) {  // Softmax row-wise partial sum (per-lane)
+
+    // Full-fp8: bias the softmax exponent by +8 so the (unnormalized) P block
+    // is scaled by 2^8 = 256 into a range better represented by fp8. The bias
+    // is applied uniformly to every element of P and cancels in the final
+    // O = (P·V) / rowsum(P) normalization (both numerator and denominator carry
+    // the same 256 factor). It is excluded from the running max so the online
+    // rescale factors are unaffected.
+    constexpr ElementS kFp8ExpOffset = Fp8Q ? ElementS(8) : ElementS(0);
 
     /* Compute row-wise maxima for this block */
     auto tS_bmax =
@@ -680,7 +865,7 @@ struct FMHAFwdMainloop<
     FragARow rescale;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tA_max.size(); i++) {
-      ElementS new_max = sycl::max(tA_max(i), params.scale * tS_bmax(i));
+      ElementS new_max = sycl::max(tA_max(i), scale * tS_bmax(i));
       rescale(i) = sycl::native::exp2(tA_max(i) - new_max);
       tA_max(i) = new_max;
     }
@@ -688,7 +873,7 @@ struct FMHAFwdMainloop<
     /* Scale S and subtract maxima, then exponentiate */
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS.size(); i++)
-      tS(i) = params.scale * tS(i) - broadcast<0>(tA_max, tS, i);
+      tS(i) = scale * tS(i) - broadcast<0>(tA_max, tS, i) + kFp8ExpOffset;
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS.size(); i++)
@@ -833,16 +1018,23 @@ struct DecodeFwdMainloop<
   // static_assert(is_same_v<decltype(FragSRow{}.shape()), float>, "dtype
   // mismatched");
   using ElementA = typename TiledMMAPV::ValTypeD;
+  using ElementP = typename TiledMMAPV::ValTypeA;
 
   static constexpr bool PagedKV = PagedKV_;
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool Fp8KV =
       is_any_of_v<ElementK, float_e5m2_t, float_e4m3_t>;
+  // True for the full-fp8 path (fp8 Q -> fp8 Q*K and fp8 P*V GEMMs). In that
+  // case the softmax applies a +8 exponent offset so the probabilities span a
+  // range better represented by fp8 (see softmax()).
+  static constexpr bool Fp8Q =
+      is_any_of_v<ElementQ, float_e5m2_t, float_e4m3_t>;
   static constexpr bool LocalMask = LocalMask_;
 
   // User-facing arguments
   struct Arguments {
     ElementS const scale;
+    void* const scale_q;
     void* const scale_k;
     void* const scale_v;
     // Paged KV Cache
@@ -877,6 +1069,7 @@ struct DecodeFwdMainloop<
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
     return Params{
         val,
+        args.scale_q,
         args.scale_k,
         args.scale_v,
         args.ptr_page_table,
@@ -1024,11 +1217,26 @@ struct DecodeFwdMainloop<
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
 
-    // FP8 KV Scale: Currently we only support per-tensor scale for KV
-    float scale_k = 1.f, scale_v = 1.f;
+    // FP8 KV Scale (per-tensor): fold scale_k into the softmax scale and
+    // defer scale_v to a single post-loop output rescale. Mathematically
+    // identical to per-element K/V rescaling (S = Q·K is linear in K and
+    // O = sum P_i·V_i is linear in V), but removes both rescales from the
+    // inner loop. The remaining fp8 -> ElementQ conversion is performed by
+    // reorder() using the subgroup-vectorized cast primitive.
+    ElementS effective_scale = params.scale;
+    float scale_v = 1.f;
     if constexpr (Fp8KV) {
-      scale_k = *static_cast<const float*>(params.scale_k);
+      const float scale_k = *static_cast<const float*>(params.scale_k);
       scale_v = *static_cast<const float*>(params.scale_v);
+      effective_scale = params.scale * ElementS(scale_k);
+    }
+    // FP8 Q Scale (per-tensor): fold the q descale into the softmax scale too,
+    // mirroring scale_k. Null pointer means an identity (1.0) descale.
+    if constexpr (Fp8Q) {
+      if (params.scale_q != nullptr) {
+        const float scale_q = *static_cast<const float*>(params.scale_q);
+        effective_scale = effective_scale * ElementS(scale_q);
+      }
     }
 
     /* Main loop, blocked in k. */
@@ -1049,13 +1257,9 @@ struct DecodeFwdMainloop<
         copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
 
         reorder(tQrQ, tSrQ);
+        // reorder() performs the (vectorized) fp8 -> ElementQ cast; the
+        // per-tensor scale_k has been folded into effective_scale above.
         reorder(tKrK, tSrK);
-        if constexpr (Fp8KV) {
-          for (int i = 0; i < tSrK.size(); ++i) {
-            tSrK(i) =
-                static_cast<ElementQ>(scale_k * static_cast<float>(tSrK(i)));
-          }
-        }
 
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
@@ -1118,21 +1322,16 @@ struct DecodeFwdMainloop<
       }
 
       /* Apply softmax and scaling */
-      softmax(K == blk_k0, tSrS, tA_max, tA_sum, tArA);
-      reorder(tSrS, tArP);
+      softmax(effective_scale, K == blk_k0, tSrS, tA_max, tA_sum, tArA);
+      reorder_to_P_fp8<ElementP>(tSrS, tArP);
 
       /* GEMM 2: A += P * V, split in v dimension */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
         copy(copy_v, tVgV_cache(_, _, _, VV), tVrV);
+        // reorder() performs the (vectorized) fp8 -> ElementQ cast; the
+        // per-tensor scale_v is applied once after the K loop below.
         reorder(tVrV, tArV);
-        if constexpr (Fp8KV) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tArV.size(); ++i) {
-            tArV(i) =
-                static_cast<ElementQ>(scale_v * static_cast<float>(tArV(i)));
-          }
-        }
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
 
@@ -1146,8 +1345,8 @@ struct DecodeFwdMainloop<
         if (next_page_local_idx < params.max_pages_per_seq) {
           int next_block_idx =
               params.ptr_page_table[b_offset + next_page_local_idx];
-          next_tile_idx =
-              next_block_idx * page_stride_tiles + next_tile_idx % tiles_per_page;
+          next_tile_idx = next_block_idx * page_stride_tiles +
+                          next_tile_idx % tiles_per_page;
         } else {
           // set to last page
           next_tile_idx = params.max_pages_per_seq * tiles_per_page - 1;
@@ -1162,11 +1361,20 @@ struct DecodeFwdMainloop<
 
       // barrier_wait(ScopeWorkgroup);
     }
+
+    // Apply the per-tensor V scale once after the K loop.
+    if constexpr (Fp8KV) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tArA.size(); ++i) {
+        tArA(i) *= ElementA(scale_v);
+      }
+    }
   }
 
   // Single step of blocked softmax.
   CUTLASS_DEVICE
   void softmax(
+      ElementS scale,    // Effective softmax scale (fp8 K scale folded in)
       bool first_block,  // First softmax block?
       FragS& tS,         // Softmax src/dst block
       FragSRow& tS_max,  // Softmax row-wise max accumulator
@@ -1180,14 +1388,27 @@ struct DecodeFwdMainloop<
     auto tS_prev_max = tS_max;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS_max.size(); i++) {
-      tS_max(i) = sycl::max(tS_max(i), params.scale * tS_bmax(i));
+      tS_max(i) = sycl::max(tS_max(i), scale * tS_bmax(i));
     }
 
-    /* Scale S and subtract maxima, then exponentiate */
+    /* Scale S and subtract maxima, then exponentiate. For the full-fp8 path
+     * (fp8 P*V GEMM) add an exponent offset of +8, i.e. multiply every
+     * probability by 2^8 = 256:
+     *
+     *   P_fp8 = exp2(scale*S - max + 8) = 256 * exp2(scale*S - max)
+     *
+     * This lifts the softmax probabilities (which would otherwise lie in
+     * (0, 1]) into a range better represented by fp8, reducing underflow when
+     * P is cast to fp8 for the P*V GEMM. The same 256 factor multiplies the
+     * row sums (tS_sum, accumulated below from these values) and the O
+     * accumulator, so it cancels exactly in the final reciprocal-sum
+     * normalization. The per-block max-rescale (exp2(prev_max - max)) is a
+     * difference of maxima and is unaffected by the constant offset. */
+    constexpr ElementS kFp8ExpOffset = Fp8Q ? ElementS(8) : ElementS(0);
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS.size(); i++)
       tS(i) = sycl::native::exp2(
-          params.scale * tS(i) - broadcast<0>(tS_max, tS, i));
+          scale * tS(i) - broadcast<0>(tS_max, tS, i) + kFp8ExpOffset);
 
     /* Rescale existing S sums and O accumulator */
     if (!first_block) {
