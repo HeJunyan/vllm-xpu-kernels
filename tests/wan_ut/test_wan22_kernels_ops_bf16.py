@@ -2843,7 +2843,8 @@ class TestConv1x1Kernels:
 
         shape_info = {
             "batch": 1, "in_channels": 4, "out_channels": 8,
-            "kernel_h": 1, "kernel_w": 1, "output_h": 16, "output_w": 16,
+            "kernel_d": 1, "kernel_h": 1, "kernel_w": 1,
+            "output_d": 1, "output_h": 16, "output_w": 16,
             "input_size": 1 * 4 * 1 * 16 * 16, "weight_size": 8 * 4,
             "output_size": 1 * 8 * 1 * 16 * 16,
         }
@@ -2866,7 +2867,8 @@ class TestConv1x1Kernels:
 
         shape_info = {
             "batch": 1, "in_channels": 4, "out_channels": 8,
-            "kernel_h": 1, "kernel_w": 1, "output_h": 32, "output_w": 32,
+            "kernel_d": 1, "kernel_h": 1, "kernel_w": 1,
+            "output_d": 1, "output_h": 32, "output_w": 32,
             "input_size": 1 * 4 * 1 * 32 * 32, "weight_size": 8 * 4,
             "output_size": 1 * 8 * 1 * 32 * 32,
         }
@@ -2889,7 +2891,8 @@ class TestConv1x1Kernels:
 
         shape_info = {
             "batch": 1, "in_channels": 256, "out_channels": 512,
-            "kernel_h": 1, "kernel_w": 1, "output_h": 180, "output_w": 320,
+            "kernel_d": 1, "kernel_h": 1, "kernel_w": 1,
+            "output_d": 1, "output_h": 180, "output_w": 320,
             "input_size": 1 * 256 * 1 * 180 * 320, "weight_size": 512 * 256,
             "output_size": 1 * 512 * 1 * 180 * 320,
         }

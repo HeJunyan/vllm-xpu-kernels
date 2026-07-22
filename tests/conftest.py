@@ -262,9 +262,10 @@ def pytest_runtest_setup(item):
         if not require_torch_ops("_C.rms_norm"):
             pytest.skip("torch.ops._C operations not registered - run build steps from CLAUDE.md")
 
-    # Skip flash_attn tests if _xpu_C ops aren't available
+    # Skip flash_attn tests if the fa2 ops aren't available
     if test_module.startswith('tests.flash_attn'):
-        pytest.skip("torch.ops._xpu_C operations not registered - run build steps from CLAUDE.md")
+        if not require_torch_ops("_vllm_fa2_C.varlen_fwd"):
+            pytest.skip("torch.ops._vllm_fa2_C operations not registered - run build steps from CLAUDE.md")
 
     # Skip moe tests if _moe_C ops aren't available
     if 'moe' in test_module:

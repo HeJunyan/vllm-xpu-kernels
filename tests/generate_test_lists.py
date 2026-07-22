@@ -137,6 +137,25 @@ def dedup_po_tests(tests: list[str], keep_seq_lens: list[int]) -> list[str]:
         if "test_wan22_kernels_mini.py" in t:
             continue
 
+        # Skip combos the flash_attn varlen test itself skips at runtime:
+        # non-contiguous Q/K/V (stride_pad>0) with an FP8 KV cache or a quantized
+        # query is "not tested" (see test_flash_attn_varlen_func.py). The node id
+        # for test_varlen_with_paged_kv is
+        #   [stride_pad-fp8_dtype-is_paged-is_casual-is_sink-q_dtype-...].
+        # Drop the ones that would only skip so they don't pollute the PO list.
+        if "test_varlen_with_paged_kv" in t and "[" in t:
+            params = t.split("[", 1)[1].rstrip("]").split("-")
+            # params[0]=stride_pad, [1]=fp8_dtype, [5]=q_dtype ("_None_" == None)
+            if len(params) > 5:
+                stride_pad = params[0]
+                fp8_dtype = params[1]
+                q_dtype = params[5]
+                noncontig = stride_pad not in ("0", "")
+                has_fp8 = fp8_dtype not in ("_None_", "None", "")
+                has_qdtype = q_dtype not in ("_None_", "None", "")
+                if noncontig and (has_fp8 or has_qdtype):
+                    continue
+
         # Skip non-first num_heads variants
         if "num_heads" in t:
             m = re.search(r"num_heads(\d+)", t)

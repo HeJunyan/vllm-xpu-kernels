@@ -25,7 +25,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytestmark = pytest.mark.skip(reason="WAN torch.compile tests are not stable for CI")
+import os
+# These torch.compile tests are unstable on CI, so they are skipped by default.
+# Opt in by exporting RUN_WAN_TORCH_COMPILE=1 to actually run them.
+pytestmark = pytest.mark.skipif(
+    os.environ.get("RUN_WAN_TORCH_COMPILE", "0") != "1",
+    reason="WAN torch.compile tests are not stable for CI "
+           "(set RUN_WAN_TORCH_COMPILE=1 to run)")
 
 SKIP_IN_MINI_SCOPE = True
 
