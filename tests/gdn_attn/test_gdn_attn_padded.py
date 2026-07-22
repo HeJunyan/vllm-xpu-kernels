@@ -25,6 +25,11 @@ import torch
 
 import vllm_xpu_kernels._xpu_C  # noqa: F401
 
+pytestmark = pytest.mark.skipif(
+    not torch.xpu.is_available() or
+    (not torch.ops._xpu_C.is_bmg(0) and not torch.ops._xpu_C.is_pvc(0)),
+    reason="XE2 CUTLASS tests only run on BMG or PVC.")
+
 
 def _build_inputs(num_actual_tokens, padded_size, dtype, device):
     """Allocate a minimal decode-only call shape with a padded leading dim."""
