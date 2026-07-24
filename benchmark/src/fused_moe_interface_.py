@@ -163,8 +163,9 @@ def xpu_fused_moe_CalKernelTime(hidden_states,
         start_event_gemm1.record()
     torch.ops._xpu_C.cutlass_grouped_gemm_interface(
         ptr_A=remapped_hidden_states,
+        ptr_A_scale=None,
         ptr_B=input_B,
-        ptr_scales=gemm1_scales,
+        ptr_B_scale=gemm1_scales,
         ptr_bias=w13_bias,
         ptr_D=gemm1_output,
         rows_per_expert=rows_per_expert,
@@ -201,8 +202,9 @@ def xpu_fused_moe_CalKernelTime(hidden_states,
         start_event_gemm2.record()
     torch.ops._xpu_C.cutlass_grouped_gemm_interface(
         ptr_A=input_A,
+        ptr_A_scale=None,
         ptr_B=input_B,
-        ptr_scales=gemm2_scales,
+        ptr_B_scale=gemm2_scales,
         ptr_bias=w2_bias,
         ptr_D=gemm2_output,
         rows_per_expert=rows_per_expert,
