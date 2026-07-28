@@ -735,11 +735,6 @@ if(FA2_KERNELS_ENABLED)
     LIBRARIES
     ${ATTN_KERNEL_LIB_NAME}
     WITH_SOABI)
-  # add FLAG for profiling queue creation
-  if(BUILD_ON_SIMULATOR_CRI)
-    target_compile_definitions(_vllm_fa2_C
-                               PRIVATE CUTLASS_SYCL_PROFILING_ENABLED)
-  endif()
 endif()
 
 #
