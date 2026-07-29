@@ -74,8 +74,8 @@ struct chunk_policy_head96 {
 
 struct chunk_policy_head128 {
 #ifdef VLLM_XPU_ENABLE_XE2
-  using ShapeQK = Shape<_256, _64, _64>;
-  using ShapePV = Shape<_256, _64, _64>;
+  using ShapeQK = Shape<_256, _32, _32>;
+  using ShapePV = Shape<_256, _32, _32>;
   using ShapeOut = Shape<_256, _128>;
   using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
 #endif
