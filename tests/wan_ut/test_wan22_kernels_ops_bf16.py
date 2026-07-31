@@ -178,9 +178,12 @@ def estimate_test_memory_mb(op_type, shape_info):
 
         qkv_bytes = 3 * batch * num_heads * seq_len * head_dim * dtype_bytes
         output_bytes = batch * num_heads * seq_len * head_dim * dtype_bytes
-        attn_scores_bytes = batch * num_heads * seq_len * seq_len * dtype_bytes
 
-        total_bytes = qkv_bytes + output_bytes + attn_scores_bytes
+        # Flash attention computes softmax in tiles and never materializes the
+        # seq_len x seq_len scores matrix, so it must not be counted here. At
+        # SEQ_LEN=75600 x 40 heads that phantom term is ~426GB and would skip
+        # every flash_attn test even though the real footprint is ~3GB.
+        total_bytes = qkv_bytes + output_bytes
         return total_bytes / (1024 ** 2)
 
     elif op_type == "elementwise":
@@ -1620,12 +1623,15 @@ class TestNormalizationOps:
 
             def prepare():
                 hidden_states = torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_DIM, device="cpu", dtype=torch.bfloat16)
-                timestep_emb = torch.randn(BATCH_SIZE, HIDDEN_DIM, device="cpu", dtype=torch.bfloat16)
+                # AdaLayerNorm computes layernorm(x) * (1 + scale) + shift, so it
+                # takes separate scale/shift tensors that broadcast over SEQ_LEN.
+                scale = torch.randn(BATCH_SIZE, 1, HIDDEN_DIM, device="cpu", dtype=torch.bfloat16)
+                shift = torch.randn(BATCH_SIZE, 1, HIDDEN_DIM, device="cpu", dtype=torch.bfloat16)
                 ada_norm = AdaLayerNorm(HIDDEN_DIM).to("cpu").to(torch.bfloat16)
-                return {"hidden_states": hidden_states, "timestep_emb": timestep_emb}, ada_norm
+                return {"hidden_states": hidden_states, "scale": scale, "shift": shift}, ada_norm
 
             def compute(tensors, operation):
-                return operation.forward_xpu(tensors["hidden_states"], tensors["timestep_emb"])
+                return operation.forward_xpu(tensors["hidden_states"], tensors["scale"], tensors["shift"])
 
             shape_info = {"elements": BATCH_SIZE * SEQ_LEN * HIDDEN_DIM}
 
@@ -1959,8 +1965,11 @@ class TestRoPEOps:
 
             def prepare():
                 q = torch.randn(BATCH_SIZE * SEQ_LEN, NUM_HEADS, HEAD_DIM, device="cpu", dtype=torch.bfloat16)
-                cos = torch.randn(SEQ_LEN, HEAD_DIM, device="cpu", dtype=torch.bfloat16)
-                sin = torch.randn(SEQ_LEN, HEAD_DIM, device="cpu", dtype=torch.bfloat16)
+                # RoPE splits the head dim into (HEAD_DIM // 2) rotated pairs, so
+                # cos/sin are half-width and carry a head axis to broadcast over.
+                rope_dim = HEAD_DIM // 2
+                cos = torch.randn(BATCH_SIZE * SEQ_LEN, 1, rope_dim, device="cpu", dtype=torch.bfloat16)
+                sin = torch.randn(BATCH_SIZE * SEQ_LEN, 1, rope_dim, device="cpu", dtype=torch.bfloat16)
                 rope = RotaryEmbeddingWan()
                 return {"q": q, "cos": cos, "sin": sin}, rope
 

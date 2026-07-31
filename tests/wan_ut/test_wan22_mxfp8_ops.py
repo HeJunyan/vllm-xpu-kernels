@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 MXFP8 Quantized GEMM tests for WAN 2.2
 Tests MXFP8 W8A8 quantization with same shapes as BF16 linear operations
@@ -225,11 +226,14 @@ def benchmark_mxfp8_gemm(name, batch, seq_len, in_features, out_features, profil
 
     Workflow:
     1. Prepare BF16 inputs and weights on CPU
-    2. Transfer to XPU (not measured)
-    3. Benchmark: Quantize to MXFP8 + fp8_gemm kernel (measured together)
+    2. Quantize to MXFP8 on CPU and transfer to XPU (not measured)
+    3. Benchmark: fp8_gemm kernel only (measured)
 
-    Note: Quantization is included in benchmark timing as it's part of the
-    actual computation workload in production inference.
+    Note: quantization runs on CPU and is excluded from the timing, following
+    tests/test_fp8_gemm_onednn.py::test_mxfp8_gemm. Quantizing on XPU makes
+    oneDNN hang while creating the GEMM primitive (CL_INVALID_DEVICE), so the
+    reported numbers are kernel-only and are not comparable to a production
+    quantize+GEMM measurement.
     """
     # Check if test should be skipped due to memory constraints
     expected_memory_mb = estimate_mxfp8_memory_mb(batch, seq_len, in_features, out_features)
@@ -246,22 +250,40 @@ def benchmark_mxfp8_gemm(name, batch, seq_len, in_features, out_features, profil
     inputs_bf16 = torch.randn((m, k), dtype=torch.bfloat16, device="cpu") * 0.01
     weights_bf16 = torch.randn((n, k), dtype=torch.bfloat16, device="cpu") * 0.01
 
-    # Step 2: Transfer to XPU (not measured)
-    inputs_bf16_xpu = inputs_bf16.to("xpu")
-    weights_bf16_xpu = weights_bf16.to("xpu")
+    # Step 2: Quantize to MXFP8 on CPU, then transfer (not measured).
+    #
+    # This mirrors tests/test_fp8_gemm_onednn.py::test_mxfp8_gemm, which keeps
+    # DEVICE="cpu" for tensor prep + to_mxfp and only moves to KERNEL_DEVICE
+    # ("xpu") at the fp8_gemm call. Running to_mxfp on XPU instead produces
+    # inputs that oneDNN cannot build a primitive for: it fails with
+    # CL_INVALID_DEVICE (errcode -33, src/xpu/ocl/utils_shared.cpp:288) and
+    # retries forever, so the test never completes. Same shapes, same values --
+    # only the device the quantization ran on differs.
+    #
+    # The weight scale is transposed to match the transposed weight, exactly as
+    # test_mxfp8_gemm does with weights_scale.t().contiguous().
+    inputs_lp_cpu, inputs_scale_cpu = _convert_to_mxfp8(inputs_bf16)
+    weights_lp_cpu, weights_scale_cpu = _convert_to_mxfp8(weights_bf16)
+    weights_t_cpu = weights_lp_cpu.transpose(0, 1)
+    weights_scale_t_cpu = weights_scale_cpu.t().contiguous()
+
+    def _to_xpu_operands():
+        """Fresh XPU copies of the quantized operands."""
+        return (
+            inputs_lp_cpu.to("xpu"),
+            weights_t_cpu.to("xpu"),
+            inputs_scale_cpu.to("xpu"),
+            weights_scale_t_cpu.to("xpu"),
+        )
 
     # Reset peak memory stats before measurement
     torch.xpu.empty_cache()
     torch.xpu.reset_peak_memory_stats()
 
-    # Step 3: Warmup (including quantization)
+    # Step 3: Warmup
     if BENCHMARK_MODE:
         for _ in range(WARMUP):
-            # Quantize
-            inputs_lp, inputs_scale = _convert_to_mxfp8(inputs_bf16_xpu)
-            weights_lp, weights_scale = _convert_to_mxfp8(weights_bf16_xpu)
-            weights_t = weights_lp.transpose(0, 1).contiguous()
-            # GEMM
+            inputs_lp, weights_t, inputs_scale, weights_scale = _to_xpu_operands()
             output = fp8_gemm(
                 inputs_lp,
                 weights_t,
@@ -272,24 +294,21 @@ def benchmark_mxfp8_gemm(name, batch, seq_len, in_features, out_features, profil
             )
             torch.xpu.synchronize()
             # Free memory immediately
-            del inputs_lp, inputs_scale, weights_lp, weights_scale, weights_t, output
+            del inputs_lp, inputs_scale, weights_t, weights_scale, output
             torch.xpu.empty_cache()
 
-    # Step 4: Benchmark (including quantization in timing)
+    # Step 4: Benchmark the GEMM (h2d transfer of the quantized operands is
+    # done before timing starts, so only the kernel is measured)
     latencies = []
     num_runs = RUNS if BENCHMARK_MODE else 1
     for _ in range(num_runs):
+        inputs_lp_xpu, weights_t_xpu, inputs_scale_xpu, weights_scale_xpu = (
+            _to_xpu_operands())
         torch.xpu.synchronize()
         start = torch.xpu.Event(enable_timing=True)
         end = torch.xpu.Event(enable_timing=True)
 
         start.record()
-        # Quantize to MXFP8 (measured)
-        inputs_lp_xpu, inputs_scale_xpu = _convert_to_mxfp8(inputs_bf16_xpu)
-        weights_lp_xpu, weights_scale_xpu = _convert_to_mxfp8(weights_bf16_xpu)
-        weights_t_xpu = weights_lp_xpu.transpose(0, 1).contiguous()
-
-        # GEMM (measured)
         output = fp8_gemm(
             inputs_lp_xpu,
             weights_t_xpu,
@@ -308,7 +327,7 @@ def benchmark_mxfp8_gemm(name, batch, seq_len, in_features, out_features, profil
         assert output.shape == expected_shape, f"Output shape {output.shape} != expected {expected_shape}"
 
         # Free memory immediately after timing
-        del inputs_lp_xpu, inputs_scale_xpu, weights_lp_xpu, weights_scale_xpu, weights_t_xpu, output
+        del inputs_lp_xpu, inputs_scale_xpu, weights_t_xpu, weights_scale_xpu, output
         torch.xpu.empty_cache()
 
     # Calculate metrics
