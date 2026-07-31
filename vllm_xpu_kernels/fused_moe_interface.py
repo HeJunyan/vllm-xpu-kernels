@@ -462,33 +462,23 @@ def quant_mxfp_act(x, recipe):
 
 
 def reorder_mxfp_scales(A_scales, rows_per_expert):
-    # After cutlass-sycl PR #570, the optimized mxfp mainloop requires per-expert
-    # scale-A surface width (M dim, since scale is MN-major) to be a multiple of
-    # 4 (ScaleAlignElems for 8-bit scales). Pad each expert's M up to a multiple
-    # of 4 with zeros so the cumulative scale offsets used by the grouped-gemm
-    # kernel (sum of round_up_4(rows)) remain aligned.
-    rows_list = rows_per_expert.tolist()
-    scale_k = A_scales.shape[1]
-    padded_rows = [(r + 3) & ~3 for r in rows_list]
-    total_padded = sum(padded_rows)
-    A_scale_k = torch.zeros((total_padded, scale_k),
-                            dtype=A_scales.dtype,
-                            device=A_scales.device)
-    src_off = 0
-    dst_off = 0
-    for r, pr in zip(rows_list, padded_rows):
-        if r != 0:
-            # Each expert's slice is stored MN-major (column-major along M) with
-            # leading dim = pr. View the (pr, scale_k) row-major slice as
-            # (scale_k, pr) and write the transposed source into columns [0:r].
-            dst_block = A_scale_k[dst_off:dst_off + pr, :]
-            view = dst_block.view(scale_k, pr)
-            src = A_scales[src_off:src_off + r, :].transpose(-1,
-                                                             -2).contiguous()
-            view[:, :r] = src
-        src_off += r
-        dst_off += pr
-    return A_scale_k
+    # After cutlass-sycl PR #570, the optimized mxfp mainloop requires the
+    # per-expert scale-A surface width (M dim, since scale is MN-major) to be a
+    # multiple of 4 (ScaleAlignElems for 8-bit scales). Pad each expert's M up
+    # to a multiple of 4 with zeros so the cumulative scale offsets used by the
+    # grouped-gemm kernel (sum of round_up_4(rows)) remain aligned.
+    #
+    # A SYCL kernel does the per-expert transpose + zero-pad on device, keeping
+    # rows_per_expert on device (no .tolist() host sync, so this is safe under
+    # XPU graph capture) and issuing a couple of launches instead of
+    # O(num_experts) small launches. The output is allocated to the static upper
+    # bound sum(round_up_4(rows)) <= total_rows + 3*E; the grouped-GEMM indexes
+    # scale-A by computed per-expert padded offsets, so any extra zero tail rows
+    # are never read.
+    num_experts = rows_per_expert.shape[0]
+    total_padded = A_scales.shape[0] + 3 * num_experts
+    return torch.ops._moe_C.reorder_mxfp_scales(A_scales, rows_per_expert,
+                                                total_padded)
 
 
 def xpu_fused_moe(hidden_states,
