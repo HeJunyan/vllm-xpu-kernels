@@ -74,8 +74,14 @@ def dequant_mxfp8(x_lp, x_scale):
     return x.reshape(ori_shape)
 
 def dequant_mxfp8_wei(wei, wei_scale):
-    wei_scale = wei_scale.view(torch.float8_e8m0fnu).to(torch.float32)
-    return wei.to(torch.float32) * wei_scale.repeat_interleave(32, dim=0)
+    # wei is (K, N) in kernel layout, scale is (N, K//32) — scale was computed
+    # along K in the original (N, K) layout. Transpose to (N, K) to align with
+    # scale blocks, dequant, then transpose back.
+    K, N = wei.shape
+    wei_nk = wei.T.contiguous()  # (N, K)
+    dq = wei_nk.to(torch.float32).reshape(-1, 32) * \
+        (wei_scale.reshape(-1, 1).to(torch.float32))
+    return dq.reshape(N, K).T.contiguous()  # back to (K, N)
 
 def quant_mxfp_act_xpu(x, recipe):
     assert recipe in ("mxfp8", "mxfp4")

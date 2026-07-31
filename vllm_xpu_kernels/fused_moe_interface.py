@@ -184,7 +184,11 @@ class XpuFusedMoe:
         self.w13 = w13
         self.w2 = w2
 
-        if not is_fp8 and not is_int4 and not is_mxfp4 and not is_block_fp8:
+        if not is_fp8 \
+            and not is_int4 \
+            and not is_mxfp4 \
+            and not is_block_fp8 \
+            and not is_mxfp8:
             self.gemm1_wei_scales = None
             self.gemm2_wei_scales = None
         else:
@@ -300,11 +304,17 @@ class XpuFusedMoe:
         num_rows, hidden_size = hidden_states.shape
         num_moe_inputs = self.n_experts_per_token * num_rows
         act_quant = a1q_scale is not None
-        
+
+       # mxfp4 activations are packed two values per byte, so the stored
+        # hidden dim is half of the logical contraction (gemm1 K) / output
+        # (gemm2 N) dim expected by the grouped GEMM.
+        gemm_hidden_size = 2 * hidden_size \
+            if (act_quant and self.is_mxfp4) else hidden_size
+
         if expert_map is None and self.ep_size > 1:
             expert_map = self.expert_map
 
-        if act_quant:
+        if act_quant and a1q_scale.ndim == 2:
             remapped_scales = torch.empty(
                 (num_rows * self.n_experts_per_token, a1q_scale.shape[1]),
                 dtype=a1q_scale.dtype,
@@ -339,16 +349,22 @@ class XpuFusedMoe:
         gemm1_output = torch.empty((num_moe_inputs, 2 * self.inter_size),
                                 dtype=output.dtype,
                                 device=output.device)
+
+        if act_quant and remapped_scales.dtype == torch.float8_e8m0fnu:
+            input_scales = reorder_mxfp_scales(remapped_scales,
+                                               rows_per_expert)
+        else:
+            input_scales = remapped_scales
         torch.ops._xpu_C.cutlass_grouped_gemm_interface(
             ptr_A=remapped_hidden_states,
-            ptr_A_scale=remapped_scales,
+            ptr_A_scale=input_scales,
             ptr_B=self.w13,
             ptr_B_scale=self.gemm1_wei_scales,
             ptr_bias=self.w13_bias,
             ptr_D=gemm1_output,
             rows_per_expert=rows_per_expert,
             N=2 * self.inter_size,
-            K=hidden_size,
+            K=gemm_hidden_size,
             num_experts=self.num_experts,
             is_B_int4=self.is_int4,
             is_B_mxfp4=self.is_mxfp4)
@@ -361,12 +377,15 @@ class XpuFusedMoe:
         self.act_func(act_output, gemm1_output)
 
         ########### gemm2 ##################
-        gemm2_output = torch.empty((num_moe_inputs, hidden_size),
+        gemm2_output = torch.empty((num_moe_inputs, gemm_hidden_size),
                                 dtype=output.dtype,
                                 device=output.device)
 
         if act_quant:
             act_output, gemm2_act_scale = quant_act_xpu(act_output, self.recipe)
+            if gemm2_act_scale.dtype == torch.float8_e8m0fnu:
+                gemm2_act_scale = reorder_mxfp_scales(gemm2_act_scale,
+                                                      rows_per_expert)
         torch.ops._xpu_C.cutlass_grouped_gemm_interface(
             ptr_A=act_output,
             ptr_A_scale=gemm2_act_scale if act_quant else None,
@@ -375,7 +394,7 @@ class XpuFusedMoe:
             ptr_bias=self.w2_bias,
             ptr_D=gemm2_output,
             rows_per_expert=rows_per_expert,
-            N=hidden_size,
+            N=gemm_hidden_size,
             K=self.inter_size * self.inter_size_scale,
             num_experts=self.num_experts,
             is_B_int4=self.is_int4,
