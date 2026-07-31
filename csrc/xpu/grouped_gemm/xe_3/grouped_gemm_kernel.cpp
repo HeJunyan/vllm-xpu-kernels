@@ -209,11 +209,10 @@ struct GroupedGemmRunner {
 
     CUTLASS_CHECK(gemm_op.can_implement(arguments));
 
-    CUTLASS_CHECK(gemm_op.initialize(arguments, workspace.get()));
+    CUTLASS_CHECK(gemm_op.initialize(arguments, workspace.get(), &stream));
 
     // Run the GEMM
-    CUTLASS_CHECK(gemm_op.run());
-    stream.throw_asynchronous();
+    CUTLASS_CHECK(gemm_op.run(&stream));
     return cutlass::Status::kSuccess;
   }
 };
@@ -234,8 +233,6 @@ void kernel_functor(
   //
   // Run examples
   //
-  compat::set_default_queue(stream);
-
   // The KernelHardwareInfo struct holds the number of EUs on the GPU with a
   // given device ID. This information is used by the underlying kernel.
   cutlass::KernelHardwareInfo hw_info;
