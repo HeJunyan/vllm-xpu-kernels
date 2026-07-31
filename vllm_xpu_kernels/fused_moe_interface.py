@@ -24,8 +24,6 @@ def _is_env_enabled(env_name: str, default: str = "0") -> bool:
 
 
 def _should_use_ref_fused_moe(is_mxfp8: bool) -> bool:
-    if is_mxfp8:
-        return True
     return _is_env_enabled(REF_FUSED_MOE_ENV)
 
 
@@ -434,9 +432,7 @@ def quant_fp8_act(x: torch.Tensor):
 
 def quant_mxfp_act(x, recipe):
     from tests.fused_moe.test_grouped_gemm_xe3 import (
-        bfloat16_to_fp4_e2m1fn_x2,
-        data_to_mx_scale,
-    )
+        bfloat16_to_fp4_e2m1fn_x2, data_to_mx_scale)
 
     # max value of `torch.float8_e4m3fn` (448)
     F8E4M3_MAX_VAL = torch.finfo(torch.float8_e4m3fn).max
