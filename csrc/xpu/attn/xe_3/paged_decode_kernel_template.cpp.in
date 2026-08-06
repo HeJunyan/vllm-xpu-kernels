@@ -1,5 +1,6 @@
 #include "csrc/xpu/attn/xe_3/paged_decode.hpp"
 
+namespace vllm::xpu::xe3 {
 using namespace cute;
 
 // =============================================================================
@@ -35,3 +36,5 @@ using namespace cute;
       const paged_decode_args_t& args);
 
 INSTANTIATE_KERNEL()
+
+}  // namespace vllm::xpu::xe3

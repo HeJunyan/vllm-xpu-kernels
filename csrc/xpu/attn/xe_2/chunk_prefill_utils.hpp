@@ -5,6 +5,7 @@
 #if __has_include("chunk_prefill_enabled_policies_gen.hpp")
   #include "chunk_prefill_enabled_policies_gen.hpp"
 #else
+namespace vllm::xpu::xe2 {
 // Fallback: if the generated header is not available (e.g., IDE indexing),
 // assume all policies are enabled.
 template <typename Policy>
@@ -17,8 +18,10 @@ template <
     bool Sink,
     bool Lse>
 struct is_chunk_policy_tuple_enabled : std::true_type {};
+}  // namespace vllm::xpu::xe2
 #endif
 
+namespace vllm::xpu::xe2 {
 using namespace cute;
 
 template <typename chunk_policy, bool... Bs>
@@ -131,11 +134,9 @@ __attribute__((visibility("hidden"))) void policy_dispatch_func(
   }
 }
 
-// Hidden visibility prevents this per-arch implementation symbol from being
-// exported and interposed across the XE2/XE3 kernel shared libraries (which
-// both define a symbol with this exact name/signature). Without this, the
-// XE3 wrapper could bind to the XE2 implementation at load time and launch a
-// kernel built for the wrong architecture.
+// Defence in depth: this implementation lives in vllm::xpu::xe2, so the XE2 and
+// XE3 libraries no longer export a symbol with the same mangled name. Hidden
+// visibility keeps it unexported even if a future refactor reintroduces one.
 __attribute__((visibility("hidden"))) void cutlass_chunk_prefill_impl(
     sycl::queue& queue,
     const at::Tensor& query,      // [seq_q, heads, head_size]
@@ -160,3 +161,5 @@ __attribute__((visibility("hidden"))) void cutlass_chunk_prefill_impl(
     bool is_sink,
     std::optional<at::Tensor>& softmax_lse,
     std::optional<const at::Tensor>& is_prefill);
+
+}  // namespace vllm::xpu::xe2

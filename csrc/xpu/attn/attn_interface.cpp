@@ -38,7 +38,7 @@ void cutlass_chunk_prefill_interface(
   if (vllm::xpu::is_xe2_arch() || vllm::xpu::is_xe3_arch()) {
 #ifdef VLLM_XPU_ENABLE_XE2
     // Use XE2 cutlass kernel (also used as WA for XE3/XE3P)
-    cutlass_chunk_prefill_xe2(
+    vllm::xpu::xe2::cutlass_chunk_prefill_xe2(
         queue,
         query,
         key_cache,
@@ -69,7 +69,7 @@ void cutlass_chunk_prefill_interface(
 #ifdef VLLM_XPU_ENABLE_XE3
   else if (vllm::xpu::is_xe3p_arch()) {
     // Use XE3 cutlass kernel
-    cutlass_chunk_prefill_xe3(
+    vllm::xpu::xe3::cutlass_chunk_prefill_xe3(
         queue,
         query,
         key_cache,
@@ -99,6 +99,11 @@ void cutlass_chunk_prefill_interface(
   else {
     TORCH_CHECK(false, "Only XE2/XE3 cutlass kernel is supported currently.");
   }
+
+  // The kernels above are enqueued asynchronously. When they are dispatched on
+  // the detached profiling queue, drain it so `out` is fully written before
+  // control returns to PyTorch.
+  vllm::xpu::vllmSyncQueue(queue);
 }
 
 void cutlass_paged_decode_interface(
@@ -135,7 +140,7 @@ void cutlass_paged_decode_interface(
   if (vllm::xpu::is_xe2_arch() || vllm::xpu::is_xe3_arch()) {
 #ifdef VLLM_XPU_ENABLE_XE2
     // Use XE2 cutlass kernel (also used as WA for XE3/XE3P)
-    cutlass_paged_decode_xe2(
+    vllm::xpu::xe2::cutlass_paged_decode_xe2(
         queue,
         query,
         key_cache,
@@ -171,7 +176,7 @@ void cutlass_paged_decode_interface(
 #ifdef VLLM_XPU_ENABLE_XE3
   else if (vllm::xpu::is_xe3p_arch()) {
     // Use XE3 cutlass kernel for XE3P (CRI simulator)
-    cutlass_paged_decode_xe3(
+    vllm::xpu::xe3::cutlass_paged_decode_xe3(
         queue,
         query,
         key_cache,
@@ -204,4 +209,9 @@ void cutlass_paged_decode_interface(
   else {
     TORCH_CHECK(false, "Only XE2/XE3 cutlass kernel is supported currently.");
   }
+
+  // The kernels above are enqueued asynchronously. When they are dispatched on
+  // the detached profiling queue, drain it so `out` is fully written before
+  // control returns to PyTorch.
+  vllm::xpu::vllmSyncQueue(queue);
 }

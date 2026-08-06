@@ -25,6 +25,20 @@
 
 #include "csrc/xpu/attn/fmha_utils.hpp"
 
+// Everything below belongs to this architecture alone.
+//
+// XE2 and XE3 are built into separate shared libraries but instantiate kernel
+// templates with the same names from divergent sources (for example
+// paged_decode_args_t differs between the two). At global namespace those
+// instantiations mangle identically and are emitted as weak, default-visibility
+// symbols, so the dynamic loader binds every reference to whichever library it
+// resolves first -- an XE3 caller then runs XE2 code and reads the argument
+// struct with the wrong layout, silently corrupting the KV cache strides.
+//
+// Keeping each architecture in its own namespace makes the mangled names
+// disjoint, so the two libraries can never cross-bind. Do not move any of these
+// declarations back to global namespace.
+namespace vllm::xpu::xe2 {
 using namespace cute;
 
 using _576 = cute::Int<576>;
@@ -696,3 +710,5 @@ void decode_policy_dispatch_impl(
       " k_type=",
       static_cast<int>(cuQKType.k_type));
 }
+
+}  // namespace vllm::xpu::xe2

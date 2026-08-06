@@ -148,6 +148,33 @@ def ref_paged_attn(query: torch.Tensor,
     return torch.cat(outputs, dim=0)
 
 
+def ref_paged_attn_cpu(**kwargs):
+    """Evaluate :func:`ref_paged_attn` entirely on CPU.
+
+    ``ref_paged_attn`` is built from regular torch ops, so when it is handed
+    XPU tensors it is executed by the very backend that is under test.  Any
+    misbehaviour of that backend then corrupts the reference as well, which
+    turns a comparison against it into a meaningless (and flaky) check.  This
+    wrapper pins the whole reference computation to CPU and returns the result
+    on the device the query came from, so the test keeps comparing XPU output
+    against a device-independent baseline.
+    """
+    device = kwargs["query"].device
+    cpu_kwargs = {
+        k: (v.cpu() if isinstance(v, torch.Tensor) else v)
+        for k, v in kwargs.items()
+    }
+    # ref_paged_attn allocates helper tensors (masks) without an explicit
+    # device, so the default device has to follow the inputs.
+    default_device = torch.get_default_device()
+    torch.set_default_device("cpu")
+    try:
+        out = ref_paged_attn(**cpu_kwargs)
+    finally:
+        torch.set_default_device(default_device)
+    return out.to(device)
+
+
 #override pytest parameters when enable mini pytest
 MINI_PYTEST_PARAMS = {
     "test_varlen_with_paged_kv": {
@@ -506,18 +533,18 @@ def test_varlen_with_interleaved_paged_kv(
 
     key_cache_ref = key_cache.contiguous()
     value_cache_ref = value_cache.contiguous()
-    ref_output = ref_paged_attn(query=query,
-                                key_cache=key_cache_ref,
-                                value_cache=value_cache_ref,
-                                query_lens=query_lens,
-                                kv_lens=kv_lens,
-                                block_tables=block_tables,
-                                scale=scale,
-                                casual=is_casual,
-                                is_paged=True,
-                                sink=sink,
-                                window_size_left=window_size[0],
-                                window_size_right=window_size[1])
+    ref_output = ref_paged_attn_cpu(query=query,
+                                    key_cache=key_cache_ref,
+                                    value_cache=value_cache_ref,
+                                    query_lens=query_lens,
+                                    kv_lens=kv_lens,
+                                    block_tables=block_tables,
+                                    scale=scale,
+                                    casual=is_casual,
+                                    is_paged=True,
+                                    sink=sink,
+                                    window_size_left=window_size[0],
+                                    window_size_right=window_size[1])
 
     atol, rtol = 1e-2, 1e-2
     if window_size[0] != -1 or window_size[1] != -1 or dtype == torch.bfloat16:

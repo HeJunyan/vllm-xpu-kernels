@@ -7,6 +7,7 @@
   #include "paged_decode_extern.hpp"
 #endif
 
+namespace vllm::xpu::xe2 {
 using namespace cute;
 
 void cutlass_paged_decode_xe2(
@@ -298,3 +299,5 @@ void cutlass_paged_decode_impl(
     TORCH_CHECK(false, "Unsupported num_heads_q / num_heads_kv for fmha");
   }
 }
+
+}  // namespace vllm::xpu::xe2

@@ -47,23 +47,72 @@ warn_once_per_line(const char* file, int line, const std::string& msg) {
 namespace vllm {
 namespace xpu {
 
+static inline std::optional<std::string> getEnv(const char* name) {
+  if (const char* val = std::getenv(name)) return val;
+  return std::nullopt;
+}
+
+// Whether ops should run on a dedicated, PyTorch-detached profiling queue.
+//
+// The profiling queue only exists so the FMHA/grouped-gemm profiling harnesses
+// (XE3_FMHA_PROFILE_ITERS / XE3_GG_PROFILE_ITERS) can read device timestamps
+// out of the SYCL events. Because that queue is *not* PyTorch's stream, every
+// op that uses it has to hand-synchronise with the torch stream on both sides,
+// which is fragile and has been observed to produce missing/torn kernel output
+// on the CRI simulator. It is therefore opt-in and off by default; set
+// VLLM_XPU_PROFILING_QUEUE=1 when actually profiling.
+static inline bool vllmUseProfilingQueue() {
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  static const bool enabled = [] {
+    auto env_val = getEnv("VLLM_XPU_PROFILING_QUEUE");
+    if (!env_val.has_value()) return false;
+    const auto& v = env_val.value();
+    return v == "1" || v == "true" || v == "TRUE";
+  }();
+  return enabled;
+#else
+  return false;
+#endif
+}
+
 static inline sycl::queue& vllmGetQueue(at::DeviceIndex device_index = -1) {
   auto current_stream = c10::xpu::getCurrentXPUStream(device_index);
   auto& queue = current_stream.queue();
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  // create profiling queue for CRI
-  auto dev_idx =
-      (device_index == -1) ? c10::xpu::current_device() : device_index;
-  static sycl::queue profiling_queue(
-      c10::xpu::get_device_context(),
-      c10::xpu::get_raw_device(dev_idx),
-      sycl::property_list{
-          sycl::property::queue::in_order(),
-          sycl::property::queue::enable_profiling()});
-  queue.wait();
-  return profiling_queue;
-#else
+  if (vllmUseProfilingQueue()) {
+    // create profiling queue for CRI
+    auto dev_idx =
+        (device_index == -1) ? c10::xpu::current_device() : device_index;
+    static sycl::queue profiling_queue(
+        c10::xpu::get_device_context(),
+        c10::xpu::get_raw_device(dev_idx),
+        sycl::property_list{
+            sycl::property::queue::in_order(),
+            sycl::property::queue::enable_profiling()});
+    queue.wait();
+    return profiling_queue;
+  }
+#endif
   return queue;
+}
+
+// Drain the queue returned by vllmGetQueue().
+//
+// When the opt-in profiling queue is active (VLLM_XPU_PROFILING_QUEUE=1 on
+// CRI/simulator builds) vllmGetQueue() hands back a queue that is *detached*
+// from PyTorch's XPU stream: PyTorch never orders any work against it. An op
+// that enqueues kernels there must therefore drain it before returning,
+// otherwise the next torch-stream operation (for example the D2H copy behind
+// Tensor.cpu()) races with the still-running kernel and reads partially
+// written -- or completely unwritten -- output.
+//
+// Otherwise vllmGetQueue() returns the torch stream itself, which is already
+// correctly ordered, so this is a no-op and async execution is kept.
+static inline void vllmSyncQueue([[maybe_unused]] sycl::queue& queue) {
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  if (vllmUseProfilingQueue()) {
+    queue.wait();
+  }
 #endif
 }
 
@@ -127,11 +176,6 @@ static inline bool is_xe3p_arch(at::DeviceIndex device_index = -1) {
          arch == syclex::architecture::intel_gpu_nvl_p;
 }
 
-
-static inline std::optional<std::string> getEnv(const char* name) {
-  if (const char* val = std::getenv(name)) return val;
-  return std::nullopt;
-}
 
 static inline bool force_xe_default_kernel() {
   auto env_val = getEnv("VLLM_XPU_FORCE_XE_DEFAULT_KERNEL");

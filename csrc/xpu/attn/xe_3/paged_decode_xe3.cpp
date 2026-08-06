@@ -3,6 +3,7 @@
 #include "csrc/xpu/attn/xe_3/paged_decode_extern.hpp"
 #include "csrc/xpu/attn/paged_kv_utils.h"
 
+namespace vllm::xpu::xe3 {
 using namespace cute;
 
 void cutlass_paged_decode_xe3(
@@ -272,3 +273,5 @@ void cutlass_paged_decode_impl(
     TORCH_CHECK(false, "Unsupported num_heads_q / num_heads_kv for fmha");
   }
 }
+
+}  // namespace vllm::xpu::xe3

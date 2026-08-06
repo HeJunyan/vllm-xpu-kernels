@@ -7,6 +7,7 @@
   #include "chunk_prefill_extern.hpp"
 #endif
 
+namespace vllm::xpu::xe2 {
 using namespace cute;
 
 void cutlass_chunk_prefill_xe2(
@@ -352,3 +353,5 @@ void cutlass_chunk_prefill_impl(
     TORCH_CHECK(false, "Unsupported head size for fmha");
   }
 }
+
+}  // namespace vllm::xpu::xe2

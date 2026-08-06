@@ -38,6 +38,10 @@
 #include "cutlass/kernel_hardware_info.h"
 
 namespace cutlass::fmha::kernel {
+// Arch-tagged inline namespace: gives these definitions a mangled name
+// distinct from the other Xe architecture's identically named copies,
+// while leaving name lookup (cutlass::fmha::...) unchanged.
+inline namespace vllm_xpu_xe2 {
 
 struct XeFHMAIndividualTileScheduler {
   struct Params {
@@ -256,5 +260,7 @@ struct XeReduceSplitKTileScheduler {
     return *this;
   }
 };
+
+}  // inline namespace vllm_xpu_xe2
 
 }  // namespace cutlass::fmha::kernel

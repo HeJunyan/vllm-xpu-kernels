@@ -45,6 +45,10 @@
 #include "flash_attention_v2/collective/copy_block_slm.hpp"
 
 namespace cutlass::fmha::collective {
+// Arch-tagged inline namespace: gives these definitions a mangled name
+// distinct from the other Xe architecture's identically named copies,
+// while leaving name lookup (cutlass::fmha::...) unchanged.
+inline namespace vllm_xpu_xe3 {
 
 using namespace cute;
 
@@ -748,5 +752,7 @@ class DecodeFwdEpilogue {
     }
   }
 };
+
+}  // inline namespace vllm_xpu_xe3
 
 }  // namespace cutlass::fmha::collective

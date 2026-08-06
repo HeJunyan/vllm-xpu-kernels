@@ -7,6 +7,7 @@
 #endif
 #include "csrc/xpu/attn/paged_kv_utils.h"
 
+namespace vllm::xpu::xe3 {
 void cutlass_chunk_prefill_xe3(
     sycl::queue& queue,
     const at::Tensor& query,      // [seq_q, heads, head_size]
@@ -343,3 +344,5 @@ void cutlass_chunk_prefill_impl(
     TORCH_CHECK(false, "Unsupported head size for fmha");
   }
 }
+
+}  // namespace vllm::xpu::xe3

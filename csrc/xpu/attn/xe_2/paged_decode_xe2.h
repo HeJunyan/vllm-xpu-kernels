@@ -1,5 +1,6 @@
 #include <torch/all.h>
 
+namespace vllm::xpu::xe2 {
 void cutlass_paged_decode_xe2(
     sycl::queue& queue,
     const at::Tensor& query,      // [seq_q, heads, head_size]
@@ -30,3 +31,5 @@ void cutlass_paged_decode_xe2(
     std::optional<const at::Tensor>& is_prefill,
     std::optional<at::Tensor>& splits_per_seq,
     std::optional<at::Tensor>& work_list);
+
+}  // namespace vllm::xpu::xe2
