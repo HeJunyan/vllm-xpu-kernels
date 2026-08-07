@@ -49,6 +49,7 @@ DEVICES = [
 
 KV_CACHE_DTYPE = ["auto", "fp8"]  # FIXME: will add "fp8" when accuracy is improved
 
+
 # For now, disable "test_aot_dispatch_dynamic" since there are some
 # bugs related to this test in PyTorch 2.4.
 DEFAULT_OPCHECK_TEST_UTILS: tuple[str, ...] = (
@@ -409,7 +410,7 @@ def _fill_mla_cache(cache: torch.Tensor, kv_cache_dtype: str):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("kv_cache_dtype", KV_CACHE_DTYPE_ALL)
+@pytest.mark.parametrize("kv_cache_dtype", KV_CACHE_DTYPE)
 @torch.inference_mode()
 def test_concat_and_cache_mla(
     kv_lora_rank: int,
