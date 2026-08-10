@@ -99,11 +99,6 @@ void cutlass_chunk_prefill_interface(
   else {
     TORCH_CHECK(false, "Only XE2/XE3 cutlass kernel is supported currently.");
   }
-
-  // The kernels above are enqueued asynchronously. When they are dispatched on
-  // the detached profiling queue, drain it so `out` is fully written before
-  // control returns to PyTorch.
-  vllm::xpu::vllmSyncQueue(queue);
 }
 
 void cutlass_paged_decode_interface(
@@ -209,9 +204,4 @@ void cutlass_paged_decode_interface(
   else {
     TORCH_CHECK(false, "Only XE2/XE3 cutlass kernel is supported currently.");
   }
-
-  // The kernels above are enqueued asynchronously. When they are dispatched on
-  // the detached profiling queue, drain it so `out` is fully written before
-  // control returns to PyTorch.
-  vllm::xpu::vllmSyncQueue(queue);
 }
