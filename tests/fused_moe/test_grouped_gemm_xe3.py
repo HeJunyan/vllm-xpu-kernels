@@ -592,7 +592,7 @@ def test_grouped_gemm_fp8_pertensor(m, n, k, e, topk, has_bias):
     else:
         bias = None
 
-    output = torch.zeros((m, n), dtype=torch.float32, device=DEVICE)
+    output = torch.zeros((m, n), dtype=torch.bfloat16, device=DEVICE)
     output_kernel = output.to(KERNEL_DEVICE)
     cutlass_grouped_gemm(_to_kernel(a_fp8), _to_kernel(a_scale),
                          _to_kernel(b_fp8), _to_kernel(b_scale),
@@ -617,8 +617,8 @@ def test_grouped_gemm_fp8_pertensor(m, n, k, e, topk, has_bias):
             expert_output += bias[i]
         ref.append(expert_output)
         pre_token_sum += cur_token_num
-    ref = torch.cat(ref, dim=0)
+    ref = torch.cat(ref, dim=0).bfloat16()
 
     print("ref: ", ref, ref.shape)
     print("ker: ", output, output.shape)
-    torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(output, ref, rtol=2e-2, atol=2e-2)

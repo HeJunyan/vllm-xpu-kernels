@@ -673,19 +673,20 @@ class moe_fp8pertensor_policy : public moe_policy_base {
 
   using ElementA = ElementType;
   using ElementB = ElementType;
-  using ElementOutput = float;
+  using ElementOutput = cutlass::bfloat16_t;
   using ElementScaleA = float;
   using ElementScaleB = float;
 
   using StrideScale = cute::Stride<_1, int64_t, int64_t>;
 
-  using TileShape = Shape<_128, _128, _32>;
+  using TileShape = Shape<_128, _256, _32>;
   using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
       Layout<TileShape>,
       SGLayout>::TiledMMA;
 
+  static constexpr int PipelineStages = 3;
   using GEMMDispatchPolicy =
       cutlass::gemm::MainloopFP8PerTensorGroup<PipelineStages>;
   CALL_GENERATE_GEMM();
@@ -699,17 +700,62 @@ class moe_fp8pertensor_mid_policy : public moe_fp8pertensor_policy {
       MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
       Layout<TileShape>,
       SGLayout>::TiledMMA;
+  static constexpr int PipelineStages = 2;
+  using GEMMDispatchPolicy =
+      cutlass::gemm::MainloopFP8PerTensorGroup<PipelineStages>;
   CALL_GENERATE_GEMM();
 };
 
 class moe_fp8pertensor_decode_policy : public moe_fp8pertensor_policy {
  public:
-  using TileShape = Shape<_16, _128, _32>;
-  using SGLayout = Layout<Shape<_1, _8, _1>, Stride<_8, _1, _0>>;
+  using TileShape = Shape<_8, _64, _32>;
+  using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
       Layout<TileShape>,
       SGLayout>::TiledMMA;
+  static constexpr int PipelineStages = 2;
+  using GEMMDispatchPolicy =
+      cutlass::gemm::MainloopFP8PerTensorGroup<PipelineStages>;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_fp8pertensor_decode_lowk_policy
+    : public moe_fp8pertensor_decode_policy {
+ public:
+  static constexpr int PipelineStages = 1;
+  using GEMMDispatchPolicy =
+      cutlass::gemm::MainloopFP8PerTensorGroup<PipelineStages>;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_fp8pertensor_decode_narrow_policy
+    : public moe_fp8pertensor_policy {
+ public:
+  using TileShape = Shape<_8, _32, _64>;
+  using SGLayout = Layout<Shape<_1, _2, _1>, Stride<_2, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  static constexpr int PipelineStages = 2;
+  using GEMMDispatchPolicy =
+      cutlass::gemm::MainloopFP8PerTensorGroup<PipelineStages>;
+  CALL_GENERATE_GEMM();
+};
+
+class moe_fp8pertensor_decode_shortk_policy
+    : public moe_fp8pertensor_policy {
+ public:
+  using TileShape = Shape<_8, _128, _128>;
+  using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
+      Layout<TileShape>,
+      SGLayout>::TiledMMA;
+  static constexpr int PipelineStages = 1;
+  using GEMMDispatchPolicy =
+      cutlass::gemm::MainloopFP8PerTensorGroup<PipelineStages>;
   CALL_GENERATE_GEMM();
 };
 

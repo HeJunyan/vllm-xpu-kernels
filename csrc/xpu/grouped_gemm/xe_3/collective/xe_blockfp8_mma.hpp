@@ -479,11 +479,6 @@ struct CollectiveMma<
     //
     // Mainloop
     //
-    Tensor scaler = make_tensor_like(accum);
-    int M = shape<0>(mainloop.mA_mkl);
-    int K = shape<1>(mainloop.mA_mkl);
-    int K_groups = cute::ceil_div(K, GROUP_K);
-    int n_scale_idx = int(n_coord / 128);
     constexpr int acc_m0 = decltype(size<0>(accum))::value;
     constexpr int acc_m1 = decltype(size<1>(accum))::value;
     constexpr int sg_m_rows = acc_m0 * acc_m1;
@@ -502,19 +497,17 @@ struct CollectiveMma<
       reorder(tArA, tCrA);
       reorder(tBrB, tCrB);
 
-      int k_group_idx = int(k_tile * SG_K / GROUP_K);
-      float combined_scale[sg_m_rows];
       if constexpr (DispatchPolicy::PerTensor) {
-        // Per-tensor: A has a single global scalar, B has one scalar per
-        // expert (the expert offset is already folded into ptr_SB), so every
-        // row/block reuses the same combined scale.
-        float scaleAB = mainloop.ptr_SA[0] * mainloop.ptr_SB[0];
-        CUTLASS_PRAGMA_UNROLL
-        for (int row = 0; row < sg_m_rows; ++row) {
-          combined_scale[row] = scaleAB;
-        }
+        cute::gemm(tiled_mma, tCrA, tCrB, accum);
       } else {
+        Tensor scaler = make_tensor_like(accum);
+        int M = shape<0>(mainloop.mA_mkl);
+        int K = shape<1>(mainloop.mA_mkl);
+        int K_groups = cute::ceil_div(K, GROUP_K);
+        int n_scale_idx = int(n_coord / 128);
+        int k_group_idx = int(k_tile * SG_K / GROUP_K);
         float scaleB = mainloop.ptr_SB[n_scale_idx * K_groups + k_group_idx];
+        float combined_scale[sg_m_rows];
         CUTLASS_PRAGMA_UNROLL
         for (int i1 = 0; i1 < acc_m1; ++i1) {
           CUTLASS_PRAGMA_UNROLL
@@ -525,25 +518,40 @@ struct CollectiveMma<
                 scaleB;
           }
         }
+
+        cute::gemm(tiled_mma, tCrA, tCrB, scaler);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i0 = 0; i0 < acc_m0; ++i0) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i1 = 0; i1 < acc_m1; ++i1) {
+            int row = i1 * acc_m0 + i0;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i2 = 0; i2 < size<2>(accum); ++i2) {
+              accum[make_coord(i0, i1, i2)] +=
+                  scaler[make_coord(i0, i1, i2)] * combined_scale[row];
+            }
+          }
+        }
+
+        clear(scaler);
       }
 
-      cute::gemm(tiled_mma, tCrA, tCrB, scaler);
+      barrier_wait(barrier_scope);
+    }
 
+    if constexpr (DispatchPolicy::PerTensor) {
+      float scaleAB = mainloop.ptr_SA[0] * mainloop.ptr_SB[0];
       CUTLASS_PRAGMA_UNROLL
       for (int i0 = 0; i0 < acc_m0; ++i0) {
         CUTLASS_PRAGMA_UNROLL
         for (int i1 = 0; i1 < acc_m1; ++i1) {
-          int row = i1 * acc_m0 + i0;
           CUTLASS_PRAGMA_UNROLL
           for (int i2 = 0; i2 < size<2>(accum); ++i2) {
-            accum[make_coord(i0, i1, i2)] +=
-                scaler[make_coord(i0, i1, i2)] * combined_scale[row];
+            accum[make_coord(i0, i1, i2)] *= scaleAB;
           }
         }
       }
-
-      clear(scaler);
-      barrier_wait(barrier_scope);
     }
   }
 };

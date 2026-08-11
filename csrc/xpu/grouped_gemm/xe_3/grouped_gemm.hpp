@@ -214,8 +214,22 @@ at::Tensor grouped_gemm_func(
         using moe_policy = grouped_gemm::moe_fp8pertensor_mid_policy;
         CALL_KERNEL_WITH_POLICY(moe_policy);
       } else {
-        using moe_policy = grouped_gemm::moe_fp8pertensor_decode_policy;
-        CALL_KERNEL_WITH_POLICY(moe_policy);
+        if (K <= 512) {
+          using moe_policy =
+              grouped_gemm::moe_fp8pertensor_decode_shortk_policy;
+          CALL_KERNEL_WITH_POLICY(moe_policy);
+        } else if (N <= 1024) {
+          using moe_policy =
+              grouped_gemm::moe_fp8pertensor_decode_narrow_policy;
+          CALL_KERNEL_WITH_POLICY(moe_policy);
+        } else if (K <= 1024) {
+          using moe_policy =
+              grouped_gemm::moe_fp8pertensor_decode_lowk_policy;
+          CALL_KERNEL_WITH_POLICY(moe_policy);
+        } else {
+          using moe_policy = grouped_gemm::moe_fp8pertensor_decode_policy;
+          CALL_KERNEL_WITH_POLICY(moe_policy);
+        }
       }
     } else if (avg_tokens_cnt > 32) {
       using moe_policy = grouped_gemm::moe_fp8block_policy;
