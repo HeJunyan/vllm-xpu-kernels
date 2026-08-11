@@ -110,6 +110,7 @@ def _spec_decode_varlen_fwd(
         1,  # max_seqlen_q
         max_seqlen_k,
         0.0,  # dropout_p
+        None,  # q_scale
         k_descale,
         v_descale,
         softmax_scale,
@@ -500,6 +501,7 @@ def flash_attn_varlen_func(
         # comment on _SPEC_DECODE_MAX_QLEN above for the rationale.
         batch = cu_seqlens_q.numel() - 1
         is_uniform_qlen = (batch > 0 and q.shape[0] == batch * max_seqlen_q)
+        # TODO: We could also support the case where q_descale is not None.
         if (block_table is not None and causal and not return_softmax_lse
                 and softcap == 0.0 and alibi_slopes is None and q_v is None
                 and q_descale is None and scheduler_metadata is None
@@ -713,4 +715,3 @@ def _fallback_varlen_attn(
     if return_softmax_lse:
         return result[0], result[1]
     return result, None
-
