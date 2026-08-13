@@ -12,6 +12,15 @@ MINI_PYTEST_PARAMS = {
         "n_token": [1],
         "n_expert": [16, 512],
     },
+    "test_fused_topk_sigmoid": {
+        "n_token": [1],
+        "n_expert": [16, 512],
+        "topk": [2, 4, 8],
+        "routed_scaling_factor": [1.0],
+    },
+    "test_fused_topk_padding": {
+        "dtype": [torch.bfloat16],
+    },
 }
 
 DEVICE = "cpu"

@@ -26,6 +26,16 @@ MINI_PYTEST_PARAMS = {
         "m": [1, 33],
         "k": [128, 256],
     },
+    "test_moe_sum_expert_map": {
+        "m": [1, 33],
+        "k": [128, 256],
+        "topk": [2],
+    },
+    "test_moe_sum_padded_topk_ids": {
+        "m": [1, 33],
+        "k": [128, 256],
+        "topk": [2],
+    },
 }
 
 

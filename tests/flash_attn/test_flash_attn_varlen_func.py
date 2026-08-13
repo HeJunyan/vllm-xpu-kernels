@@ -220,7 +220,26 @@ MINI_PYTEST_PARAMS = {
         "head_size,window_size": CROSS_LAYER_PAGED_DECODE_CASES,
         "num_blocks": [64],
         "num_layers": [2],
-    }
+    },
+    "test_varlen_with_softmax_lse": {
+        "seq_lens": [[(1, 1328), (1, 18), (1, 463), (1, 37)]],
+        "head_size": [128, 192],
+    },
+    "test_decode_large_gqa_ratio": {
+        "seq_lens": [[(1, 523), (1, 37), (1, 211)]],
+        "num_heads": [(71, 1)],
+        "block_size": [64],
+        "causal": [False],
+        "num_blocks": [64],
+    },
+    "test_spec_decode_uniform_qlen": {
+        "q_len": [2],
+        "seq_lens": [[(1328, ), (18, ), (463, )]],
+        "num_heads": [(8, 2)],
+        "block_size": [64],
+        "window_size": [(-1, -1)],
+        "is_sink": [False],
+    },
 }
 
 

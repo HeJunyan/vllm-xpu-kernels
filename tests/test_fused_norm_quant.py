@@ -39,6 +39,22 @@ MINI_PYTEST_PARAMS = {
         "HIDDEN_SIZES": [64],
         "GROUP_SIZES": [64],
     },
+    "test_rms_norm_per_block_quant_noncontiguous": {
+        "num_tokens": [4],
+        "hidden_size": [128],
+        "group_size": [64],
+        "quant_dtype": [torch.float8_e4m3fn],
+    },
+    "test_rms_norm_per_block_mxfp8_quant": {
+        "num_tokens": [4],
+        "hidden_size": [128],
+        "add_residual": [False],
+    },
+    "test_rms_norm_mxfp4_quant": {
+        "num_tokens": [4],
+        "hidden_size": [128],
+        "add_residual": [False],
+    },
 }
 
 

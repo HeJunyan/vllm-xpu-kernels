@@ -69,6 +69,7 @@ MINI_PYTEST_PARAMS = {
     "test_fp8_bmm_batched_weight_per_block": {
         "batch": [1],
         "mnk_factors": MINI_MNK_FACTORS,
+        "group_size": [128],
     },
     "test_fp8_gemm_per_tensor": {
         "mnk_factors": MINI_MNK_FACTORS,
@@ -78,12 +79,14 @@ MINI_PYTEST_PARAMS = {
     },
     "test_fp8_gemm_w8a16_per_channel": {
         "mnk_factors": MINI_MNK_FACTORS[:1],
+        "scale_layout": ["flat_1d"],
     },
     "test_mxfp8_gemm": {
         "mnk_factors": MINI_MX_MNK_FACTORS,
     },
     "test_fp8_gemm_per_block": {
         "mnk_factors": MINI_MNK_BLOCK_FACTORS,
+        "use_ue8m0": [False],
     },
     "test_fp8_gemm_w8a16_block": {
         "mnk_factors": MINI_MNK_BLOCK_FACTORS,

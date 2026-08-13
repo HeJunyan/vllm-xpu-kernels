@@ -1024,3 +1024,36 @@ ONDEMAND_PROFILES = {
     "qwen3_235b_a22b": _QWEN3_235B_A22B_PROFILE,
     "wan": _WAN_PROFILE,
 }
+
+# ---------------------------------------------------------------------------
+# Mini scope collection exclusions
+#
+# Files listed here are NOT collected at all in mini scope
+# (XPU_KERNEL_TEST_SCOPE=mini or the legacy XPU_KERNEL_PYTEST_PROFILER=MINI).
+# This is stronger than SKIP_IN_MINI_SCOPE / MINI_PYTEST_PARAMS, which still
+# import and collect the module.
+#
+# Use this for test modules that are out of mini-scope coverage entirely, e.g.
+# heavily parametrized new kernel tests. Paths are matched as path suffixes,
+# so a directory-style entry ("tests/wan_ut/") excludes everything under it.
+#
+# A module can also opt out on its own by setting ``SKIP_IN_MINI_SCOPE = True``
+# at module level; conftest detects that flag without importing the module.
+# ---------------------------------------------------------------------------
+MINI_EXCLUDE_FILES = [
+    # Test files added after the rebase. They are new kernel coverage that is
+    # out of mini-scope; keep them out of collection entirely rather than
+    # paying their full parametrization cost.
+    "tests/gdn_attn/test_causal_conv1d.py",
+    "tests/gdn_attn/test_gated_delta_rule.py",
+    "tests/mhc/test_mhc.py",
+    "tests/test_apply_rotary_emb.py",
+    "tests/test_deepseek_fused_indexer_q_rope_fp8.py",
+    "tests/test_deepseek_fused_indexer_q_rope_mxfp4.py",
+    "tests/test_deepseek_inv_rope_bf16.py",
+    "tests/test_deepseek_inv_rope_fp8_quant.py",
+    "tests/test_deepseek_qnorm_rope_kv_insert.py",
+    "tests/test_fused_silu_mul_mxfp4_quant.py",
+    "tests/test_punica_ops.py",
+    "tests/test_topk_softplus_sqrt.py",
+]

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+import re
 import sys
 
 import pytest
@@ -14,15 +15,67 @@ _workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path[:] = [p for p in sys.path if os.path.abspath(p) != _workspace_root]
 
 
+def _rel_tests_path(collection_path):
+    """Return the ``tests/...`` relative path for a collected path, or None."""
+    collection_path_str = str(collection_path)
+    if "/tests/" not in collection_path_str:
+        return None
+    return "tests/" + collection_path_str.split("/tests/", 1)[1]
+
+
+def _declares_skip_in_mini(collection_path):
+    """Detect a module-level ``SKIP_IN_MINI_SCOPE = True`` without importing.
+
+    Importing the module during collection can fail (missing extensions, XPU
+    runtime, ...), so the flag is detected by scanning the source text.
+    """
+    try:
+        source = collection_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return re.search(r"^SKIP_IN_MINI_SCOPE\s*=\s*True\s*$", source,
+                     re.MULTILINE) is not None
+
+
+def _ignore_for_mini(collection_path):
+    """Return True if the path must not be collected in mini scope."""
+    rel_path = _rel_tests_path(collection_path)
+    if rel_path is None:
+        return False
+
+    try:
+        from tests.test_scope_profiles import MINI_EXCLUDE_FILES
+    except ImportError:
+        MINI_EXCLUDE_FILES = []
+
+    excludes = [e.rstrip("/") for e in MINI_EXCLUDE_FILES]
+
+    if collection_path.is_dir():
+        # Ignore a directory only when every excluded entry covering it is a
+        # directory entry, otherwise files inside still need visiting.
+        return any(rel_path == e for e in excludes)
+
+    for entry in excludes:
+        if rel_path == entry or rel_path.startswith(entry + "/"):
+            return True
+
+    return _declares_skip_in_mini(collection_path)
+
+
 def pytest_ignore_collect(collection_path, config):
-    """Skip collection of test files not in the active ondemand profile.
+    """Skip collection of test files outside the active scope.
 
     This hook runs before pytest tries to import test modules, preventing
-    import errors from modules that aren't part of the active profile.
+    import errors from modules that aren't part of the active scope.
 
-    Only applies to ondemand:<profile> scopes. Other scopes collect all tests.
+    Applies to ``ondemand:<profile>`` scopes (profile file list) and to the
+    ``mini`` scope (``MINI_EXCLUDE_FILES`` plus ``SKIP_IN_MINI_SCOPE``).
+    Other scopes collect all tests.
     """
-    scope = os.getenv("XPU_KERNEL_TEST_SCOPE", "").strip().lower()
+    scope = _get_test_scope()
+
+    if scope == "mini":
+        return _ignore_for_mini(collection_path)
 
     # Only filter for ondemand profiles
     if not scope.startswith("ondemand:"):
@@ -42,11 +95,9 @@ def pytest_ignore_collect(collection_path, config):
         return False
 
     # Get relative path from tests/ directory
-    collection_path_str = str(collection_path)
-    if "/tests/" not in collection_path_str:
+    rel_path = _rel_tests_path(collection_path)
+    if rel_path is None:
         return False
-
-    rel_path = "tests/" + collection_path_str.split("/tests/", 1)[1]
 
     # If it's a directory, check if any profile file is under it
     if collection_path.is_dir():

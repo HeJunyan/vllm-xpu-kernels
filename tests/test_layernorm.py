@@ -34,6 +34,7 @@ MINI_PYTEST_PARAMS = {
     "default": {
         "num_tokens": [7],
         "hidden_size": [8],
+        "has_weight": [True],
     },
 }
 

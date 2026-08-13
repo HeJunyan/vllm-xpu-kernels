@@ -82,6 +82,12 @@ MINI_PYTEST_PARAMS = {
         "num_query_heads": [4],
         "output_dtype": [torch.half, torch.bfloat16],
     },
+    "test_merge_attn_states_with_prefix_num_tokens": {
+        "num_tokens": [256],
+        "head_size": [64],
+        "num_query_heads": [8],
+        "output_dtype": [torch.half, torch.bfloat16],
+    },
 }
 
 
