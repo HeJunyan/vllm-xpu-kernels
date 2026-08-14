@@ -613,7 +613,9 @@ endif()
 #
 # quant_asm_xe_3 shared library — Xe3(p)-only hand-written asm quant impl.
 #
-if(VLLM_XPU_ENABLE_XE3 AND BASIC_KERNELS_ENABLED AND BUILD_QUANT_ASM_XE3)
+if(VLLM_XPU_ENABLE_XE3
+   AND BASIC_KERNELS_ENABLED
+   AND BUILD_QUANT_ASM_XE3)
   message(STATUS "Enabling quant_asm_xe_3 library (Xe3 asm quant impl).")
 
   set(QUANT_ASM_SRC "csrc/quant_asm_entry.cpp")
@@ -698,7 +700,9 @@ if(BASIC_KERNELS_ENABLED)
     target_link_libraries(_C PRIVATE quant_asm_xe_3)
     target_compile_definitions(_C PRIVATE VLLM_QUANT_ASM_AVAILABLE=1)
   elseif(VLLM_XPU_ENABLE_XE3)
-    message(STATUS "quant_asm_xe_3 disabled; _C built without VLLM_QUANT_ASM_AVAILABLE.")
+    message(
+      STATUS
+        "quant_asm_xe_3 disabled; _C built without VLLM_QUANT_ASM_AVAILABLE.")
   endif()
 
 endif()
@@ -760,6 +764,7 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
       "csrc/xpu/sycl/deepseek_inv_rope_fp8_quant.cpp"
       "csrc/xpu/sycl/deepseek_fused_indexer_q_rope_fp8.cpp"
       "csrc/xpu/sycl/deepseek_fused_indexer_q_rope_mxfp4.cpp"
+      "csrc/xpu/sycl/fused_rope_norm_store_kv_fp8.cpp"
       "csrc/xpu/sycl/multimodal_rope.cpp"
       "csrc/xpu/sycl/apply_rotary_emb.cpp"
       "csrc/xpu/rand/exponential.cpp"
