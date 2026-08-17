@@ -354,7 +354,7 @@ struct CollectiveMma<
         expert_first_token_offset[next_group] * K;
     ElementB const* ptr_B_curr_batch =
         reinterpret_cast<ElementB const*>(mainloop_params.ptr_B) +
-        next_group * N * K;
+        static_cast<int64_t>(next_group) * N * K;
 
     Tensor mA = make_tensor(
         make_gmem_ptr(ptr_A_curr_batch),

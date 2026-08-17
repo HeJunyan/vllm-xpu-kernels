@@ -50,7 +50,6 @@ def _to_kernel(x):
 def warm_up_cri_grouped_gemm():
     maybe_warm_up_cri_grouped_gemm()
 
-# shape for Llama-4-scout
 FUSED_MOE_MNK_FACTORS = [
     (1, 5120, 8192),
     (4, 5120, 8192),
@@ -622,3 +621,65 @@ def test_grouped_gemm_fp8_pertensor(m, n, k, e, topk, has_bias):
     print("ref: ", ref, ref.shape)
     print("ker: ", output, output.shape)
     torch.testing.assert_close(output, ref, rtol=2e-2, atol=2e-2)
+
+
+# Large-scale per-tensor FP8 cases: many experts, varied topk
+FP8_PERTENSOR_LARGE_CASES = [
+    # (m, n, k, topk)
+    (1, 3072, 4096, 8),       # decode
+    (16, 3072, 4096, 8),      # small batch
+    (512, 3072, 4096, 8),     # medium batch
+    (16384, 3072, 4096, 8),   # large batch
+    (131072, 3072, 4096, 1),  # prefill: large M triggers prefill tile policy
+]
+
+
+@pytest.mark.parametrize("m,n,k,topk", FP8_PERTENSOR_LARGE_CASES)
+@pytest.mark.parametrize("e", [192])
+@pytest.mark.parametrize("has_bias", [False])
+def test_grouped_gemm_fp8_pertensor_large(m, n, k, e, topk, has_bias):
+    seed_everything(8)
+    num_experts = e
+    rows_per_expert = random_partition(e, m * topk)
+    assert (len(rows_per_expert) == e)
+
+    m = sum(rows_per_expert)
+
+    A_fp32 = torch.randn((m, k), device=DEVICE, dtype=torch.float32)
+    a_fp8 = A_fp32.to(torch.float8_e4m3fn)
+    a_scale = torch.randn(1, device=DEVICE, dtype=torch.float32)
+    fill_zero(a_scale)
+
+    B_fp32 = torch.randn((num_experts, n, k),
+                         device=DEVICE,
+                         dtype=torch.float32)
+    b_fp8 = B_fp32.to(torch.float8_e4m3fn).transpose(
+        -1, -2).contiguous().transpose(-1, -2)
+    b_scale = torch.randn(num_experts, device=DEVICE, dtype=torch.float32)
+    fill_zero(b_scale)
+
+    output = torch.zeros((m, n), dtype=torch.float32, device=DEVICE)
+    output_kernel = output.to(KERNEL_DEVICE)
+    cutlass_grouped_gemm(_to_kernel(a_fp8), _to_kernel(a_scale),
+                         _to_kernel(b_fp8), _to_kernel(b_scale),
+                         None, output_kernel,
+                         rows_per_expert, n, k, num_experts)
+    torch.xpu.synchronize()
+    output = output_kernel.cpu()
+
+    # ref
+    ref = []
+    pre_token_sum = 0
+    a_ref = a_fp8.float() * a_scale.item()
+    for i in range(num_experts):
+        cur_token_num = rows_per_expert[i]
+        if cur_token_num == 0:
+            continue
+        input = a_ref[pre_token_sum:pre_token_sum + cur_token_num, :]
+        weight = b_fp8[i, :, :].float() * b_scale[i].item()
+        expert_output = input @ weight.T
+        ref.append(expert_output)
+        pre_token_sum += cur_token_num
+    ref = torch.cat(ref, dim=0)
+
+    torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)

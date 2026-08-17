@@ -216,7 +216,7 @@ struct CollectiveMma<
         expert_first_token_offset * K;
     ElementB const* ptr_B_curr_batch =
         static_cast<ElementB const*>(mainloop_params.ptr_B) +
-        next_group * N * K;
+        static_cast<int64_t>(next_group) * N * K;
     StrideA dA = cutlass::make_cute_packed_stride(InternalStrideA{}, {M, K, 1});
     StrideB dB = cutlass::make_cute_packed_stride(InternalStrideB{}, {N, K, 1});
 

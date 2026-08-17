@@ -228,7 +228,7 @@ struct CollectiveMma<
         expert_first_token_offset * K;
     ElementB const* ptr_B_curr_batch =
         static_cast<ElementB const*>(mainloop_params.ptr_B) +
-        next_group * N * K;
+        static_cast<int64_t>(next_group) * N * K;
     ElementSF const* ptr_SFA_curr_batch;
     ElementSF const* ptr_SFB_curr_batch;
     StrideScaleA dSA;

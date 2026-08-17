@@ -233,14 +233,14 @@ struct CollectiveMma<
       // per-expert element offset by B's packing factor (2 for 4-bit).
       ElementB const* ptr_B_curr_batch =
           static_cast<ElementB const*>(mainloop_params.ptr_B) +
-          next_group * N * K /
+          static_cast<int64_t>(next_group) * N * K /
               (cute::is_same_v<ElementB, cutlass::float_e2m1_t> ? 2 : 1);
       ElementSF const* ptr_SFA_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
           expert_first_scale_offset * scale_k;
       ElementSF const* ptr_SFB_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SB) +
-          next_group * N * scale_k;
+          static_cast<int64_t>(next_group) * N * scale_k;
       StrideA dA =
           cutlass::make_cute_packed_stride(InternalStrideA{}, {M, K, 1});
       StrideB dB =
@@ -265,13 +265,13 @@ struct CollectiveMma<
           expert_first_token_offset * K / 2;
       ElementB const* ptr_B_curr_batch =
           static_cast<ElementB const*>(mainloop_params.ptr_B) +
-          next_group * N * K / 2;
+          static_cast<int64_t>(next_group) * N * K / 2;
       ElementSF const* ptr_SFA_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
           expert_first_scale_offset * scale_k;
       ElementSF const* ptr_SFB_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SB) +
-          next_group * N * scale_k;
+          static_cast<int64_t>(next_group) * N * scale_k;
       StrideA dA =
           cutlass::make_cute_packed_stride(InternalStrideA{}, {M, K, 1});
       StrideB dB =
@@ -486,14 +486,14 @@ struct CollectiveMma<
       // per-expert element offset by B's packing factor (2 for 4-bit).
       ElementB const* ptr_B_curr_batch =
           static_cast<ElementB const*>(mainloop_params.ptr_B) +
-          next_group * N * K /
+          static_cast<int64_t>(next_group) * N * K /
               (cute::is_same_v<ElementB, cutlass::float_e2m1_t> ? 2 : 1);
       ElementSF const* ptr_SFA_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
           expert_first_scale_offset * scale_k;
       ElementSF const* ptr_SFB_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SB) +
-          next_group * N * scale_k;
+          static_cast<int64_t>(next_group) * N * scale_k;
       StrideA dA =
           cutlass::make_cute_packed_stride(InternalStrideA{}, {M, K, 1});
       StrideB dB =
@@ -518,13 +518,13 @@ struct CollectiveMma<
           expert_first_token_offset * K / 2;
       ElementB const* ptr_B_curr_batch =
           static_cast<ElementB const*>(mainloop_params.ptr_B) +
-          next_group * N * K / 2;
+          static_cast<int64_t>(next_group) * N * K / 2;
       ElementSF const* ptr_SFA_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SA) +
           expert_first_scale_offset * scale_k;
       ElementSF const* ptr_SFB_curr_batch =
           static_cast<ElementSF const*>(mainloop_params.ptr_SB) +
-          next_group * N * scale_k;
+          static_cast<int64_t>(next_group) * N * scale_k;
       StrideA dA =
           cutlass::make_cute_packed_stride(InternalStrideA{}, {M, K, 1});
       StrideB dB =
