@@ -619,7 +619,6 @@ def test_rms_norm_per_block_mxfp8_quant(
             group_size {group_size}")
 
     torch.manual_seed(seed)
-    torch.set_default_device("xpu")
     torch.xpu.set_device(device)
 
     quant_dtype = torch.float8_e4m3fn
