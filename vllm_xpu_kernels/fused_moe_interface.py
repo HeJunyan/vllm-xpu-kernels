@@ -14,7 +14,7 @@ except ImportError as e:
     FUSEDMOE_UNAVAILABLE_REASON = str(e)
     FUSEDMOE_AVAILABLE = False
 
-from .moe_utils import quant_act_xpu, ref_fused_moe
+from .moe_utils import quant_act_xpu, ref_fused_moe, reorder_mxfp_scales
 
 REF_FUSED_MOE_ENV = "VLLM_XPU_FUSED_MOE_USE_REF"
 USE_MXFP4_FP8_ENV = "VLLM_XPU_FUSED_MOE_USE_MXFP4_FP8"
@@ -330,11 +330,14 @@ class XpuFusedMoe:
         num_moe_inputs = self.n_experts_per_token * num_rows
         act_quant = a1q_scale is not None
 
-       # mxfp4 activations are packed two values per byte, so the stored
+        # mxfp4 activations are packed two values per byte, so the stored
         # hidden dim is half of the logical contraction (gemm1 K) / output
-        # (gemm2 N) dim expected by the grouped GEMM.
+        # (gemm2 N) dim expected by the grouped GEMM. mxfp4_fp8 (W4A8) keeps
+        # the activation as unpacked mxfp8, so its hidden dim is already
+        # logical and must NOT be doubled.
+        act_is_packed_mxfp4 = act_quant and self.recipe == "mxfp4"
         gemm_hidden_size = 2 * hidden_size \
-            if (act_quant and self.is_mxfp4) else hidden_size
+            if act_is_packed_mxfp4 else hidden_size
 
         if expert_map is None and self.ep_size > 1:
             expert_map = self.expert_map
@@ -371,18 +374,25 @@ class XpuFusedMoe:
             local_experts_num=self.local_experts_num)
 
         ########### gemm1 ##################
+        # The grouped-GEMM writes ptr_D as its policy ElementOutput. The symmetric
+        # block-scaled MXFP policies (mxfp8/mxfp4) emit bf16 output (halves output
+        # traffic), so the buffers must be bf16 to match; other recipes emit fp32.
+        if self.is_mxfp8 or self.is_mxfp4:
+            gemm_output_dtype = torch.bfloat16
+        else:
+            gemm_output_dtype = output.dtype
         gemm1_output = torch.empty((num_moe_inputs, 2 * self.inter_size),
-                                dtype=output.dtype,
+                                dtype=gemm_output_dtype,
                                 device=output.device)
 
-        if act_quant and remapped_scales.dtype == torch.float8_e8m0fnu:
-            input_scales = reorder_mxfp_scales(remapped_scales,
-                                               rows_per_expert)
-        else:
-            input_scales = remapped_scales
+        gemm1_act_scale = remapped_scales
+        if remapped_scales is not None \
+                and remapped_scales.dtype == torch.float8_e8m0fnu:
+            gemm1_act_scale = reorder_mxfp_scales(remapped_scales,
+                                                  rows_per_expert)
         torch.ops._xpu_C.cutlass_grouped_gemm_interface(
             ptr_A=remapped_hidden_states,
-            ptr_A_scale=input_scales,
+            ptr_A_scale=gemm1_act_scale,
             ptr_B=self.w13,
             ptr_B_scale=self.gemm1_wei_scales,
             ptr_bias=self.w13_bias,
@@ -408,7 +418,7 @@ class XpuFusedMoe:
 
         ########### gemm2 ##################
         gemm2_output = torch.empty((num_moe_inputs, gemm_hidden_size),
-                                dtype=output.dtype,
+                                dtype=gemm_output_dtype,
                                 device=output.device)
 
         if act_quant:
@@ -428,9 +438,18 @@ class XpuFusedMoe:
             K=self.inter_size * self.inter_size_scale,
             num_experts=self.num_experts)
 
-        torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
-                                    unpermuted_row_to_permuted_row,
-                                    self.num_experts)
+        if gemm2_output.dtype != output.dtype:
+            gather_output = torch.empty_like(output,
+                                             dtype=gemm2_output.dtype)
+            torch.ops._moe_C.moe_gather(gather_output, gemm2_output,
+                                        topk_weights,
+                                        unpermuted_row_to_permuted_row,
+                                        self.num_experts)
+            output.copy_(gather_output)
+        else:
+            torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
+                                        unpermuted_row_to_permuted_row,
+                                        self.num_experts)
 
 def quant_fp8_act(x: torch.Tensor):
     """
@@ -507,279 +526,3 @@ def quant_mxfp_act(x, recipe):
         x = bfloat16_to_fp4_e2m1fn_x2(x)
     return x, x_scale
 
-
-def reorder_mxfp_scales(A_scales, rows_per_expert):
-    # After cutlass-sycl PR #570, the optimized mxfp mainloop requires the
-    # per-expert scale-A surface width (M dim, since scale is MN-major) to be a
-    # multiple of 4 (ScaleAlignElems for 8-bit scales). Pad each expert's M up
-    # to a multiple of 4 with zeros so the cumulative scale offsets used by the
-    # grouped-gemm kernel (sum of round_up_4(rows)) remain aligned.
-    #
-    # A SYCL kernel does the per-expert transpose + zero-pad on device, keeping
-    # rows_per_expert on device (no .tolist() host sync, so this is safe under
-    # XPU graph capture) and issuing a couple of launches instead of
-    # O(num_experts) small launches. The output is allocated to the static upper
-    # bound sum(round_up_4(rows)) <= total_rows + 3*E; the grouped-GEMM indexes
-    # scale-A by computed per-expert padded offsets, so any extra zero tail rows
-    # are never read.
-    num_experts = rows_per_expert.shape[0]
-    total_padded = A_scales.shape[0] + 3 * num_experts
-    return torch.ops._moe_C.reorder_mxfp_scales(A_scales, rows_per_expert,
-                                                total_padded)
-
-
-def xpu_fused_moe(hidden_states,
-                  w13,
-                  w2,
-                  topk_weights,
-                  topk_ids,
-                  n_experts_per_token,
-                  activation,
-                  num_experts,
-                  w13_scales=None,
-                  w2_scales=None,
-                  w13_bias=None,
-                  w2_bias=None,
-                  act_quant=False,
-                  ep_rank=0,
-                  ep_size=1,
-                  expert_map=None,
-                  output=None,
-                  is_fp8=False,
-                  is_int4=False,
-                  is_mxfp4=False,
-                  is_mxfp8=False,
-                  is_block_fp8=False,
-                  gemm1_clamp_limit: Optional[float] = None):
-    '''
-    hidden_states: [num_rows, hidden_size]
-    w13: [num_experts, 2*inter_size, hidden_size]
-    w13_scales:
-        None for bf16/fp16
-        or [num_experts] for fp8
-        or [num_experts, 2*inter_size, hidden_size // group_size] for 4bits
-    w13_bias: [num_experts, 2*inter_size] or None
-    w2: [num_experts, hidden_size, inter_size]
-    w2_scales:
-        None for bf16/fp16
-        or [num_experts] for fp8
-        or [num_experts, hidden_size, inter_size // group_size] for 4bits
-    w2_bias: [num_experts, hidden_size] or None
-    topk_weights: [num_rows, topk]
-    topk_ids: [num_rows, topk]
-    n_experts_per_token: int
-    activation: str
-    num_experts: int
-    is_int4: bool
-    is_mxfp4: bool
-    is_mxfp8: bool
-    is_block_fp8: bool
-    '''
-
-    ori_token_num, ori_hidden_size = list(hidden_states.shape)
-    data_dtype = hidden_states.dtype
-    input_scales = None
-    scale_dtype = None
-    block_k = 1
-    if output is None:
-        output = torch.zeros_like(hidden_states)
-    else:
-        assert output.shape == hidden_states.shape, \
-            "output shape must be the same as hidden_states shape"
-    if _should_use_ref_fused_moe(is_mxfp8):
-        recipe = _get_recipe(is_fp8, is_mxfp8, is_mxfp4, is_int4,
-                             is_block_fp8)
-        out = ref_fused_moe(recipe=recipe,
-                            x=hidden_states,
-                            w13=w13,
-                            w13_scales=w13_scales,
-                            w13_bias=w13_bias,
-                            w2=w2,
-                            w2_scales=w2_scales,
-                            w2_bias=w2_bias,
-                            expert_weights=topk_weights,
-                            expert_indices=topk_ids,
-                            num_per_tok=n_experts_per_token,
-                            activation=activation,
-                            num_experts=num_experts,
-                            ep_rank=ep_rank,
-                            ep_size=ep_size,
-                            gemm1_clamp_limit=gemm1_clamp_limit)
-        output.copy_(out)
-        return output
-
-    if act_quant:
-        assert (w13_scales is not None)
-        assert (w2_scales is not None)
-        if w13_scales.dtype == torch.float32:
-            # fp8 block
-            data_dtype = torch.float8_e4m3fn
-            scale_dtype = torch.float32
-            block_k = 128
-            hidden_states, input_scales = quant_fp8_act(hidden_states)
-        elif w13_scales.dtype == torch.float8_e8m0fnu:
-            if w13.dtype == torch.float8_e4m3fn:
-                # mxfp8
-                data_dtype = torch.float8_e4m3fn
-                scale_dtype = torch.float8_e8m0fnu
-                block_k = 32
-                hidden_states, input_scales = quant_mxfp_act(
-                    hidden_states, "mxfp8")
-            elif w13.dtype == torch.float4_e2m1fn_x2:
-                # mxfp4
-                data_dtype = torch.float4_e2m1fn_x2
-                scale_dtype = torch.float8_e8m0fnu
-                block_k = 16  # for prologue
-                hidden_states, input_scales = quant_mxfp_act(
-                    hidden_states, "mxfp4")
-
-    # 4bits support [E, N, K]
-    # other types [E, K, N]
-    if not is_int4 and not is_mxfp4 and w13.dtype != torch.float4_e2m1fn_x2:
-        inter_size = list(w13.shape)[-1] // 2
-    else:
-        inter_size = list(w13.shape)[-2] // 2
-
-    assert w13.is_contiguous() and w2.is_contiguous()
-
-    # FIXME: move this to vllm
-    if is_int4 and not hasattr(w13, 'xpu_fused_moe'):
-        w13_tmp = torch.empty_like(w13)
-        w2_tmp = torch.empty_like(w2)
-        for i in range(num_experts):
-            w13_tmp[i] = implement_zp(w13[i])
-            w2_tmp[i] = implement_zp(w2[i])
-        w13_tmp = w13_tmp.contiguous()
-        w2_tmp = w2_tmp.contiguous()
-        w13.data = w13_tmp
-        w2.data = w2_tmp
-        w13.xpu_fused_moe = True
-
-    num_rows, hidden_size = list(hidden_states.shape)
-    num_moe_inputs = n_experts_per_token * num_rows
-    if topk_ids.dtype == torch.int32:
-        topk_ids = topk_ids.to(torch.int64)
-
-    gemm1_output = torch.zeros((num_moe_inputs, 2 * inter_size),
-                               dtype=torch.float32,
-                               device=hidden_states.device)
-    if data_dtype in [torch.float16, torch.bfloat16]:
-        gemm1_output = gemm1_output.to(data_dtype)
-
-    if expert_map is None and ep_size > 1:
-        expert_map = torch.empty((num_experts * ep_size),
-                                 dtype=torch.int32,
-                                 device=hidden_states.device)
-        torch.ops._moe_C.init_expert_map(expert_map, num_experts, ep_rank,
-                                         ep_size)
-
-    if expert_map is not None:
-        total_experts_num = expert_map.shape[0]
-    else:
-        total_experts_num = num_experts * ep_size
-    local_experts_num = num_experts
-
-    remapped_hidden_states = torch.empty(
-        (num_rows * n_experts_per_token, hidden_size),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device)
-    rows_per_expert = torch.zeros((num_experts),
-                                            dtype=torch.int32,
-                                            device=hidden_states.device)
-    unpermuted_row_to_permuted_row = torch.empty(
-        (num_rows, n_experts_per_token),
-        dtype=torch.int32,
-        device=hidden_states.device)
-
-    remapped_hidden_states_scales = None
-    if input_scales is not None:
-        scaled_hidden_size = hidden_size // block_k
-        remapped_hidden_states_scales = torch.empty(
-            (num_rows * n_experts_per_token, scaled_hidden_size),
-            dtype=input_scales.dtype,
-            device=hidden_states.device)
-
-    torch.ops._moe_C.remap_hidden_states(
-        hidden_states=hidden_states,
-        hidden_states_scales=input_scales,
-        remapped_hidden_states=remapped_hidden_states,
-        remapped_hidden_states_scales=remapped_hidden_states_scales,
-        expert_map=expert_map,
-        rows_per_expert=rows_per_expert,
-        unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
-        topk_ids=topk_ids,
-        total_experts_num=total_experts_num,
-        local_experts_num=local_experts_num)
-
-    ########### gemm1 ##################
-    input_B = w13
-    if scale_dtype == torch.float8_e8m0fnu:
-        input_scales = reorder_mxfp_scales(remapped_hidden_states_scales,
-                                           rows_per_expert)
-    elif remapped_hidden_states_scales is not None:
-        input_scales = remapped_hidden_states_scales
-
-    torch.ops._xpu_C.cutlass_grouped_gemm_interface(
-        ptr_A=remapped_hidden_states,
-        ptr_A_scale=input_scales,
-        ptr_B=input_B,
-        ptr_B_scale=w13_scales,
-        ptr_bias=w13_bias,
-        ptr_D=gemm1_output,
-        rows_per_expert=rows_per_expert,
-        N=2 * inter_size,
-        K=ori_hidden_size,
-        num_experts=num_experts)
-
-    # Apply swiglu_limit clamping before activation
-    if gemm1_clamp_limit is not None and gemm1_clamp_limit > 0:
-        gate = gemm1_output[:, :inter_size]
-        up = gemm1_output[:, inter_size:]
-        gate.clamp_(max=gemm1_clamp_limit)
-        up.clamp_(min=-gemm1_clamp_limit, max=gemm1_clamp_limit)
-
-    inter_size_scale = 2 if activation == "relu2_no_mul" else 1
-    # act
-    act_output = torch.empty((num_moe_inputs, inter_size * inter_size_scale),
-                             dtype=gemm1_output.dtype,
-                             device=gemm1_output.device)
-    fused_moe_activation(act_output, gemm1_output, activation)
-
-    ########### gemm2 ##################
-    input_A = act_output.contiguous()
-    input_B = w2
-    gemm2_output = torch.zeros((num_moe_inputs, ori_hidden_size),
-                               dtype=gemm1_output.dtype,
-                               device=gemm1_output.device)
-
-    if data_dtype in [torch.float16, torch.bfloat16]:
-        input_A_scales = None
-    elif data_dtype == torch.float8_e4m3fn:
-        if scale_dtype == torch.float32:
-            input_A, input_A_scales = quant_fp8_act(input_A)
-        elif scale_dtype == torch.float8_e8m0fnu:
-            input_A, input_A_scales = quant_mxfp_act(input_A, "mxfp8")
-            input_A_scales = reorder_mxfp_scales(input_A_scales,
-                                                 rows_per_expert)
-    elif data_dtype == torch.float4_e2m1fn_x2:
-        input_A, input_A_scales = quant_mxfp_act(input_A, "mxfp4")
-        input_A_scales = reorder_mxfp_scales(input_A_scales,
-                                             rows_per_expert)
-
-    torch.ops._xpu_C.cutlass_grouped_gemm_interface(
-        ptr_A=input_A,
-        ptr_A_scale=input_A_scales,
-        ptr_B=input_B,
-        ptr_B_scale=w2_scales,
-        ptr_bias=w2_bias,
-        ptr_D=gemm2_output,
-        rows_per_expert=rows_per_expert,
-        N=ori_hidden_size,
-        K=inter_size * inter_size_scale,
-        num_experts=num_experts)
-
-    torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
-                                unpermuted_row_to_permuted_row,
-                                num_experts)
-
-    return output

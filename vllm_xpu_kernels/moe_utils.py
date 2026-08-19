@@ -184,11 +184,14 @@ def _as_e8m0(s):
 def dequant_act(x, x_scale, recipe):
     if recipe == "fp8block":
         return dequant_fp8_block_act(x, x_scale)
-    elif recipe in ("fp8", "mxfp4_fp8"):
+    elif recipe == "fp8":
         return x.to(torch.float32) * _as_e8m0(x_scale).to(torch.float32)
     elif recipe == "mxfp4":
         return dequant_mxfp4(x, x_scale)
-    elif recipe == "mxfp8":
+    elif recipe in ("mxfp8", "mxfp4_fp8"):
+        # W4A8 (mxfp4_fp8): mxfp4 weights + mxfp8 activations. The activation
+        # is e4m3 with an e8m0 per-32-block scale, i.e. dequantized exactly
+        # like the mxfp8 recipe.
         return dequant_mxfp8(x, x_scale)
     else:
         # bf16: no quantization noise, return unchanged
@@ -198,12 +201,14 @@ def qdq_act(x, recipe):
     if recipe == "fp8block":
         _q, _s = quant_fp8_block_act(x)
         return dequant_fp8_block_act(_q, _s)
-    elif recipe in ("fp8", "mxfp4_fp8"):
+    elif recipe == "fp8":
         return qdq_fp8_act(x)
     elif recipe == "mxfp4":
         _aq, _as = quant_mxfp_act_xpu(x, "mxfp4")
         return dequant_mxfp4(_aq, _as)
-    elif recipe == "mxfp8":
+    elif recipe in ("mxfp8", "mxfp4_fp8"):
+        # W4A8 (mxfp4_fp8): the activation is quantized to mxfp8 (e4m3 + e8m0
+        # per-32-block scale), matching the XE3 W4A8 grouped-GEMM kernel.
         _aq, _as = quant_mxfp_act_xpu(x, "mxfp8")
         return dequant_mxfp8(_aq, _as)
     else:
@@ -269,7 +274,9 @@ def ref_fused_moe(recipe,
         fp8block      - block-wise fp8 quant/dequant on activations and weights
         mxfp8         - mxfp8 (per-32-element group)
         mxfp4         - mxfp4 (per-32-element group)
-        mxfp4_fp8     - mxfp4 weights + per-tensor fp8 activations
+        mxfp4_fp8     - mxfp4 weights + mxfp8 activations (W4A8; e4m3 activation
+                        with e8m0 per-32-block scale, matching the XE3 W4A8
+                        grouped-GEMM kernel)
         fp8           - per-tensor fp8 quant/dequant on activations
 
     NOT supported (raise NotImplementedError):
@@ -340,6 +347,10 @@ def ref_fused_moe(recipe,
         total_experts_num=total_experts_num,
         local_experts_num=local_experts_num)
 
+    # mxfp4 packs two activation values per byte, so the stored hidden dim is
+    # half the logical size and must be doubled here. mxfp4_fp8 (W4A8) keeps
+    # the activation as unpacked mxfp8 (e4m3), so its hidden dim is already the
+    # logical size and must NOT be doubled.
     if a1q_scale is not None and recipe == "mxfp4":
         hidden_size = 2 * hidden_size
 
@@ -422,7 +433,23 @@ def ref_fused_moe(recipe,
 def quant_act_xpu(x, recipe):
     if recipe in ("mxfp4", "mxfp8"):
         return quant_mxfp_act_xpu(x, recipe)
+    elif recipe == "mxfp4_fp8":
+        # W4A8: mxfp4 weights + mxfp8 activations. The activation is quantized
+        # to mxfp8 (e4m3 + e8m0 per-32-block scale) to match the XE3 W4A8
+        # grouped-GEMM kernel (see PR #165).
+        return quant_mxfp_act_xpu(x, "mxfp8")
     elif recipe == "fp8block":
         return quant_fp8_block_act(x)
     else:
         raise NotImplementedError(f"Unsupported recipe for quant_act_xpu: {recipe}") # noqa: E501
+    
+def reorder_mxfp_scales(A_scales, rows_per_expert):  
+    # After cutlass-sycl PR #570, the optimized mxfp mainloop requires the
+    # per-expert scale-A surface width (M dim, since scale is MN-major) to be
+    # a multiple of 4 (ScaleAlignElems for 8-bit scales). Pad each expert's M
+    # up to a multiple of 4 with zeros so the cumulative scale offsets used by
+    # the grouped-gemm kernel (sum of round_up_4(rows)) remain aligned.
+    num_experts = rows_per_expert.shape[0]
+    total_padded = A_scales.shape[0] + 3 * num_experts
+    return torch.ops._moe_C.reorder_mxfp_scales(A_scales, rows_per_expert,
+                                                total_padded)

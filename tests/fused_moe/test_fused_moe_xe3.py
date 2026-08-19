@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import math
+import os
 
 import pytest
 import torch
@@ -10,15 +11,21 @@ from tests.fused_moe.test_grouped_gemm_xe3 import (
     hp_from_1x128, hp_from_128x128, maybe_warm_up_cri_grouped_gemm)
 from tests.utils import seed_everything
 from vllm_xpu_kernels.fused_moe_interface import (XpuFusedMoe, quant_fp8_act,
-                                                  quant_mxfp_act,
-                                                  xpu_fused_moe)
+                                                  quant_mxfp_act)
+from vllm_xpu_kernels.moe_utils import quant_act_xpu
 
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available() or
     (not torch.ops._xpu_C.is_cri(0) and not torch.ops._xpu_C.is_nvl_p(0)),
     reason="XE3 tests only run on CRI or NVL_P.")
 
-DEVICE = "cpu"
+# Device on which the reference tensors are built and the reference
+# computation runs. Selectable via VLLM_XPU_FUSED_MOE_TEST_DEVICE so the
+# suite can run either fully on XPU (default) or with CPU-hosted reference
+# tensors (the original behaviour). The kernel itself always runs on XPU.
+DEVICE = os.environ.get("VLLM_XPU_FUSED_MOE_TEST_DEVICE", "xpu").lower()
+assert DEVICE in ("xpu", "cpu"), (
+    f"VLLM_XPU_FUSED_MOE_TEST_DEVICE must be 'xpu' or 'cpu', got {DEVICE!r}")
 KERNEL_DEVICE = "xpu"
 
 
@@ -327,20 +334,45 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
                             expert_indices, topk, "silu", e)
     kernel_w13, kernel_w2 = to_kernel_weight_layout(recipe, w13, w2)
 
-    output = xpu_fused_moe(hidden_states=_to_kernel(hidden_states),
-                           w13=_to_kernel(kernel_w13),
-                           w13_scales=_to_kernel(w13_scales),
-                           w13_bias=_to_kernel(w13_bias),
-                           w2=_to_kernel(kernel_w2),
-                           w2_scales=_to_kernel(w2_scales),
-                           w2_bias=_to_kernel(w2_bias),
-                           topk_weights=_to_kernel(expert_scores),
-                           topk_ids=_to_kernel(expert_indices),
-                           n_experts_per_token=topk,
-                           activation="silu",
-                           num_experts=e,
-                           act_quant=recipe not in ["bf16", "fp16"])
-    output = output.cpu()
+    # XpuFusedMoe.apply consumes pre-quantized activations together with their
+    # scales (a1q_scale), so quantize the hidden states up-front for the
+    # quantized recipes (bf16/fp16 pass the activations through unchanged).
+    kernel_hidden_states = _to_kernel(hidden_states)
+    a1q_scale = None
+    if recipe not in ["bf16", "fp16"]:
+        kernel_hidden_states, a1q_scale = quant_act_xpu(kernel_hidden_states,
+                                                        recipe)
+
+    fused_moe_impl = XpuFusedMoe(
+        w13=_to_kernel(kernel_w13),
+        w13_scales=_to_kernel(w13_scales),
+        w13_bias=_to_kernel(w13_bias),
+        w2=_to_kernel(kernel_w2),
+        w2_scales=_to_kernel(w2_scales),
+        w2_bias=_to_kernel(w2_bias),
+        n_experts_per_token=topk,
+        activation="silu",
+        num_experts=e,
+        is_mxfp8=(recipe == "mxfp8"),
+        is_mxfp4=(recipe == "mxfp4"),
+        is_block_fp8=(recipe == "fp8block"),
+    )
+
+    output = torch.empty((input_len, hidden_size),
+                         dtype=hidden_states.dtype,
+                         device=KERNEL_DEVICE)
+    fused_moe_impl.apply(
+        output=output,
+        hidden_states=kernel_hidden_states,
+        topk_weights=_to_kernel(expert_scores),
+        topk_ids=_to_kernel(expert_indices),
+        a1q_scale=a1q_scale,
+    )
+    # The kernel output lives on KERNEL_DEVICE (xpu); move it onto the same
+    # device as the reference (DEVICE) so assert_close can compare them. When
+    # DEVICE == "xpu" this is a no-op; when DEVICE == "cpu" it mirrors the
+    # original CPU-hosted comparison.
+    output = output.to(DEVICE)
 
     if data_dtype == torch.float16:
         rtol = 1e-2
@@ -348,203 +380,4 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
     else:
         rtol = 2e-2
         atol = 2e-2
-    torch.testing.assert_close(output, ref_out, rtol=rtol, atol=atol)
-
-
-MXFP8_CLASS_MNK_SHAPES = [
-    (1, 32, 32),
-    (2, 32, 64),
-    (4, 64, 32),
-    (16, 32, 32),
-]
-
-
-@pytest.mark.parametrize("m,n,k", MXFP8_CLASS_MNK_SHAPES)
-@pytest.mark.parametrize("e", [2])
-@pytest.mark.parametrize("topk", [1, 2])
-@pytest.mark.parametrize("has_bias", [True, False])
-def test_fused_moe_mxfp8_class(m, n, k, e, topk, has_bias):
-    """Test XpuFusedMoe class with is_mxfp8=True (uses _apply_kernel)."""
-    if topk > e:
-        pytest.skip(f"topk={topk} > num_experts={e}")
-
-    seed_everything(7)
-
-    input_len = m
-    hidden_size = k
-    intermediate_size = n
-    num_experts = e
-    data_factor = 1.0 / math.sqrt(hidden_size)
-
-    hidden_states = torch.randn(
-        (input_len, hidden_size), device=DEVICE,
-        dtype=torch.float32) * data_factor
-    w13 = torch.randn((num_experts, 2 * intermediate_size, hidden_size),
-                      device=DEVICE, dtype=torch.float32) * data_factor
-    w2 = torch.randn((num_experts, hidden_size, intermediate_size),
-                     device=DEVICE, dtype=torch.float32) * data_factor
-
-    # Quantize weights to MXFP8
-    w13_q, w13_scales = quant_mxfp_weight(w13, "mxfp8")
-    w2_q, w2_scales = quant_mxfp_weight(w2, "mxfp8")
-
-    if has_bias:
-        w13_bias = torch.randn((num_experts, 2 * intermediate_size),
-                               device=DEVICE, dtype=torch.float32) / 16
-        w2_bias = torch.randn((num_experts, hidden_size),
-                              device=DEVICE, dtype=torch.float32) / 16
-    else:
-        w13_bias = None
-        w2_bias = None
-
-    # MoE routing
-    scores = torch.randn((input_len, num_experts),
-                         device=DEVICE, dtype=torch.float32)
-    expert_scores, expert_indices = torch.topk(scores, k=topk, dim=-1,
-                                               sorted=False)
-
-    # Reference: use xpu_fused_moe (known working path)
-    kernel_w13, kernel_w2 = to_kernel_weight_layout("mxfp8", w13_q, w2_q)
-    ref_out = xpu_fused_moe(hidden_states=_to_kernel(hidden_states),
-                            w13=_to_kernel(kernel_w13),
-                            w13_scales=_to_kernel(w13_scales),
-                            w13_bias=_to_kernel(w13_bias),
-                            w2=_to_kernel(kernel_w2),
-                            w2_scales=_to_kernel(w2_scales),
-                            w2_bias=_to_kernel(w2_bias),
-                            topk_weights=_to_kernel(expert_scores),
-                            topk_ids=_to_kernel(expert_indices),
-                            n_experts_per_token=topk,
-                            activation="silu",
-                            num_experts=e,
-                            act_quant=True)
-
-    # XpuFusedMoe class path
-    moe = XpuFusedMoe(
-        w13=_to_kernel(kernel_w13),
-        w13_scales=_to_kernel(w13_scales),
-        w13_bias=_to_kernel(w13_bias),
-        w2=_to_kernel(kernel_w2),
-        w2_scales=_to_kernel(w2_scales),
-        w2_bias=_to_kernel(w2_bias),
-        n_experts_per_token=topk,
-        activation="silu",
-        num_experts=e,
-        is_mxfp8=True)
-
-    hidden_states_xpu = _to_kernel(hidden_states)
-    # Quantize activation (same as xpu_fused_moe does internally)
-    hidden_states_q, a1q_scale = quant_mxfp_act(hidden_states_xpu, "mxfp8")
-
-    output = torch.zeros((input_len, hidden_size), dtype=torch.bfloat16,
-                         device=KERNEL_DEVICE)
-    moe.apply(output, hidden_states_q, _to_kernel(expert_scores),
-              _to_kernel(expert_indices), a1q_scale=a1q_scale)
-
-    ref_out = ref_out.cpu().to(torch.bfloat16)
-    output = output.cpu()
-
-    rtol = 1.6e-2
-    atol = 5e-2
-    torch.testing.assert_close(output, ref_out, rtol=rtol, atol=atol)
-
-
-MXFP4_CLASS_MNK_SHAPES = [
-    (1, 32, 32),
-    (2, 32, 64),
-    (4, 64, 32),
-    (16, 32, 32),
-]
-
-
-@pytest.mark.parametrize("m,n,k", MXFP4_CLASS_MNK_SHAPES)
-@pytest.mark.parametrize("e", [2])
-@pytest.mark.parametrize("topk", [1, 2])
-@pytest.mark.parametrize("has_bias", [True, False])
-def test_fused_moe_mxfp4_class(m, n, k, e, topk, has_bias):
-    """Test XpuFusedMoe class with is_mxfp4=True (uses _apply_kernel)."""
-    if torch.ops._xpu_C.is_nvl_p(0):
-        pytest.skip(reason="MXFP4 is not supported on NVL_P")
-    if topk > e:
-        pytest.skip(f"topk={topk} > num_experts={e}")
-
-    seed_everything(7)
-
-    input_len = m
-    hidden_size = k
-    intermediate_size = n
-    num_experts = e
-    data_factor = 1.0 / math.sqrt(hidden_size)
-
-    hidden_states = torch.randn(
-        (input_len, hidden_size), device=DEVICE,
-        dtype=torch.float32) * data_factor
-    w13 = torch.randn((num_experts, 2 * intermediate_size, hidden_size),
-                      device=DEVICE, dtype=torch.float32) * data_factor
-    w2 = torch.randn((num_experts, hidden_size, intermediate_size),
-                     device=DEVICE, dtype=torch.float32) * data_factor
-
-    # Quantize weights to MXFP4
-    w13_q, w13_scales = quant_mxfp_weight(w13, "mxfp4")
-    w2_q, w2_scales = quant_mxfp_weight(w2, "mxfp4")
-
-    if has_bias:
-        w13_bias = torch.randn((num_experts, 2 * intermediate_size),
-                               device=DEVICE, dtype=torch.float32) / 16
-        w2_bias = torch.randn((num_experts, hidden_size),
-                              device=DEVICE, dtype=torch.float32) / 16
-    else:
-        w13_bias = None
-        w2_bias = None
-
-    # MoE routing
-    scores = torch.randn((input_len, num_experts),
-                         device=DEVICE, dtype=torch.float32)
-    expert_scores, expert_indices = torch.topk(scores, k=topk, dim=-1,
-                                               sorted=False)
-
-    # Reference: use xpu_fused_moe (known working path)
-    kernel_w13, kernel_w2 = to_kernel_weight_layout("mxfp4", w13_q, w2_q)
-    ref_out = xpu_fused_moe(hidden_states=_to_kernel(hidden_states),
-                            w13=_to_kernel(kernel_w13),
-                            w13_scales=_to_kernel(w13_scales),
-                            w13_bias=_to_kernel(w13_bias),
-                            w2=_to_kernel(kernel_w2),
-                            w2_scales=_to_kernel(w2_scales),
-                            w2_bias=_to_kernel(w2_bias),
-                            topk_weights=_to_kernel(expert_scores),
-                            topk_ids=_to_kernel(expert_indices),
-                            n_experts_per_token=topk,
-                            activation="silu",
-                            num_experts=e,
-                            act_quant=True,
-                            is_mxfp4=True)
-
-    # XpuFusedMoe class path
-    moe = XpuFusedMoe(
-        w13=_to_kernel(kernel_w13),
-        w13_scales=_to_kernel(w13_scales),
-        w13_bias=_to_kernel(w13_bias),
-        w2=_to_kernel(kernel_w2),
-        w2_scales=_to_kernel(w2_scales),
-        w2_bias=_to_kernel(w2_bias),
-        n_experts_per_token=topk,
-        activation="silu",
-        num_experts=e,
-        is_mxfp4=True)
-
-    hidden_states_xpu = _to_kernel(hidden_states)
-    # Quantize activation (same as xpu_fused_moe does internally)
-    hidden_states_q, a1q_scale = quant_mxfp_act(hidden_states_xpu, "mxfp4")
-
-    output = torch.zeros((input_len, hidden_size), dtype=torch.bfloat16,
-                         device=KERNEL_DEVICE)
-    moe.apply(output, hidden_states_q, _to_kernel(expert_scores),
-              _to_kernel(expert_indices), a1q_scale=a1q_scale)
-
-    ref_out = ref_out.cpu().to(torch.bfloat16)
-    output = output.cpu()
-
-    rtol = 1.6e-2
-    atol = 5e-2
     torch.testing.assert_close(output, ref_out, rtol=rtol, atol=atol)
