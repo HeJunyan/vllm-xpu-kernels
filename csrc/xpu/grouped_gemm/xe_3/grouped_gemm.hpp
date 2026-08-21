@@ -86,6 +86,127 @@ at::Tensor grouped_gemm_func(
   auto A_dtype = ptr_A.dtype();
   auto avg_tokens_cnt = ptr_A.size(0) / groups;
 
+  // Every stride is rebuilt from {N, K, groups} via make_cute_packed_stride()
+  // and the tensors' own strides are never read, so a mismatched layout is
+  // silently wrong instead of an error. LayoutA/C/D are RowMajor for all
+  // policies; LayoutB is RowMajor (dense along N) except for the 4-bit weight
+  // policies (mxfp4, w4a8) which are ColumnMajor (dense along K). Both scale
+  // surfaces are MN-major.
+  const bool a_is_fp4 = A_dtype == at::kFloat4_e2m1fn_x2;
+  const bool b_is_fp4 = ptr_B.dtype() == at::kFloat4_e2m1fn_x2;
+  const int64_t A_K = a_is_fp4 ? K / 2 : K;
+
+  TORCH_CHECK(groups > 0 && N > 0 && K > 0, "N, K and num_experts must be > 0");
+  TORCH_CHECK(!a_is_fp4 || K % 2 == 0, "K must be even for 4-bit ptr_A");
+
+  // The XE 2D block copies need each row of B and D to start on a 128-bit
+  // boundary, and cutlass reports a violation by aborting the process rather
+  // than returning, so reject it here instead.
+  const int64_t b_bits = ptr_B.dtype().itemsize() * 8 / (b_is_fp4 ? 2 : 1);
+  const int64_t d_bits = ptr_D.dtype().itemsize() * 8;
+  TORCH_CHECK(
+      (N * b_bits) % 128 == 0 && (N * d_bits) % 128 == 0,
+      "N must be a multiple of 128 bits of the weight and output element type, "
+      "so N must be a multiple of 32 for 4-bit, 16 for 8-bit and 8 for 16-bit "
+      "weights");
+
+  TORCH_CHECK(
+      ptr_A.dim() == 2 && ptr_A.size(1) == A_K && ptr_A.is_contiguous(),
+      "ptr_A must be a contiguous 2D [total_M, K] tensor, with K halved when "
+      "it is 4-bit packed");
+
+  TORCH_CHECK(
+      ptr_D.dim() == 2 && ptr_D.size(0) == ptr_A.size(0) &&
+          ptr_D.size(1) == N && ptr_D.is_contiguous(),
+      "ptr_D must be a contiguous 2D [total_M, N] tensor");
+
+  TORCH_CHECK(
+      ptr_B.dim() == 3 && ptr_B.size(0) == groups,
+      "ptr_B must be 3D with one leading entry per expert");
+  if (b_is_fp4) {
+    TORCH_CHECK(
+        ptr_B.size(1) == N && ptr_B.size(2) == K / 2 && ptr_B.is_contiguous(),
+        "4-bit ptr_B must be a contiguous [num_experts, N, K/2] tensor");
+  } else {
+    // Element (e, n, k) must sit at e * N * K + n + k * N. Callers spell that
+    // either as a contiguous (E, K, N) or as an (E, N, K) view of it.
+    TORCH_CHECK(
+        (ptr_B.size(1) == K && ptr_B.size(2) == N && ptr_B.is_contiguous()) ||
+            (ptr_B.size(1) == N && ptr_B.size(2) == K &&
+             ptr_B.stride(0) == N * K && (N == 1 || ptr_B.stride(1) == 1) &&
+             (K == 1 || ptr_B.stride(2) == N)),
+        "ptr_B must be dense along N: either a contiguous [num_experts, K, N] "
+        "tensor or its [num_experts, N, K] transposed view");
+  }
+
+  TORCH_CHECK(
+      rows_per_expert.dim() == 1 && rows_per_expert.numel() == groups &&
+          rows_per_expert.scalar_type() == at::kInt,
+      "rows_per_expert must be a 1D int32 tensor with one entry per expert");
+
+  // cutlass_grouped_gemm_xe3() has already expanded the caller's
+  // [num_experts, N] bias into one fp32 row per token (ElementC).
+  if (ptr_bias) {
+    TORCH_CHECK(
+        ptr_bias->dim() == 2 && ptr_bias->size(0) == ptr_A.size(0) &&
+            ptr_bias->size(1) == N && ptr_bias->is_contiguous() &&
+            ptr_bias->scalar_type() == at::kFloat,
+        "ptr_bias must expand to a contiguous fp32 [total_M, N] tensor, so the "
+        "caller's bias must be [num_experts, N]");
+  }
+
+  if (ptr_A_scale && ptr_A_scale->dtype() == at::kFloat8_e8m0fnu) {
+    const int64_t scale_k = (K + 31) / 32;
+    TORCH_CHECK(
+        ptr_B_scale && ptr_B_scale->dtype() == at::kFloat8_e8m0fnu,
+        "block-scaled grouped GEMM requires an e8m0 ptr_B_scale");
+    // reorder_mxfp_scales() hands over a plain [padded_M, scale_k] buffer that
+    // it filled MN-major, so only its extent is meaningful here. Each expert's
+    // row count is rounded up to a multiple of 4.
+    TORCH_CHECK(
+        ptr_A_scale->dim() == 2 && ptr_A_scale->size(1) == scale_k &&
+            ptr_A_scale->is_contiguous(),
+        "ptr_A_scale must be a contiguous [padded_M, ceil(K/32)] tensor");
+    TORCH_CHECK(
+        ptr_A_scale->size(0) >= ptr_A.size(0) &&
+            ptr_A_scale->size(0) <= ptr_A.size(0) + 3 * groups,
+        "ptr_A_scale must have total_M rows with each expert padded up to a "
+        "multiple of 4");
+    // Element (e, n, k) must sit at e * N * scale_k + n + k * N.
+    TORCH_CHECK(
+        ptr_B_scale->dim() == 3 && ptr_B_scale->size(0) == groups &&
+            ((ptr_B_scale->size(1) == scale_k && ptr_B_scale->size(2) == N &&
+              ptr_B_scale->is_contiguous()) ||
+             (ptr_B_scale->size(1) == N && ptr_B_scale->size(2) == scale_k &&
+              ptr_B_scale->stride(0) == N * scale_k &&
+              (N == 1 || ptr_B_scale->stride(1) == 1) &&
+              (scale_k == 1 || ptr_B_scale->stride(2) == N))),
+        "ptr_B_scale must be dense along N: either a contiguous "
+        "[num_experts, ceil(K/32), N] tensor or its [num_experts, N, "
+        "ceil(K/32)] transposed view");
+  } else if (ptr_A_scale && ptr_A_scale->dtype() == at::kFloat) {
+    TORCH_CHECK(
+        ptr_B_scale && ptr_B_scale->dtype() == at::kFloat,
+        "fp8 grouped GEMM requires a float32 ptr_B_scale");
+    if (ptr_A_scale->numel() == 1) {
+      TORCH_CHECK(
+          ptr_B_scale->numel() == groups,
+          "per-tensor fp8 ptr_B_scale must hold one scale per expert");
+    } else {
+      const int64_t scale_k = (K + 127) / 128;
+      const int64_t scale_n = (N + 127) / 128;
+      TORCH_CHECK(
+          ptr_A_scale->numel() == ptr_A.size(0) * scale_k,
+          "block fp8 ptr_A_scale must hold total_M * ceil(K/128) scales");
+      TORCH_CHECK(
+          ptr_B_scale->dim() == 3 && ptr_B_scale->size(0) == groups &&
+              ptr_B_scale->size(1) == scale_n &&
+              ptr_B_scale->size(2) == scale_k && ptr_B_scale->is_contiguous(),
+          "block fp8 ptr_B_scale must be a contiguous [num_experts, "
+          "ceil(N/128), ceil(K/128)] tensor");
+    }
+  }
+
 #define CALL_KERNEL_WITH_POLICY(POLICY)                \
   grouped_gemm::kernel_functor<POLICY>(                \
       dpcpp_queue,                                     \
