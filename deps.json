@@ -7,9 +7,9 @@
     }
   },
   "onednn": {
-    "repo": "https://github.com/uxlfoundation/oneDNN",
+    "repo": "https://github.com/intel-innersource/libraries.performance.math.onednn",
     "revisions": {
-      "cri": "main",
+      "cri": "prv-cri",
       "default": "main"
     }
   }

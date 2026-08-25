@@ -51,12 +51,12 @@ set(BUILD_SYCL_TLA_KERNELS
     CACHE BOOL "Build SYCL-TLA based kernels for XPU")
 
 set(ONEDNN_GIT_REPO
-    "https://github.com/uxlfoundation/oneDNN.git"
+    "https://github.com/intel-innersource/libraries.performance.math.onednn.git"
     CACHE STRING "oneDNN git repository URL")
 
-# rls-v3.12
+# rls-v3.13
 set(ONEDNN_GIT_TAG
-    "80afa71049cd69a3df32adcccb623b12cd7baa22"
+    "0e2a5bfeef1bfbffc3137464606540233086ce9b"
     CACHE STRING "oneDNN git commit hash or tag")
 # ARCHITECTURE OPTIONS
 option(VLLM_XPU_ENABLE_XE2 "Enable XE2 architecture kernels" ON)
@@ -155,10 +155,10 @@ if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
   # CRI simulator, so disable them for this build.
   set(VLLM_XPU_ENABLE_XE_DEFAULT OFF)
   set(ONEDNN_GIT_REPO
-      "https://github.com/uxlfoundation/oneDNN.git"
+      "https://github.com/intel-innersource/libraries.performance.math.onednn.git"
       CACHE STRING "oneDNN git repository URL" FORCE)
   set(ONEDNN_GIT_TAG
-      "main"
+      "prv-cri"
       CACHE STRING "oneDNN git commit hash or tag" FORCE)
 endif()
 
