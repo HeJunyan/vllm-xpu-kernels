@@ -174,7 +174,9 @@ void cutlass_chunk_prefill_impl(
       "is_local=false, is_sink=false");
   if (is_lse) {
     args.softmax_lse = softmax_lse.value().data_ptr<float>();
-    args.lse_stride = num_heads_q;
+    // softmax_lse is allocated as (num_heads_q, total_seqlen_q); stride
+    // along the query-row dimension is total_seqlen_q.
+    args.lse_stride = total_seqlen_q;
   }
   args.is_prefill =
       is_prefill.has_value() ? is_prefill.value().data_ptr() : nullptr;
