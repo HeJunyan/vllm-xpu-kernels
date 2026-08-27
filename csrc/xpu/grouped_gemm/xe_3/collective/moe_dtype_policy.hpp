@@ -582,7 +582,7 @@ class moe_w4a8_policy : public moe_policy_base {
 
   using ElementA = typename ElementTypeA::DataType;
   using ElementB = typename ElementTypeB::DataType;
-  using ElementOutput = float;
+  using ElementOutput = cutlass::bfloat16_t;
   using ElementScaleA = typename ElementTypeA::ScaleFactorType;
   using ElementScaleB = typename ElementTypeB::ScaleFactorType;
   using LayoutB = cutlass::layout::ColumnMajor;
@@ -622,7 +622,7 @@ class moe_fp8block_policy : public moe_policy_base {
 
   using ElementA = ElementType;
   using ElementB = ElementType;
-  using ElementOutput = float;
+  using ElementOutput = cutlass::bfloat16_t;
   using ElementScaleA = float;
   using ElementScaleB = float;
 

@@ -130,6 +130,21 @@ def _quant_mxfp4_act_xpu(x):
                  memory_format=torch.preserve_format)
     return x_q, x_s
 
+def quant_fp8_pertensor_act(x):
+    """
+    Quantize to per-tensor fp8: one global scalar for the whole tensor.
+
+    Returns (q, scale) where scale has shape [1] (float32), matching what the
+    per-tensor grouped-GEMM policy expects for ptr_A_scale.
+    """
+    x_fp = x.to(torch.float32)
+    scale = (x_fp.abs().max() / FP8_E4M3_MAX).clamp(
+        min=torch.finfo(torch.float32).eps).reshape(1)
+    q = (x_fp / scale).clamp(FP8_E4M3_MIN,
+                             FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    return q, scale
+
+
 def qdq_fp8_act(x):
     x_fp = x.to(torch.float32)
     scale = (x_fp.abs().max() / FP8_E4M3_MAX).clamp(
@@ -440,6 +455,8 @@ def quant_act_xpu(x, recipe):
         return quant_mxfp_act_xpu(x, "mxfp8")
     elif recipe == "fp8block":
         return quant_fp8_block_act(x)
+    elif recipe == "fp8":
+        return quant_fp8_pertensor_act(x)
     else:
         raise NotImplementedError(f"Unsupported recipe for quant_act_xpu: {recipe}") # noqa: E501
     

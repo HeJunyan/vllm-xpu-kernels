@@ -429,7 +429,7 @@ def test_grouped_gemm_w4a8(m, n, k, e, topk, has_bias):
                            device=DEVICE)
     else:
         bias = None
-    output = torch.zeros((m, n), dtype=torch.float32, device=DEVICE)
+    output = torch.zeros((m, n), dtype=torch.bfloat16, device=DEVICE)
     output_kernel = output.to(KERNEL_DEVICE)
     cutlass_grouped_gemm(_to_kernel(A), _to_kernel(A_scale_k), _to_kernel(B),
                          _to_kernel(B_scale), _to_kernel(bias), output_kernel,
@@ -456,9 +456,9 @@ def test_grouped_gemm_w4a8(m, n, k, e, topk, has_bias):
             expert_output += bias[i]
         ref.append(expert_output)
         pre_token_sum += cur_token_num
-    ref = torch.cat(ref, dim=0)
+    ref = torch.cat(ref, dim=0).bfloat16()
 
-    torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(output, ref, rtol=2e-2, atol=2e-2)
 
 
 def hp_from_128x128(x_lp, x_scale):
@@ -524,7 +524,7 @@ def test_grouped_gemm_fp8block(m, n, k, e, topk, recipe, has_bias):
     else:
         bias = None
 
-    output = torch.zeros((m, n), dtype=torch.float32, device=DEVICE)
+    output = torch.zeros((m, n), dtype=torch.bfloat16, device=DEVICE)
     output_kernel = output.to(KERNEL_DEVICE)
     cutlass_grouped_gemm(_to_kernel(a_fp8), _to_kernel(a_scales),
                          _to_kernel(b_fp8), _to_kernel(b_scales),
@@ -548,11 +548,11 @@ def test_grouped_gemm_fp8block(m, n, k, e, topk, recipe, has_bias):
             expert_output += bias[i]
         ref.append(expert_output)
         pre_token_sum += cur_token_num
-    ref = torch.cat(ref, dim=0)
+    ref = torch.cat(ref, dim=0).bfloat16()
 
     print("ref: ", ref, ref.shape)
     print("ker: ", output, output.shape)
-    torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(output, ref, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
@@ -658,7 +658,7 @@ def test_grouped_gemm_fp8_pertensor_large(m, n, k, e, topk, has_bias):
     b_scale = torch.randn(num_experts, device=DEVICE, dtype=torch.float32)
     fill_zero(b_scale)
 
-    output = torch.zeros((m, n), dtype=torch.float32, device=DEVICE)
+    output = torch.zeros((m, n), dtype=torch.bfloat16, device=DEVICE)
     output_kernel = output.to(KERNEL_DEVICE)
     cutlass_grouped_gemm(_to_kernel(a_fp8), _to_kernel(a_scale),
                          _to_kernel(b_fp8), _to_kernel(b_scale),
@@ -680,6 +680,6 @@ def test_grouped_gemm_fp8_pertensor_large(m, n, k, e, topk, has_bias):
         expert_output = input @ weight.T
         ref.append(expert_output)
         pre_token_sum += cur_token_num
-    ref = torch.cat(ref, dim=0)
+    ref = torch.cat(ref, dim=0).bfloat16()
 
-    torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(output, ref, rtol=2e-2, atol=2e-2)

@@ -10,9 +10,10 @@ from tests.fused_moe.test_grouped_gemm_xe3 import (
     bfloat16_to_fp4_e2m1fn_x2, data_to_mx_scale, fp4_e2m1fn_x2_to_float,
     hp_from_1x128, hp_from_128x128, maybe_warm_up_cri_grouped_gemm)
 from tests.utils import seed_everything
-from vllm_xpu_kernels.fused_moe_interface import (XpuFusedMoe, quant_fp8_act,
+from vllm_xpu_kernels.fused_moe_interface import (USE_MXFP4_FP8_ENV,
+                                                  XpuFusedMoe, quant_fp8_act,
                                                   quant_mxfp_act)
-from vllm_xpu_kernels.moe_utils import quant_act_xpu
+from vllm_xpu_kernels.moe_utils import quant_act_xpu, quant_fp8_pertensor_act
 
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available() or
@@ -68,7 +69,7 @@ MINI_PYTEST_PARAMS = {
         ],
         "e": [2],
         "topk": [2],
-        "recipe": ["bf16", "mxfp8", "mxfp4", "fp8block"],
+        "recipe": ["bf16", "mxfp8", "mxfp4", "fp8block", "fp8", "mxfp4_fp8"],
         "has_bias": [True]
     }
 }
@@ -79,7 +80,22 @@ RECIPE_TO_DTYPE = {
     "mxfp8": (torch.float8_e4m3fn, torch.float8_e8m0fnu),
     "fp8block": (torch.float8_e4m3fn, torch.float32),
     "mxfp4": (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu),
+    # Per-tensor fp8: one scalar per expert for the weights.
+    "fp8": (torch.float8_e4m3fn, torch.float32),
+    # W4A8: mxfp4 weights consumed with mxfp8 activations.
+    "mxfp4_fp8": (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu),
 }
+
+
+def quant_fp8_pertensor_weight(w):
+    """Quantize [E, ...] weights to fp8 with a single scalar per expert."""
+    F8E4M3_MAX_VAL = torch.finfo(torch.float8_e4m3fn).max
+    num_experts = w.shape[0]
+    amax = w.reshape(num_experts, -1).float().abs().amax(dim=1)
+    scales = (amax / F8E4M3_MAX_VAL).clamp(min=torch.finfo(torch.float32).eps)
+    q = (w.float() / scales.view(-1, 1, 1)).clamp(
+        -F8E4M3_MAX_VAL, F8E4M3_MAX_VAL).to(torch.float8_e4m3fn)
+    return q, scales
 
 
 def quant_mxfp_weight(w, recipe):
@@ -113,7 +129,7 @@ def quant_mxfp_weight(w, recipe):
 
 def to_kernel_weight_layout(recipe, w13, w2):
     # XE3 grouped GEMM expects non-MXFP4 weights in [E, K, N] layout.
-    if recipe == "mxfp4":
+    if recipe in ("mxfp4", "mxfp4_fp8"):
         return w13, w2
     return w13.transpose(-1, -2).contiguous(), w2.transpose(-1, -2).contiguous()
 
@@ -173,6 +189,25 @@ def ref_fused_moe(recipe,
             -1, 1).float())
         w13 = w13.reshape(w13_ori_shape[:-1] + (w13_ori_shape[-1] * 2, ))
         w2 = w2.reshape(w2_ori_shape[:-1] + (w2_ori_shape[-1] * 2, ))
+    elif recipe == "mxfp4_fp8":
+        # W4A8: mxfp8 activations against mxfp4 weights.
+        act_ori_shape = x.shape
+        _q, _scale = quant_mxfp_act(x, "mxfp8")
+        x = _q.float().reshape(-1, 32) * (_scale.reshape(-1, 1).float())
+        x = x.reshape(act_ori_shape)
+        w13_ori_shape = w13.shape
+        w2_ori_shape = w2.shape
+        w13 = fp4_e2m1fn_x2_to_float(w13).reshape(
+            -1, 32) * (w13_scales.reshape(-1, 1).float())
+        w2 = fp4_e2m1fn_x2_to_float(w2).reshape(-1, 32) * (w2_scales.reshape(
+            -1, 1).float())
+        w13 = w13.reshape(w13_ori_shape[:-1] + (w13_ori_shape[-1] * 2, ))
+        w2 = w2.reshape(w2_ori_shape[:-1] + (w2_ori_shape[-1] * 2, ))
+    elif recipe == "fp8":
+        _q, _scale = quant_fp8_pertensor_act(x)
+        x = _q.float() * _scale
+        w13 = w13.float() * w13_scales.view(-1, 1, 1)
+        w2 = w2.float() * w2_scales.view(-1, 1, 1)
 
     for expert_id, end_idx in enumerate(tokens_per_expert):
         start_idx = 0 if expert_id == 0 else tokens_per_expert[expert_id - 1]
@@ -224,6 +259,14 @@ def ref_fused_moe(recipe,
                 -1, 32) * (_scale.reshape(-1, 1).float())
             gemm2_input = gemm2_input.reshape(_q.shape[:-1] +
                                               (_q.shape[-1] * 2, ))
+        elif recipe == "mxfp4_fp8":
+            _q, _scale = quant_mxfp_act(gemm2_input, "mxfp8")
+            gemm2_input = _q.float().reshape(-1, 32) * (_scale.reshape(
+                -1, 1).float())
+            gemm2_input = gemm2_input.reshape(_q.shape)
+        elif recipe == "fp8":
+            _q, _scale = quant_fp8_pertensor_act(gemm2_input)
+            gemm2_input = _q.float() * _scale
         ###
 
         expert_out = ((gemm2_input) @ expert_w2.T.to(torch.float32))
@@ -245,14 +288,20 @@ def ref_fused_moe(recipe,
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
-@pytest.mark.parametrize("recipe",
-                         ["bf16", "fp16", "mxfp8", "mxfp4", "fp8block"])
+@pytest.mark.parametrize("recipe", [
+    "bf16", "fp16", "mxfp8", "mxfp4", "fp8block", "fp8", "mxfp4_fp8"
+])
 @pytest.mark.parametrize("has_bias", [True, False])
-def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
-    if recipe == "mxfp4" and torch.ops._xpu_C.is_nvl_p(0):
+def test_fused_moe(m, n, k, e, topk, recipe, has_bias, monkeypatch):
+    if recipe in ("mxfp4", "mxfp4_fp8") and torch.ops._xpu_C.is_nvl_p(0):
         pytest.skip(reason="MXFP4 is not supported on NVL_P")
     if topk > e:
         pytest.skip(f"topk={topk} > num_experts={e}")
+
+    # W4A8 shares the mxfp4 weight dtype, so it is only reachable through the
+    # opt-in env var that _get_recipe() consults.
+    if recipe == "mxfp4_fp8":
+        monkeypatch.setenv(USE_MXFP4_FP8_ENV, "1")
 
     seed_everything(7)
     data_dtype, scale_dtype = RECIPE_TO_DTYPE.get(recipe, (None, None))
@@ -302,10 +351,13 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
         block_k = 32
         w13, w13_scales = quant_mxfp_weight(w13, "mxfp8")
         w2, w2_scales = quant_mxfp_weight(w2, "mxfp8")
-    elif recipe == "mxfp4":
+    elif recipe == "mxfp4" or recipe == "mxfp4_fp8":
         block_k = 32
         w13, w13_scales = quant_mxfp_weight(w13, "mxfp4")
         w2, w2_scales = quant_mxfp_weight(w2, "mxfp4")
+    elif recipe == "fp8":
+        w13, w13_scales = quant_fp8_pertensor_weight(w13)
+        w2, w2_scales = quant_fp8_pertensor_weight(w2)
 
     if has_bias:
         w13_bias = torch.randn((num_experts, 2 * intermediate_size),
@@ -354,8 +406,9 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias):
         activation="silu",
         num_experts=e,
         is_mxfp8=(recipe == "mxfp8"),
-        is_mxfp4=(recipe == "mxfp4"),
+        is_mxfp4=(recipe in ("mxfp4", "mxfp4_fp8")),
         is_block_fp8=(recipe == "fp8block"),
+        is_fp8=(recipe == "fp8"),
     )
 
     output = torch.empty((input_len, hidden_size),

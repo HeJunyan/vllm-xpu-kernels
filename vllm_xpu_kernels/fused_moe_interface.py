@@ -329,6 +329,10 @@ class XpuFusedMoe:
         num_rows, hidden_size = hidden_states.shape
         num_moe_inputs = self.n_experts_per_token * num_rows
         act_quant = a1q_scale is not None
+        # Per-tensor fp8 uses a single global scalar that is invariant under
+        # the row permutation/duplication, so it is passed straight through
+        # instead of being remapped.
+        per_tensor_scale = act_quant and a1q_scale.ndim <= 1
 
         # mxfp4 activations are packed two values per byte, so the stored
         # hidden dim is half of the logical contraction (gemm1 K) / output
@@ -342,7 +346,7 @@ class XpuFusedMoe:
         if expert_map is None and self.ep_size > 1:
             expert_map = self.expert_map
 
-        if act_quant and a1q_scale.ndim == 2:
+        if act_quant and not per_tensor_scale:
             remapped_scales = torch.empty(
                 (num_rows * self.n_experts_per_token, a1q_scale.shape[1]),
                 dtype=a1q_scale.dtype,
@@ -363,7 +367,7 @@ class XpuFusedMoe:
 
         torch.ops._moe_C.remap_hidden_states(
             hidden_states=hidden_states,
-            hidden_states_scales=a1q_scale,
+            hidden_states_scales=None if per_tensor_scale else a1q_scale,
             remapped_hidden_states=remapped_hidden_states,
             remapped_hidden_states_scales=remapped_scales,
             expert_map=expert_map,
@@ -374,19 +378,20 @@ class XpuFusedMoe:
             local_experts_num=self.local_experts_num)
 
         ########### gemm1 ##################
-        # The grouped-GEMM writes ptr_D as its policy ElementOutput. The symmetric
-        # block-scaled MXFP policies (mxfp8/mxfp4) emit bf16 output (halves output
-        # traffic), so the buffers must be bf16 to match; other recipes emit fp32.
-        if self.is_mxfp8 or self.is_mxfp4:
-            gemm_output_dtype = torch.bfloat16
-        else:
-            gemm_output_dtype = output.dtype
+        # The grouped-GEMM writes ptr_D as its policy ElementOutput, so the
+        # scratch buffers must match that dtype rather than the caller's
+        # output dtype. Every policy emits bf16 except the fp16 one (see
+        # csrc/xpu/grouped_gemm/xe_3/collective/moe_dtype_policy.hpp).
+        gemm_output_dtype = (torch.float16 if output.dtype == torch.float16
+                             else torch.bfloat16)
         gemm1_output = torch.empty((num_moe_inputs, 2 * self.inter_size),
                                 dtype=gemm_output_dtype,
                                 device=output.device)
 
         gemm1_act_scale = remapped_scales
-        if remapped_scales is not None \
+        if per_tensor_scale:
+            gemm1_act_scale = a1q_scale
+        elif remapped_scales is not None \
                 and remapped_scales.dtype == torch.float8_e8m0fnu:
             gemm1_act_scale = reorder_mxfp_scales(remapped_scales,
                                                   rows_per_expert)
