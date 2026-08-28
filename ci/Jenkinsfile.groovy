@@ -89,6 +89,12 @@ def KEEP_WORKSPACE_VALUE = booleanParamOrDefault('KEEP_WORKSPACE', false)
 def NO_CACHE_VALUE = booleanParamOrDefault('NO_CACHE', false)
 def WORKSPACE_RECLAIM_IMAGE_VALUE = params.WORKSPACE_RECLAIM_IMAGE ?: 'intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04'
 def GIT_CREDENTIAL_ID_VALUE = params.GIT_CREDENTIAL_ID ?: 'dujun_github_token'
+def UPLOAD_WHL_TO_ARTIFACTORY_VALUE = booleanParamOrEnvListOrDefault('UPLOAD_WHL_TO_ARTIFACTORY', ['UPLOAD_WHL_TO_ARTIFACTORY'], true)
+def ARTIFACTORY_UPLOAD_PATH_VALUE = stringParamOrEnvListOrDefault('ARTIFACTORY_UPLOAD_PATH', ['ARTIFACTORY_UPLOAD_PATH'], 'local-ci')
+def UPLOAD_ARTIFACTORY_CREDENTIAL_ID_VALUE = stringParamOrEnvListOrDefault('UPLOAD_ARTIFACTORY_CREDENTIAL_ID', ['UPLOAD_ARTIFACTORY_CREDENTIAL_ID'], '')
+def UPLOAD_ARTIFACTORY_CREDENTIALS_VALUE = stringParamOrEnvListOrDefault('UPLOAD_ARTIFACTORY_CREDENTIALS', ['UPLOAD_ARTIFACTORY_CREDENTIALS'], '')
+def UPLOAD_ARTIFACTORY_CREDENTIAL_ID_IS_RAW_VALUE = UPLOAD_ARTIFACTORY_CREDENTIAL_ID_VALUE.contains(':')
+def UPLOAD_ARTIFACTORY_CREDENTIALS_RAW_VALUE = UPLOAD_ARTIFACTORY_CREDENTIAL_ID_IS_RAW_VALUE ? UPLOAD_ARTIFACTORY_CREDENTIAL_ID_VALUE : UPLOAD_ARTIFACTORY_CREDENTIALS_VALUE
 def PR_SOURCE_BRANCH_VALUE = stringParamOrEnvListOrDefault('KERNEL_BRANCH', ['WEBHOOK_VLLM_XPU_KERNEL_BRANCH', 'WEBHOOK_XPU_KERNEL_BRANCH', 'WEBHOOK_KERNEL_BRANCH', 'PR_HEAD_REF', 'ghprbSourceBranch', 'CHANGE_BRANCH', 'BRANCH_NAME'], 'main')
 def PR_TARGET_BRANCH_VALUE = stringParamOrEnvListOrDefault('KERNEL_TARGET_BRANCH', ['WEBHOOK_VLLM_XPU_KERNEL_TARGET_BRANCH', 'WEBHOOK_XPU_KERNEL_TARGET_BRANCH', 'WEBHOOK_KERNEL_TARGET_BRANCH', 'PR_BASE_REF', 'ghprbTargetBranch', 'CHANGE_TARGET'], 'main')
 def ENABLE_PR_AUTOMATIC_TRIGGER_VALUE = booleanParamOrEnvListOrDefault('ENABLE_PR_AUTOMATIC_TRIGGER', ['ENABLE_PR_AUTOMATIC_TRIGGER'], true)
@@ -365,7 +371,12 @@ def publishGitHubCommitStatus = { String state, String description ->
     def remoteConfig = configuredScm?.userRemoteConfigs ? configuredScm.userRemoteConfigs[0] : null
     def repoUrl = remoteConfig?.url ?: (REPO_FULL_NAME_VALUE ? "https://github.com/${REPO_FULL_NAME_VALUE}.git" : '')
     def repoFullName = inferRepoFullName(repoUrl)
-    def statusSha = EFFECTIVE_PR_HEAD_SHA_VALUE?.trim() ?: PR_HEAD_SHA_VALUE?.trim() ?: EFFECTIVE_PR_MERGE_COMMIT_SHA_VALUE?.trim() ?: PR_MERGE_COMMIT_SHA_VALUE?.trim()
+    def statusSha = ''
+    if (TRIGGER_KIND_VALUE == 'pr_merge') {
+        statusSha = EFFECTIVE_PR_MERGE_COMMIT_SHA_VALUE?.trim() ?: PR_MERGE_COMMIT_SHA_VALUE?.trim() ?: EFFECTIVE_PR_HEAD_SHA_VALUE?.trim() ?: PR_HEAD_SHA_VALUE?.trim()
+    } else {
+        statusSha = EFFECTIVE_PR_HEAD_SHA_VALUE?.trim() ?: PR_HEAD_SHA_VALUE?.trim() ?: EFFECTIVE_PR_MERGE_COMMIT_SHA_VALUE?.trim() ?: PR_MERGE_COMMIT_SHA_VALUE?.trim()
+    }
 
     if (!repoFullName || !statusSha) {
         echo "[Jenkinsfile] Skip GitHub status update: repo='${repoFullName}', sha='${statusSha}'"
@@ -429,6 +440,56 @@ def publishGitHubCommitStatusOnBuildNode = { String state, String description ->
     node(BUILD_NODE_LABEL_VALUE) {
         publishGitHubCommitStatus(state, description)
     }
+}
+
+def uploadKernelWheelToArtifactory = {
+    if (!UPLOAD_WHL_TO_ARTIFACTORY_VALUE) {
+        echo '[Jenkinsfile] UPLOAD_WHL_TO_ARTIFACTORY=false, skipping Artifactory upload'
+        return
+    }
+
+    def uploadPath = ARTIFACTORY_UPLOAD_PATH_VALUE?.trim() ?: 'local-ci'
+    def wheelPath = sh(
+        script: '''#!/bin/bash
+set -euo pipefail
+ls -1 dist/*.whl | head -n 1
+''',
+        returnStdout: true
+    ).trim()
+
+    if (!wheelPath) {
+        error('[Jenkinsfile] Kernel wheel upload requested, but no dist/*.whl artifact was found')
+    }
+
+    def uploadUrl = "https://af01p-ba.devtools.intel.com/artifactory/aipc_releases-ba-local/${uploadPath}/${wheelPath.tokenize('/').last()}"
+    def runUpload = {
+        sh(
+            script: """#!/bin/bash
+set -euo pipefail
+mkdir -p \"${WORKSPACE}/logs/kernel-ci\"
+if ! python3 \"${WORKSPACE}/ci/upload2art.py\" --file \"${wheelPath}\" --path \"${uploadPath}\" >\"${WORKSPACE}/logs/kernel-ci/upload-artifactory.log\" 2>&1; then
+    cat \"${WORKSPACE}/logs/kernel-ci/upload-artifactory.log\" >&2 || true
+    exit 1
+fi
+printf '%s\n' ${groovy.json.JsonOutput.toJson(uploadUrl)} | tee \"${WORKSPACE}/logs/kernel-ci/kernel-wheel-artifactory-url.txt\"
+""",
+            label: 'Upload kernel wheel to Artifactory'
+        )
+    }
+
+    if (UPLOAD_ARTIFACTORY_CREDENTIAL_ID_VALUE?.trim() && !UPLOAD_ARTIFACTORY_CREDENTIAL_ID_IS_RAW_VALUE) {
+        withCredentials([usernamePassword(credentialsId: UPLOAD_ARTIFACTORY_CREDENTIAL_ID_VALUE, usernameVariable: 'ARTIFACTORY_USERNAME', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+            runUpload()
+        }
+    } else if (UPLOAD_ARTIFACTORY_CREDENTIALS_RAW_VALUE?.trim()) {
+        withEnv(["UPLOAD_ARTIFACTORY_CREDENTIALS=${UPLOAD_ARTIFACTORY_CREDENTIALS_RAW_VALUE}"]) {
+            runUpload()
+        }
+    } else {
+        error('[Jenkinsfile] UPLOAD_WHL_TO_ARTIFACTORY=true requires UPLOAD_ARTIFACTORY_CREDENTIAL_ID or UPLOAD_ARTIFACTORY_CREDENTIALS')
+    }
+
+    echo "[Jenkinsfile] Uploaded kernel wheel to ${uploadUrl}"
 }
 
 def checkoutTriggerSource = {
@@ -520,6 +581,7 @@ bash "${WORKSPACE}/ci/run_kernel_ci.sh" build
 '''
                     }
                 }
+                uploadKernelWheelToArtifactory()
                 stash name: 'kernel-ci-build', includes: 'dist/*.whl,logs/kernel-ci/**', allowEmpty: false
             } finally {
                 archiveArtifacts artifacts: 'logs/**,dist/*.whl', allowEmptyArchive: true
