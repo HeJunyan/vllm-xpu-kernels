@@ -184,12 +184,7 @@ class FMHAFwdEpilogue {
 
     // Collapse the deferred per-lane partial row sums into the full row sum,
     // unless the caller already performed the horizontal reduction.
-    auto tA_sum_full = [&]() -> decltype(auto) {
-      if constexpr (SumIsReduced)
-        return (tA_sum);
-      else
-        return reduce<0, ReduceMode::Horizontal>(tA_sum, sycl::plus<void>{});
-    }();
+    auto tA_sum_full = reduce<0, ReduceMode::Horizontal>(tA_sum, sycl::plus<void>{});
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
     auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum_full, thr_id);
@@ -209,9 +204,9 @@ class FMHAFwdEpilogue {
       rA_sum(i) = ElementA(1) / rA_sum(i);
     }
 
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA.size(); i++)
-      rA(i) *= broadcast<0>(rA_sum, rA, i);
+    // CUTLASS_PRAGMA_UNROLL
+    // for (int i = 0; i < rA.size(); i++)
+    //   rA(i) *= broadcast<0>(rA_sum, rA, i);
 
     /* Tile output */
     Tensor cO = make_identity_tensor(O.shape());       // (q,v)
@@ -225,7 +220,10 @@ class FMHAFwdEpilogue {
     auto tOgO = thr_copy_o.partition_D(gO);
 
     /* Reorder tile and write out */
-    reorder(rA, tOrO);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA.size(); i++)
+      rA(i) *= broadcast<0>(rA_sum, rA, i);
+    cute::reorder(rA, tOrO);
     copy(copy_o, tOrO, tOgO);
   }
 

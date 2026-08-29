@@ -578,13 +578,18 @@ struct FMHAFwdMainloop<
     auto tArV = thr_mma_pv.partition_sg_fragment_B(gV_split(_, _, 0, 0));
 
     /* Create TiledCopy objects for prefetches */
+    constexpr int RegularKVPrefetchSGs = cute::bit_floor(static_cast<unsigned>(SGPerWG::value));
+    constexpr int RegularKVPrefetchThreads = RegularKVPrefetchSGs * intel::sg_size;
+    int const prefetch_thr_id = thr_id < RegularKVPrefetchThreads ? thr_id : 0;
+    const auto subgroup_id = thr_id / intel::sg_size;
+
     auto prefetch_k =
-        make_block_2d_prefetch<SGPerWG::value>(tile_shape_k, K_2D);
+        make_block_2d_prefetch<RegularKVPrefetchSGs>(tile_shape_k, K_2D);
     auto prefetch_v =
-        make_block_2d_prefetch<SGPerWG::value>(tile_shape_v, V_2D);
+        make_block_2d_prefetch<RegularKVPrefetchSGs>(tile_shape_v, V_2D);
     /* Partition global tensors for prefetch */
-    auto pKgK = prefetch_k.get_slice(thr_id).partition_S(gK_prefetch);
-    auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV);
+    auto pKgK = prefetch_k.get_slice(prefetch_thr_id).partition_S(gK_prefetch);
+    auto pVgV = prefetch_v.get_slice(prefetch_thr_id).partition_S(gV);
 
 
     // ------
@@ -593,11 +598,14 @@ struct FMHAFwdMainloop<
 
     /* Initialization steps for first block: Q/K prefetch, O init */
     using PreparedK_t =
-        decltype(prepare_payloads(copy_k, tKgK(_, _, _, 0, 0), tKrK));
+        decltype(prepare_payloads(copy_k, tKgK(_, _, _, 0, 0)));
     using PreparedV_t =
-        decltype(prepare_payloads(copy_v, tVgV(_, _, _, 0, 0), tVrV));
+        decltype(prepare_payloads(copy_v, tVgV(_, _, _, 0, 0)));
     std::array<PreparedK_t, DTiles> prepared_k;
     std::array<PreparedV_t, VTiles> prepared_v;
+
+    auto k_seq_delta = [](auto n) { return make_coord(n, _0{}); };
+    auto v_seq_delta = [](auto n) { return make_coord(_0{}, n); };
 
     /* Preload + reorder Q once; reused across all K iterations. */
     CUTLASS_PRAGMA_UNROLL
@@ -621,18 +629,20 @@ struct FMHAFwdMainloop<
 
     CUTLASS_PRAGMA_UNROLL
     for (int D = 0; D < DTiles; D++) {
-      prepared_k[D] = prepare_payloads(copy_k, tKgK(_, _, _, next_page_idx, D), tKrK);
+      prepared_k[D] = prepare_payloads(copy_k, tKgK(_, _, _, next_page_idx, D));
     }
     CUTLASS_PRAGMA_UNROLL
     for (int VV = 0; VV < VTiles; VV++) {
-      prepared_v[VV] = prepare_payloads(copy_v, tVgV(_, _, _, VV, next_page_idx), tVrV);
+      prepared_v[VV] = prepare_payloads(copy_v, tVgV(_, _, _, VV, next_page_idx));
     }
 
-    auto prepared_pk  = prepare_payloads(prefetch_k, pKgK(_,_,_,next_page_idx), pKgK(_,_,_,next_page_idx));
-    auto prepared_pv  = prepare_payloads(prefetch_v, pVgV(_,_,_,next_page_idx), pVgV(_,_,_,next_page_idx));
+    auto prepared_pk  = prepare_payloads(prefetch_k, pKgK(_,_,_,next_page_idx));
+    auto prepared_pv  = prepare_payloads(prefetch_v, pVgV(_,_,_,next_page_idx));
 
-    prefetch_with_payloads(prefetch_k, prepared_pk, shape(pKgK(_,_,_,0)));
-    prefetch_with_payloads(prefetch_v, prepared_pv, shape(pVgV(_,_,_,0)));
+    if (subgroup_id < RegularKVPrefetchSGs) {
+      prefetch(prefetch_k, prepared_pk);
+      prefetch(prefetch_v, prepared_pv);
+    }
 
     clear(tArA);
     fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
@@ -686,14 +696,16 @@ struct FMHAFwdMainloop<
           PagedKV ? tVgV(_, _, _, _, page_idx) : tVgV(_, _, _, _, K);
 
       /* V prefetch for next iter */
-      update_payloads(prepared_pv, page_offset);
-      prefetch_with_payloads(prefetch_v, prepared_pv, shape(pVgV(_,_,_,0)));
+      if (subgroup_id < RegularKVPrefetchSGs) {
+        prepared_pv += v_seq_delta(page_offset);
+        prefetch(prefetch_v, prepared_pv);
+      }
 
       /* GEMM 1: S = Q * K^T */
       CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < DTiles; D++) {
-        copy_with_multi_payloads(copy_k, prepared_k[D], tKrK);
-        update_payloads(prepared_k[D], page_offset);
+        copy(copy_k, prepared_k[D], tKrK);
+        prepared_k[D] += k_seq_delta(page_offset);
         reorder(tKrK, tSrK);
 
         if constexpr (Fp8KV && !Fp8Q) {
@@ -713,12 +725,14 @@ struct FMHAFwdMainloop<
       }
 
       /* K prefetch for next iteration */
-      update_payloads(prepared_pk, page_offset);
-      prefetch_with_payloads(prefetch_k, prepared_pk, shape(pKgK(_,_,_,0)));
+      if (subgroup_id < RegularKVPrefetchSGs) {
+        prepared_pk += k_seq_delta(page_offset);
+        prefetch(prefetch_k, prepared_pk);
+      }
 
       /* Early V-load for VV=0: overlap memory latency with softmax scalar work */
-      copy_with_multi_payloads(copy_v, prepared_v[0], tVrV);
-      update_payloads(prepared_v[0], page_offset);
+      copy(copy_v, prepared_v[0], tVrV);
+      prepared_v[0] += v_seq_delta(page_offset);
 
       /* Causal masking and k remainder masking */
       if constexpr (CausalMask) {
@@ -783,27 +797,16 @@ struct FMHAFwdMainloop<
       }
 
       /* Apply softmax (deferred row-sum hreduce) */
-      auto [rescale, tS_partial_sum] = softmax(effective_scale, tSrS, tA_max, tA_sum);
+      auto [rescale, tS_partial_sum, needs_rescale] = softmax(effective_scale, tSrS, tA_max, tA_sum);
       auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+      bool const subgroup_needs_rescale = sycl::any_of_group(sg, needs_rescale);
       constexpr int kSumSize = decltype(tA_sum.size())::value;
       constexpr bool kSumDivVT = (kSumSize % VTiles == 0);
       constexpr int kSumPerVT = kSumDivVT ? (kSumSize / VTiles) : 0;
 
       using ElementP = typename TiledMMAPV::ValTypeA;
       if constexpr (std::is_same_v<ElementP, bfloat16_t>) {
-        static_assert(decltype(tArP.size())::value % 2 == 0,
-                      "tArP per-WI element count must be even for f32x2->bf16x2 packing");
-        constexpr int kCvtPairs = decltype(tSrS.size())::value / 2;
-        cute::intel::uint2 cvt_tmp[kCvtPairs];
-        CUTLASS_PRAGMA_UNROLL
-        for (int p = 0; p < kCvtPairs; p++) {
-          cvt_f32x2_to_bf16x2_bias(tSrS(2 * p), tSrS(2 * p + 1), cvt_tmp[p]);
-        }
-        CUTLASS_PRAGMA_UNROLL
-        for (int p = 0; p < kCvtPairs; p++) {
-          cvt_f32x2_to_bf16x2_pack(cvt_tmp[p],
-              reinterpret_cast<cute::intel::ushort2&>(tArP(2 * p)));
-        }
+        reorder(tSrS, tArP);
       }
       else {
         reorder_to_P_fp8<ElementP>(tSrS, tArP);
@@ -814,14 +817,16 @@ struct FMHAFwdMainloop<
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
         if (VV > 0) {
-          copy_with_multi_payloads(copy_v, prepared_v[VV], tVrV);
-          update_payloads(prepared_v[VV], page_offset);
+          copy(copy_v, prepared_v[VV], tVrV);
+          prepared_v[VV] += v_seq_delta(page_offset);
         }
         reorder(tVrV, tArV);
 
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = tArA.size() / VTiles - 1; i >= 0; i--)
-          tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+        if (subgroup_needs_rescale) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = tArA.size() / VTiles - 1; i >= 0; i--)
+            tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+        }
         /* Rescale + accumulate per-lane partial row sums, fused into V loop. */
         if constexpr (kSumDivVT) {
           CUTLASS_PRAGMA_UNROLL
@@ -873,9 +878,11 @@ struct FMHAFwdMainloop<
             tS, sycl::maximum<void>{});
 
     FragARow rescale;
+    bool needs_rescale = false;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tA_max.size(); i++) {
       ElementS new_max = sycl::max(tA_max(i), scale * tS_bmax(i));
+      needs_rescale |= new_max != tA_max(i);
       rescale(i) = sycl::native::exp2(tA_max(i) - new_max);
       tA_max(i) = new_max;
     }
@@ -907,7 +914,7 @@ struct FMHAFwdMainloop<
       }
     }
 
-    return cute::make_tuple(rescale, tS_partial_sum);
+    return cute::make_tuple(rescale, tS_partial_sum, needs_rescale);
   }
 };
 
