@@ -90,7 +90,8 @@ def NO_CACHE_VALUE = booleanParamOrDefault('NO_CACHE', false)
 def WORKSPACE_RECLAIM_IMAGE_VALUE = params.WORKSPACE_RECLAIM_IMAGE ?: 'intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04'
 def GIT_CREDENTIAL_ID_VALUE = params.GIT_CREDENTIAL_ID ?: 'dujun_github_token'
 def UPLOAD_WHL_TO_ARTIFACTORY_VALUE = booleanParamOrEnvListOrDefault('UPLOAD_WHL_TO_ARTIFACTORY', ['UPLOAD_WHL_TO_ARTIFACTORY'], true)
-def ARTIFACTORY_UPLOAD_PATH_VALUE = stringParamOrEnvListOrDefault('ARTIFACTORY_UPLOAD_PATH', ['ARTIFACTORY_UPLOAD_PATH'], 'local-ci')
+// Explicit override wins; otherwise the upload path is derived per trigger kind below once it is known.
+def ARTIFACTORY_UPLOAD_PATH_OVERRIDE_VALUE = stringParamOrEnvListOrDefault('ARTIFACTORY_UPLOAD_PATH', ['ARTIFACTORY_UPLOAD_PATH'], '')
 def UPLOAD_ARTIFACTORY_CREDENTIAL_ID_VALUE = stringParamOrEnvListOrDefault('UPLOAD_ARTIFACTORY_CREDENTIAL_ID', ['UPLOAD_ARTIFACTORY_CREDENTIAL_ID'], '')
 def UPLOAD_ARTIFACTORY_CREDENTIALS_VALUE = stringParamOrEnvListOrDefault('UPLOAD_ARTIFACTORY_CREDENTIALS', ['UPLOAD_ARTIFACTORY_CREDENTIALS'], '')
 def UPLOAD_ARTIFACTORY_CREDENTIAL_ID_IS_RAW_VALUE = UPLOAD_ARTIFACTORY_CREDENTIAL_ID_VALUE.contains(':')
@@ -149,6 +150,20 @@ if (['pr_auto', 'pr_merge', 'comment', 'manual'].contains(normalizedForcedTrigge
     TRIGGER_KIND_VALUE = 'pr_auto'
     TRIGGER_REASON_VALUE = 'legacy-pr-context'
 }
+
+def defaultArtifactoryUploadPathForTrigger = { String triggerKind ->
+    switch (triggerKind) {
+        case 'pr_merge':
+            return 'local-ci/merge'
+        case 'comment':
+            return 'local-ci/pr-comment'
+        case 'pr_auto':
+            return 'local-ci/pr'
+        default:
+            return 'local-ci/manual'
+    }
+}
+def ARTIFACTORY_UPLOAD_PATH_VALUE = ARTIFACTORY_UPLOAD_PATH_OVERRIDE_VALUE?.trim() ?: defaultArtifactoryUploadPathForTrigger(TRIGGER_KIND_VALUE)
 
 def shouldRunBuild = true
 def skipReason = ''
@@ -544,6 +559,7 @@ def checkoutTriggerSource = {
 
 echo "[Jenkinsfile] Using GIT_CREDENTIAL_ID='${GIT_CREDENTIAL_ID_VALUE}' for private FetchContent clones"
 echo "[Jenkinsfile] Trigger kind='${TRIGGER_KIND_VALUE}', reason='${TRIGGER_REASON_VALUE}', webhook event='${WEBHOOK_EVENT_VALUE}', action='${WEBHOOK_ACTION_VALUE}', merged='${WEBHOOK_PR_MERGED_VALUE}'"
+echo "[Jenkinsfile] Artifactory upload path='${ARTIFACTORY_UPLOAD_PATH_VALUE}' (override='${ARTIFACTORY_UPLOAD_PATH_OVERRIDE_VALUE}')"
 
 currentBuild.displayName = "#${BUILD_NUMBER}-kernel-ci-${TRIGGER_KIND_VALUE}-${PR_SOURCE_BRANCH_VALUE}"
 currentBuild.description = "${TRIGGER_KIND_VALUE} ${BUILD_NODE_LABEL_VALUE}->${TEST_NODE_LABEL_VALUE} ${PR_SOURCE_BRANCH_VALUE} -> ${PR_TARGET_BRANCH_VALUE}"
