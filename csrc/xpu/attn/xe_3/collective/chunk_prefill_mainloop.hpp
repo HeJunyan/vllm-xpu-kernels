@@ -805,7 +805,7 @@ struct FMHAFwdMainloop<
       constexpr int kSumPerVT = kSumDivVT ? (kSumSize / VTiles) : 0;
 
       using ElementP = typename TiledMMAPV::ValTypeA;
-      if constexpr (std::is_same_v<ElementP, bfloat16_t>) {
+      if constexpr (!Fp8Q) {
         reorder(tSrS, tArP);
       }
       else {
