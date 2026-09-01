@@ -75,16 +75,6 @@ def dequant_mxfp8(x_lp, x_scale):
         (x_scale.reshape(-1, 1).to(torch.float32))
     return x.reshape(ori_shape)
 
-def dequant_mxfp8_wei(wei, wei_scale):
-    # wei is (K, N) in kernel layout, scale is (N, K//32) — scale was computed
-    # along K in the original (N, K) layout. Transpose to (N, K) to align with
-    # scale blocks, dequant, then transpose back.
-    K, N = wei.shape
-    wei_nk = wei.T.contiguous()  # (N, K)
-    dq = wei_nk.to(torch.float32).reshape(-1, 32) * \
-        (wei_scale.reshape(-1, 1).to(torch.float32))
-    return dq.reshape(N, K).T.contiguous()  # back to (K, N)
-
 def quant_mxfp_act_xpu(x, recipe):
     assert recipe in ("mxfp8", "mxfp4")
     if recipe == "mxfp8":
@@ -234,7 +224,7 @@ def dequant_wei(wei, wei_scale, recipe):
     if recipe in ("mxfp4", "mxfp4_fp8"):
         return dequant_mxfp4(wei, _as_e8m0(wei_scale))
     elif recipe == "mxfp8":
-        return dequant_mxfp8_wei(wei, _as_e8m0(wei_scale))
+        return dequant_mxfp8(wei, _as_e8m0(wei_scale))
     elif recipe == "fp8block":
         return dequant_fp8_block_wei(wei, wei_scale)
     elif recipe == "fp8":
@@ -284,6 +274,9 @@ def ref_fused_moe(recipe,
     """
     Reference fused MoE implementation with quantization simulation.
 
+    Weights and scales are taken in the loaded [E, N, K] / [E, N, K // group]
+    layout, not in any grouped-GEMM layout.
+
     Supported recipes:
         bf16          - no quantization (direct matmul)
         fp8block      - block-wise fp8 quant/dequant on activations and weights
@@ -308,10 +301,7 @@ def ref_fused_moe(recipe,
         "mxfp4_fp8", "fp8"), f"Unsupported recipe: {recipe}"
     
     num_rows, hidden_size = hidden_states.shape
-    if recipe in ("mxfp4", "mxfp4_fp8"):
-        inter_size = w13.shape[-2] // 2
-    else:
-        inter_size = w13.shape[-1] // 2
+    inter_size = w13.shape[-2] // 2
     num_moe_inputs = n_experts_per_token * num_rows
     compute_dtype = hidden_states.dtype if a1q_scale is None else torch.bfloat16
 
@@ -389,11 +379,9 @@ def ref_fused_moe(recipe,
         else:
             tokens_i_qdq = qdq_act(tokens_i, recipe).to(compute_dtype)
         # weight dequant
-        w13_i = dequant_wei(w13[i], w13_scales[i], recipe).to(compute_dtype)
-        if recipe in ("fp8block", "mxfp8"):
-            out_i = tokens_i_qdq @ w13_i
-        else:
-            out_i = tokens_i_qdq @ w13_i.T
+        w13_scales_i = None if w13_scales is None else w13_scales[i]
+        w13_i = dequant_wei(w13[i], w13_scales_i, recipe).to(compute_dtype)
+        out_i = tokens_i_qdq @ w13_i.T
         if w13_bias is not None:
             out_i = out_i + w13_bias[i].to(compute_dtype)
         gemm1_output[offset:offset + n_tokens] = out_i
@@ -428,12 +416,9 @@ def ref_fused_moe(recipe,
         act_i_qdq = qdq_act(act_i, recipe).to(compute_dtype)
 
         # weight dequant
-        w2_i = dequant_wei(w2[i], w2_scales[i], recipe).to(compute_dtype)
-
-        if recipe in ("fp8block", "mxfp8"):
-            out_i = act_i_qdq @ w2_i
-        else:
-            out_i = act_i_qdq @ w2_i.T
+        w2_scales_i = None if w2_scales is None else w2_scales[i]
+        w2_i = dequant_wei(w2[i], w2_scales_i, recipe).to(compute_dtype)
+        out_i = act_i_qdq @ w2_i.T
         if w2_bias is not None:
             out_i = out_i + w2_bias[i].to(compute_dtype)
         gemm2_output[offset:offset + n_tokens] = out_i

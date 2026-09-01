@@ -113,7 +113,6 @@ def quant_mxfp_weight(w, recipe):
 
     orig_shape = w.shape
     w_scales = data_to_mx_scale(w.to(torch.bfloat16), BLOCK_SIZE, recipe)
-    w_scales = w_scales.transpose(-1, -2).contiguous().transpose(-1, -2)
     if recipe == "mxfp8":
         w = (w.to(torch.bfloat16).reshape(-1, BLOCK_SIZE) /
              w_scales.reshape(-1, 1).float()).reshape(orig_shape)
@@ -125,13 +124,6 @@ def quant_mxfp_weight(w, recipe):
         w = w.clamp(min=min_val, max=max_val)
         w = bfloat16_to_fp4_e2m1fn_x2(w)
     return w, w_scales
-
-
-def to_kernel_weight_layout(recipe, w13, w2):
-    # XE3 grouped GEMM expects non-MXFP4 weights in [E, K, N] layout.
-    if recipe in ("mxfp4", "mxfp4_fp8"):
-        return w13, w2
-    return w13.transpose(-1, -2).contiguous(), w2.transpose(-1, -2).contiguous()
 
 
 def ref_fused_moe(recipe,
@@ -384,7 +376,6 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias, monkeypatch):
     ref_out = ref_fused_moe(recipe, hidden_states, w13, w13_scales, w13_bias,
                             w2, w2_scales, w2_bias, expert_scores,
                             expert_indices, topk, "silu", e)
-    kernel_w13, kernel_w2 = to_kernel_weight_layout(recipe, w13, w2)
 
     # XpuFusedMoe.apply consumes pre-quantized activations together with their
     # scales (a1q_scale), so quantize the hidden states up-front for the
@@ -396,10 +387,10 @@ def test_fused_moe(m, n, k, e, topk, recipe, has_bias, monkeypatch):
                                                         recipe)
 
     fused_moe_impl = XpuFusedMoe(
-        w13=_to_kernel(kernel_w13),
+        w13=_to_kernel(w13),
         w13_scales=_to_kernel(w13_scales),
         w13_bias=_to_kernel(w13_bias),
-        w2=_to_kernel(kernel_w2),
+        w2=_to_kernel(w2),
         w2_scales=_to_kernel(w2_scales),
         w2_bias=_to_kernel(w2_bias),
         n_experts_per_token=topk,

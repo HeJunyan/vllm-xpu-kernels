@@ -59,6 +59,57 @@ def _get_weights_dtype(weight, scales):
     return is_fp8, is_int4, is_mxfp4, is_mxfp8, is_block_fp8
 
 
+def _is_packed_4bit(weight):
+    return weight.dtype in (torch.uint8, torch.int8, torch.float4_e2m1fn_x2)
+
+
+def _uses_xe2_grouped_gemm(weight):
+    """Mirrors the routing in csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp.
+
+    BMG / PVC / LNL and the XE3 client parts run the xe_2 kernel; only CRI and
+    NVL-P run the xe_3 one.
+    """
+    device_index = -1 if weight.device.index is None else weight.device.index
+    return bool(torch.ops._xpu_C.is_xe2_arch(device_index)
+                or torch.ops._xpu_C.is_xe3_arch(device_index))
+
+
+def _to_n_major(scales):
+    """Relayout an [E, N, G] scale surface so that N is the dense extent."""
+    return scales.transpose(-1, -2).contiguous().transpose(-1, -2)
+
+
+def _to_xe2_layout(weight, scales):
+    """Checkpoint layout -> what csrc/xpu/grouped_gemm/xe_2 indexes.
+
+    4-bit weights stay packed as [E, N, K // 2] alongside their [E, N,
+    K // group] scales; every wider dtype is read as a contiguous [E, K, N]
+    buffer. Scales are always taken as loaded.
+    """
+    if _is_packed_4bit(weight):
+        return weight.contiguous(), scales
+    return weight.transpose(-1, -2).contiguous(), scales
+
+
+def _to_xe3_layout(weight, scales):
+    """Checkpoint layout -> what csrc/xpu/grouped_gemm/xe_3 indexes.
+
+    Weights follow the same rule as XE2, but the mx block scales have to be
+    e8m0 and dense along N. Block-fp8 ([E, ceil(N/128), ceil(K/128)] fp32) and
+    per-tensor scales are already in the expected layout.
+    """
+    if _is_packed_4bit(weight):
+        weight = weight.contiguous()
+    else:
+        weight = weight.transpose(-1, -2).contiguous()
+    if scales is not None and scales.ndim == 3 \
+            and scales.dtype in (torch.uint8, torch.float8_e8m0fnu):
+        if scales.dtype == torch.uint8:
+            scales = scales.view(torch.float8_e8m0fnu)
+        scales = _to_n_major(scales)
+    return weight, scales
+
+
 def cutlass_grouped_gemm(input_A, input_A_scale, input_B, input_B_scale, bias,
                          output, expert_token_count, n, k, num_experts):
     num_rows_per_expert = torch.tensor(expert_token_count,
@@ -182,27 +233,49 @@ class XpuFusedMoe:
         is_mxfp8 = d_mxfp8 if is_mxfp8 is None else is_mxfp8
         is_block_fp8 = d_block_fp8 if is_block_fp8 is None else is_block_fp8
 
+        self._use_ref = _should_use_ref_fused_moe(is_mxfp8)
+
+        # Weights and scales are taken in the layout vLLM loads them in --
+        # [E, N, K] with K packed for 4-bit, plus [E, N, K // group] scales --
+        # and are rewritten in place into whatever this device's grouped GEMM
+        # indexes, so callers never have to know the kernel layouts. The mark
+        # keeps rebuilding over the same parameters a no-op. ref_fused_moe
+        # consumes the loaded layout directly, so it skips the rewrite.
+        if not self._use_ref and not hasattr(w13, "xpu_fused_moe"):
+            if is_int4:
+                # change u4 to s4 to avoid zero point in gemm kernel
+                # The buffer must be int8: the grouped GEMM detects packed
+                # int4 weights via `B_dtype == at::kChar` (see
+                # csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp),
+                # and only then reads them as [E, N, K // 2].
+                w13_tmp = torch.empty_like(w13, dtype=torch.int8)
+                w2_tmp = torch.empty_like(w2, dtype=torch.int8)
+                for i in range(num_experts):
+                    w13_tmp[i] = implement_zp(w13[i])
+                    w2_tmp[i] = implement_zp(w2[i])
+                w13.data = w13_tmp.contiguous()
+                w2.data = w2_tmp.contiguous()
+
+            to_kernel_layout = _to_xe2_layout \
+                if _uses_xe2_grouped_gemm(w13) else _to_xe3_layout
+            w13_data, w13_scales_data = to_kernel_layout(w13, w13_scales)
+            w2_data, w2_scales_data = to_kernel_layout(w2, w2_scales)
+            w13.data = w13_data
+            w2.data = w2_data
+            if w13_scales is not None:
+                w13_scales.data = w13_scales_data
+            if w2_scales is not None:
+                w2_scales.data = w2_scales_data
+            w13.xpu_fused_moe = True
+
         # 4bits support [E, N, K]
         # other types [E, K, N]
-        if not is_int4 and not is_mxfp4:
-            self.inter_size = w13.shape[-1] // 2
-        else:
+        if self._use_ref or is_int4 or is_mxfp4:
             self.inter_size = w13.shape[-2] // 2
+        else:
+            self.inter_size = w13.shape[-1] // 2
 
         assert w13.is_contiguous() and w2.is_contiguous()
-
-        # FIXME: move this to vllm
-        if is_int4 and not hasattr(w13, 'xpu_fused_moe'):
-            w13_tmp = torch.empty_like(w13)
-            w2_tmp = torch.empty_like(w2)
-            for i in range(num_experts):
-                w13_tmp[i] = implement_zp(w13[i])
-                w2_tmp[i] = implement_zp(w2[i])
-            w13_tmp = w13_tmp.contiguous()
-            w2_tmp = w2_tmp.contiguous()
-            w13.data = w13_tmp
-            w2.data = w2_tmp
-            w13.xpu_fused_moe = True
 
         self.w13 = w13
         self.w2 = w2
@@ -235,7 +308,6 @@ class XpuFusedMoe:
         self.gemm1_clamp_limit = gemm1_clamp_limit
         self.recipe = _get_recipe(is_fp8, is_mxfp8, is_mxfp4, is_int4,
                                    is_block_fp8)
-        self._use_ref = _should_use_ref_fused_moe(is_mxfp8)
         if self.activation == "silu":
             self.act_func = torch.ops._C.silu_and_mul
         elif self.activation == "gelu":

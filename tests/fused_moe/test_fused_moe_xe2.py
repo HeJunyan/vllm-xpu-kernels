@@ -242,9 +242,6 @@ def test_fused_moe(m, n, k, e, topk, dtype, w_dtype, has_bias):
                             flat_expert_weights, flat_expert_indices, topk,
                             "silu", e)
 
-    w13.data = w13.transpose(-1, -2).contiguous()
-    w2.data = w2.transpose(-1, -2).contiguous()
-
     fused_moe_impl = XpuFusedMoe(
                 w13=w13,
                 w13_scales=w13_scales,
@@ -599,9 +596,6 @@ def test_fused_moe_ep(m, n, k, e, topk, ep_rank, ep_size, dtype, w_dtype,
     expert_start_id = e * ep_rank
     expert_end_id = expert_start_id + e
 
-    w13.data = w13.transpose(-1, -2).contiguous()
-    w2.data = w2.transpose(-1, -2).contiguous()
-
     fused_moe_impl = XpuFusedMoe(
                 w13=w13[expert_start_id:expert_end_id],
                 w13_scales=w13_scales[expert_start_id:expert_end_id]
@@ -930,9 +924,6 @@ def test_fused_moe_clamp_limit(m, n, k, e, topk, dtype, gemm1_clamp_limit):
                             flat_expert_weights, flat_expert_indices, topk,
                             "silu", e,
                             gemm1_clamp_limit=gemm1_clamp_limit)
-
-    w13.data = w13.transpose(-1, -2).contiguous()
-    w2.data = w2.transpose(-1, -2).contiguous()
 
     fused_moe_impl = XpuFusedMoe(
                 w13=w13,
