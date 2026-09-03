@@ -5,6 +5,7 @@
 #include <mutex>
 #include <iostream>
 #include <memory>
+#include <type_traits>
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <c10/xpu/XPUFunctions.h>
@@ -60,6 +61,28 @@ static inline sycl::queue& vllmGetQueue(at::DeviceIndex device_index = -1) {
 
 namespace syclex = sycl::ext::oneapi::experimental;
 
+// Some SYCL/oneAPI toolchains (e.g. the public 2026.x releases) do not yet
+// expose the `intel_gpu_cri` enumerator in `syclex::architecture`. Detect it at
+// compile time so the CRI arch checks compile everywhere: where the enumerator
+// exists behavior is unchanged, and where it is absent a device can never be
+// CRI, so the check is a no-op returning false.
+template <typename Arch, typename = void>
+struct has_intel_gpu_cri : std::false_type {};
+template <typename Arch>
+struct has_intel_gpu_cri<Arch, std::void_t<decltype(Arch::intel_gpu_cri)>>
+    : std::true_type {};
+
+static inline bool arch_is_cri(syclex::architecture arch) {
+  return [](auto a) {
+    using Arch = decltype(a);
+    if constexpr (has_intel_gpu_cri<Arch>::value) {
+      return a == Arch::intel_gpu_cri;
+    } else {
+      return false;
+    }
+  }(arch);
+}
+
 static inline syclex::architecture
 get_device_architecture(at::DeviceIndex device_index = -1) {
   auto device_id =
@@ -88,8 +111,7 @@ static inline bool is_pvc(at::DeviceIndex device_index = -1) {
 }
 
 static inline bool is_cri(at::DeviceIndex device_index = -1) {
-  return get_device_architecture(device_index) ==
-         syclex::architecture::intel_gpu_cri;
+  return arch_is_cri(get_device_architecture(device_index));
 }
 
 static inline bool is_nvl_p(at::DeviceIndex device_index = -1) {
@@ -114,7 +136,7 @@ static inline bool is_xe3_arch(at::DeviceIndex device_index = -1) {
 
 static inline bool is_xe3p_arch(at::DeviceIndex device_index = -1) {
   auto arch = get_device_architecture(device_index);
-  return arch == syclex::architecture::intel_gpu_cri ||
+  return arch_is_cri(arch) ||
          arch == syclex::architecture::intel_gpu_nvl_p;
 }
 
