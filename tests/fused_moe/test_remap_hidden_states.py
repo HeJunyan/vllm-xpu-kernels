@@ -377,3 +377,109 @@ def test_init_expert_map(local_experts_num, ep_rank, ep_size):
     expert_map.copy_(expert_map_kernel.cpu())
 
     torch.testing.assert_close(expert_map, ref_expert_map, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_rows", [1, 32, 257])
+@pytest.mark.parametrize("hidden_size", [128, 2048])
+@pytest.mark.parametrize("total_experts_num", [8, 128])
+@pytest.mark.parametrize("topk", [1, 8])
+def test_remap_hidden_states_mn_major_padded(num_rows, hidden_size,
+                                             total_experts_num, topk):
+    """remap_hidden_states can emit the activation scales straight into the
+    per-expert MN-major, M-padded-to-4 surface that the mxfp grouped-GEMM
+    mainloop indexes, and publishes the per-expert prefix descriptor that lets
+    the gemm2 activation quant kernel write the same layout directly."""
+    seed_everything(7)
+
+    scale_k = hidden_size // 32
+    hidden_states = torch.randint(0,
+                                  256, (num_rows, hidden_size),
+                                  dtype=torch.uint8,
+                                  device=KERNEL_DEVICE).view(
+                                      torch.float8_e4m3fn)
+    scales = torch.randint(100,
+                           140, (num_rows, scale_k),
+                           dtype=torch.uint8,
+                           device=KERNEL_DEVICE)
+    topk_ids = torch.stack([
+        torch.randperm(total_experts_num, device=KERNEL_DEVICE)[:topk]
+        for _ in range(num_rows)
+    ]).to(torch.int32)
+
+    num_moe_inputs = num_rows * topk
+    total_padded = num_moe_inputs + 3 * total_experts_num
+
+    def _run(padded):
+        rows = total_padded if padded else num_moe_inputs
+        out_hs = torch.empty((num_moe_inputs, hidden_size),
+                             dtype=hidden_states.dtype,
+                             device=KERNEL_DEVICE)
+        out_s = torch.zeros((rows, scale_k),
+                            dtype=torch.uint8,
+                            device=KERNEL_DEVICE)
+        rows_per_expert = torch.zeros((total_experts_num),
+                                      dtype=torch.int32,
+                                      device=KERNEL_DEVICE)
+        row_map = torch.empty((num_rows, topk),
+                              dtype=torch.int32,
+                              device=KERNEL_DEVICE)
+        desc = torch.empty((2, total_experts_num + 1),
+                           dtype=torch.int32,
+                           device=KERNEL_DEVICE) if padded else None
+        torch.ops._moe_C.remap_hidden_states(
+            hidden_states=hidden_states,
+            hidden_states_scales=scales.view(torch.float8_e8m0fnu),
+            remapped_hidden_states=out_hs,
+            remapped_hidden_states_scales=out_s.view(torch.float8_e8m0fnu),
+            expert_map=None,
+            rows_per_expert=rows_per_expert,
+            unpermuted_row_to_permuted_row=row_map,
+            topk_ids=topk_ids,
+            total_experts_num=total_experts_num,
+            local_experts_num=total_experts_num,
+            expert_scale_desc=desc)
+        return out_s, rows_per_expert, row_map, desc
+
+    fused, rows_per_expert, row_map, desc = _run(True)
+
+    # The descriptor rows must be the exclusive cumsums of rows and of
+    # round_up_4(rows), each with the total appended.
+    rpe = rows_per_expert.cpu()
+    padded_rpe = (rpe + 3) & ~3
+    zero = torch.zeros(1, dtype=torch.int32)
+    torch.testing.assert_close(
+        desc[0].cpu(), torch.cat([zero,
+                                  torch.cumsum(rpe, 0, dtype=torch.int32)]))
+    torch.testing.assert_close(
+        desc[1].cpu(),
+        torch.cat([zero, torch.cumsum(padded_rpe, 0, dtype=torch.int32)]))
+
+    # The row order inside an expert is decided by atomics, so validate the
+    # padded surface against the source rows through the emitted row map
+    # rather than against a second (independently ordered) kernel run.
+    fused_flat = fused.cpu().flatten()
+    src = scales.cpu()
+    row_map_c = row_map.cpu()
+    row_prefix_c = desc[0].cpu()
+    scale_prefix_c = desc[1].cpu()
+    topk_ids_c = topk_ids.cpu()
+    expected = torch.zeros_like(fused_flat)
+    for r in range(num_rows):
+        for i in range(topk):
+            e = int(topk_ids_c[r, i])
+            m_local = int(row_map_c[r, i]) - int(row_prefix_c[e])
+            base = int(scale_prefix_c[e]) * scale_k
+            ld = int(padded_rpe[e])
+            idx = base + torch.arange(scale_k) * ld + m_local
+            expected[idx] = src[r]
+    torch.testing.assert_close(fused_flat, expected, rtol=0, atol=0)
+
+    # The fused surface must hold exactly what the standalone reorder pass
+    # would have produced from the unpadded scales.
+    plain = _run(False)[0].view(torch.float8_e8m0fnu)
+    ref = torch.ops._moe_C.reorder_mxfp_scales(plain, rows_per_expert,
+                                               total_padded)
+    torch.testing.assert_close(fused.cpu(),
+                               ref.view(torch.uint8).cpu(),
+                               rtol=0,
+                               atol=0)

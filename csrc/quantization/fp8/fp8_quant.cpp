@@ -11,6 +11,7 @@
 
 #include "quantization/fp8/fp8_quant_asm.h"
 #include "quantization/fp8/quant_utils.h"
+#include "quantization/moe_scale_layout.h"
 #include "quantization/utils.h"
 #include "quant_ns.h"
 
@@ -170,6 +171,7 @@ class per_token_group_quant_8bit_kernel {
   const int scale_num_rows;
   const int scale_stride;
   bool is_column_major;
+  MoEScaleLayout moe_layout;
 
  public:
   per_token_group_quant_8bit_kernel(
@@ -182,7 +184,8 @@ class per_token_group_quant_8bit_kernel {
       bool scale_ue8m0_,
       const int scale_num_rows_ = 0,
       const int scale_stride_ = 0,
-      bool is_column_major_ = false)
+      bool is_column_major_ = false,
+      MoEScaleLayout moe_layout_ = {})
       : out(out_),
         scale(scale_),
         input(input_),
@@ -192,7 +195,8 @@ class per_token_group_quant_8bit_kernel {
         scale_ue8m0(scale_ue8m0_),
         scale_num_rows(scale_num_rows_),
         scale_stride(scale_stride_),
-        is_column_major(is_column_major_) {}
+        is_column_major(is_column_major_),
+        moe_layout(moe_layout_) {}
   void operator()
       [[sycl::reqd_sub_group_size(32)]] (sycl::nd_item<1> item) const {
     constexpr int threads_per_group = 32;
@@ -214,7 +218,9 @@ class per_token_group_quant_8bit_kernel {
 
     scalar_t const* group_input = &input[block_group_offset];
     fp8_type* group_output = &out[block_group_offset];
-    if (is_column_major) {
+    if (moe_layout.enabled()) {
+      scale_output = nullptr;
+    } else if (is_column_major) {
       const int row_idx = global_group_id / scale_num_rows;
       const int col_idx = global_group_id % scale_num_rows;
       scale_output =
@@ -248,7 +254,14 @@ class per_token_group_quant_8bit_kernel {
     }
 
     if (lane_id == 0) {
-      *scale_output = y_s;
+      if (moe_layout.enabled()) {
+        moe_layout.store(
+            global_group_id / moe_layout.scale_k,
+            global_group_id % moe_layout.scale_k,
+            y_s);
+      } else {
+        *scale_output = y_s;
+      }
     }
     group_barrier(item.get_group());
 
@@ -292,6 +305,7 @@ class per_token_group_quant_8bit_vec_kernel {
   const int scale_num_rows;
   const int scale_stride;
   bool is_column_major;
+  MoEScaleLayout moe_layout;
 
  public:
   per_token_group_quant_8bit_vec_kernel(
@@ -305,7 +319,8 @@ class per_token_group_quant_8bit_vec_kernel {
       bool scale_ue8m0_,
       const int scale_num_rows_,
       const int scale_stride_,
-      bool is_column_major_)
+      bool is_column_major_,
+      MoEScaleLayout moe_layout_ = {})
       : out(out_),
         scale(scale_),
         input(input_),
@@ -316,7 +331,8 @@ class per_token_group_quant_8bit_vec_kernel {
         scale_ue8m0(scale_ue8m0_),
         scale_num_rows(scale_num_rows_),
         scale_stride(scale_stride_),
-        is_column_major(is_column_major_) {}
+        is_column_major(is_column_major_),
+        moe_layout(moe_layout_) {}
 
   void operator()
       [[sycl::reqd_sub_group_size(32)]] (sycl::nd_item<1> item) const {
@@ -375,16 +391,20 @@ class per_token_group_quant_8bit_vec_kernel {
 
       if (active && (lanes_per_group <= 1 || (lane % lanes_per_group) == 0)) {
         const int g_idx = c0 / chunks_per_group;
-        const int global_group = row * num_groups_per_row + g_idx;
-        float* scale_output;
-        if (is_column_major) {
-          const int row_idx = global_group / scale_num_rows;
-          const int col_idx = global_group % scale_num_rows;
-          scale_output = scale + (col_idx * scale_stride + row_idx);
+        if (moe_layout.enabled()) {
+          moe_layout.store(row, g_idx, y_s);
         } else {
-          scale_output = scale + global_group;
+          const int global_group = row * num_groups_per_row + g_idx;
+          float* scale_output;
+          if (is_column_major) {
+            const int row_idx = global_group / scale_num_rows;
+            const int col_idx = global_group % scale_num_rows;
+            scale_output = scale + (col_idx * scale_stride + row_idx);
+          } else {
+            scale_output = scale + global_group;
+          }
+          *scale_output = y_s;
         }
-        *scale_output = y_s;
       }
 
       if (active) {
@@ -814,7 +834,8 @@ void per_token_group_quant_fp8(
     double fp8_max,
     bool scale_ue8m0,
     bool dummy_is_scale_transposed,
-    bool dummy_is_tma_aligned) {
+    bool dummy_is_tma_aligned,
+    const c10::optional<torch::Tensor>& expert_scale_desc) {
   TORCH_CHECK(input.is_contiguous());
   TORCH_CHECK(output_q.is_contiguous());
 
@@ -843,14 +864,21 @@ void per_token_group_quant_fp8(
   const int num_blocks = num_groups / groups_per_block;
   const int num_threads = groups_per_block * THREADS_PER_GROUP;
 
-  const bool is_column_major = output_s.stride(0) < output_s.stride(1);
+  const auto moe_layout = vllm::make_moe_scale_layout(
+      output_s,
+      expert_scale_desc,
+      static_cast<int>(input.size(-1) / group_size));
+  const bool is_column_major =
+      !moe_layout.enabled() && output_s.stride(0) < output_s.stride(1);
   const int scale_num_rows = output_s.size(1);
   const int scale_stride = output_s.stride(1);
+  float* const scale_ptr =
+      moe_layout.enabled() ? nullptr : output_s.data_ptr<float>();
 
   // Fast vectorized path: one work-group per row with 16-byte loads. Requires
   // group_size to be a multiple of the (dtype-dependent) vector width.
-  const int num_tokens = output_s.size(0);
-  const int hidden = static_cast<int>(input.numel() / num_tokens);
+  const int hidden = static_cast<int>(input.size(-1));
+  const int num_tokens = static_cast<int>(input.numel() / hidden);
   const int elem_size = input.element_size();
   const int vec_width = 16 / elem_size;
   const bool use_vec =
@@ -889,7 +917,7 @@ void per_token_group_quant_fp8(
                     auto kernel = vllm::per_token_group_quant_8bit_vec_kernel<
                         scalar_t, fp8_t, CPT>(
                         output_q.data_ptr<fp8_t>(),
-                        output_s.data_ptr<float>(),
+                        scale_ptr,
                         input.data_ptr<scalar_t>(),
                         group_size,
                         hidden,
@@ -898,7 +926,8 @@ void per_token_group_quant_fp8(
                         scale_ue8m0,
                         scale_num_rows,
                         scale_stride,
-                        is_column_major);
+                        is_column_major,
+                        moe_layout);
                     cgh.parallel_for(
                         sycl::nd_range<1>(vgrid * vblock, vblock), kernel);
                   });
@@ -929,7 +958,7 @@ void per_token_group_quant_fp8(
                 auto kernel =
                     vllm::per_token_group_quant_8bit_kernel<scalar_t, fp8_t>(
                         output_q.data_ptr<fp8_t>(),
-                        output_s.data_ptr<float>(),
+                        scale_ptr,
                         input.data_ptr<scalar_t>(),
                         group_size,
                         groups_per_block,
@@ -937,7 +966,8 @@ void per_token_group_quant_fp8(
                         scale_ue8m0,
                         scale_num_rows,
                         scale_stride,
-                        is_column_major);
+                        is_column_major,
+                        moe_layout);
                 cgh.parallel_for(
                     sycl::nd_range<1>(grid * block, block), kernel);
               });

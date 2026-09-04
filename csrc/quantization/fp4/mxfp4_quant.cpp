@@ -20,6 +20,9 @@
 //   output_q [M, N/2]     – packed FP4 output (uint8, two nibbles per byte)
 //   output_s [M, N/g]     – UE8M0-rounded power-of-two scale (float32)
 //                           May be column-major (see below).
+//   moe_*                 – optional MoE scale-layout descriptor. When given,
+//                           output_s is instead the padded MN-major e8m0
+//                           surface consumed directly by the grouped GEMM.
 //   group_size            – block size; must be 32 for the MX format
 //   eps                   – absolute minimum to avoid log2(0); default 1e-10
 //
@@ -30,7 +33,8 @@ void per_token_group_quant_mxfp4(
     torch::Tensor& output_q,
     torch::Tensor& output_s,
     int64_t group_size,
-    double eps) {
+    double eps,
+    const c10::optional<torch::Tensor>& expert_scale_desc) {
   TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
   TORCH_CHECK(output_q.is_contiguous(), "output_q must be contiguous");
   TORCH_CHECK(
@@ -39,6 +43,10 @@ void per_token_group_quant_mxfp4(
       input.numel() % group_size == 0,
       "input numel must be divisible by group_size");
   TORCH_CHECK(output_s.dim() == 2, "output_s must be 2-D");
+  const auto moe_layout = vllm::make_moe_scale_layout(
+      output_s,
+      expert_scale_desc,
+      static_cast<int>(input.size(-1) / group_size));
   TORCH_CHECK(
       output_q.scalar_type() == at::ScalarType::Byte, "output_q must be uint8");
 
@@ -48,7 +56,8 @@ void per_token_group_quant_mxfp4(
     TORCH_CHECK(
         output_q.numel() == 0, "output_q must be empty when input is empty");
     TORCH_CHECK(
-        output_s.numel() == 0, "output_s must be empty when input is empty");
+        moe_layout.enabled() || output_s.numel() == 0,
+        "output_s must be empty when input is empty");
     return;
   }
 
@@ -70,7 +79,10 @@ void per_token_group_quant_mxfp4(
   const int num_threads = groups_per_block * THREADS_PER_GROUP;
 
   // Detect column-major scale layout.
-  const bool is_column_major = output_s.stride(0) < output_s.stride(1);
+  const bool is_column_major =
+      !moe_layout.enabled() && output_s.stride(0) < output_s.stride(1);
+  float* const scale_ptr =
+      moe_layout.enabled() ? nullptr : output_s.data_ptr<float>();
   // scale_num_cols = number of groups per token row (= N / group_size).
   const int scale_num_cols = output_s.size(1);
   const int scale_stride = static_cast<int>(output_s.stride(1));
@@ -100,13 +112,14 @@ void per_token_group_quant_mxfp4(
             auto kernel =
                 vllm::mxfp4::per_token_group_quant_mxfp4_vec_kernel<scalar_t>(
                     output_q.data_ptr<uint8_t>(),
-                    output_s.data_ptr<float>(),
+                    scale_ptr,
                     input.data_ptr<scalar_t>(),
                     hidden,
                     static_cast<int>(group_size),
                     static_cast<float>(eps),
                     scale_stride_token,
-                    scale_stride_group);
+                    scale_stride_group,
+                    moe_layout);
             cgh.parallel_for(
                 sycl::nd_range<1>(num_rows * wg_size, wg_size), kernel);
           });
@@ -115,14 +128,15 @@ void per_token_group_quant_mxfp4(
             auto kernel =
                 vllm::mxfp4::per_token_group_quant_mxfp4_kernel<scalar_t>(
                     output_q.data_ptr<uint8_t>(),
-                    output_s.data_ptr<float>(),
+                    scale_ptr,
                     input.data_ptr<scalar_t>(),
                     static_cast<int>(group_size),
                     groups_per_block,
                     static_cast<float>(eps),
                     scale_num_cols,
                     scale_stride,
-                    is_column_major);
+                    is_column_major,
+                    moe_layout);
             cgh.parallel_for(sycl::nd_range<1>(grid * block, block), kernel);
           });
         }

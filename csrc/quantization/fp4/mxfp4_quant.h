@@ -6,6 +6,7 @@
 
 #include "quantization/fp4/mxfp4_quant_asm.h"
 #include "quantization/utils.h"
+#include "quantization/moe_scale_layout.h"
 
 namespace vllm {
 namespace mxfp4 {
@@ -46,6 +47,7 @@ class per_token_group_quant_mxfp4_kernel {
   const int scale_num_cols;  // N / group_size  (columns in scale matrix)
   const int scale_stride;    // stride(1) of scale tensor
   bool is_column_major;
+  MoEScaleLayout moe_layout;
 
  public:
   per_token_group_quant_mxfp4_kernel(
@@ -57,7 +59,8 @@ class per_token_group_quant_mxfp4_kernel {
       float eps_,
       const int scale_num_cols_ = 0,
       const int scale_stride_ = 0,
-      bool is_column_major_ = false)
+      bool is_column_major_ = false,
+      MoEScaleLayout moe_layout_ = {})
       : out(out_),
         scale(scale_),
         input(input_),
@@ -66,7 +69,8 @@ class per_token_group_quant_mxfp4_kernel {
         eps(eps_),
         scale_num_cols(scale_num_cols_),
         scale_stride(scale_stride_),
-        is_column_major(is_column_major_) {}
+        is_column_major(is_column_major_),
+        moe_layout(moe_layout_) {}
 
   void operator()
       [[sycl::reqd_sub_group_size(32)]] (sycl::nd_item<1> item) const {
@@ -85,12 +89,12 @@ class per_token_group_quant_mxfp4_kernel {
     uint8_t* group_output = out + group_offset / 2;
 
     // Resolve the scale output pointer for this group.
-    float* scale_output;
-    if (is_column_major) {
+    float* scale_output = nullptr;
+    if (is_column_major && !moe_layout.enabled()) {
       const int row_idx = global_group_id / scale_num_cols;
       const int col_idx = global_group_id % scale_num_cols;
       scale_output = scale + col_idx * scale_stride + row_idx;
-    } else {
+    } else if (!moe_layout.enabled()) {
       scale_output = scale + global_group_id;
     }
 
@@ -106,15 +110,21 @@ class per_token_group_quant_mxfp4_kernel {
     y_s = sycl::exp2(sycl::ceil(sycl::log2(sycl::fmax(sycl::fabs(y_s), eps))));
 
     if (lane_id == 0) {
-      *scale_output = y_s;
+      if (moe_layout.enabled()) {
+        moe_layout.store(
+            global_group_id / moe_layout.scale_k,
+            global_group_id % moe_layout.scale_k,
+            y_s);
+      } else {
+        *scale_output = y_s;
+      }
     }
     sycl::group_barrier(item.get_group());
 
     const float inv_scale = 1.0f / y_s;
 
     if (lane_id < group_size) {
-      float scaled_val =
-          mxfp4_scale_clamp_asm(group_input[lane_id], inv_scale);
+      float scaled_val = mxfp4_scale_clamp_asm(group_input[lane_id], inv_scale);
       uint8_t fp4_val = float_to_fp4_e2m1(scaled_val);
 
       // Pack: even lane → low nibble, odd lane (lane+1) → high nibble.
@@ -142,6 +152,7 @@ class per_token_group_quant_mxfp4_vec_kernel {
   float eps;
   const int64_t scale_stride_token;
   const int64_t scale_stride_group;
+  MoEScaleLayout moe_layout;
 
  public:
   per_token_group_quant_mxfp4_vec_kernel(
@@ -152,7 +163,8 @@ class per_token_group_quant_mxfp4_vec_kernel {
       const int group_size_,
       float eps_,
       const int64_t scale_stride_token_,
-      const int64_t scale_stride_group_)
+      const int64_t scale_stride_group_,
+      MoEScaleLayout moe_layout_ = {})
       : out(out_),
         scale(scale_),
         input(input_),
@@ -160,7 +172,8 @@ class per_token_group_quant_mxfp4_vec_kernel {
         group_size(group_size_),
         eps(eps_),
         scale_stride_token(scale_stride_token_),
-        scale_stride_group(scale_stride_group_) {}
+        scale_stride_group(scale_stride_group_),
+        moe_layout(moe_layout_) {}
 
   void operator()
       [[sycl::reqd_sub_group_size(32)]] (sycl::nd_item<1> item) const {
@@ -210,10 +223,14 @@ class per_token_group_quant_mxfp4_vec_kernel {
 
       if (active && (lane % lanes_per_group) == 0) {
         const int g_idx = c / lanes_per_group;
-        const int64_t scale_idx =
-            static_cast<int64_t>(row_idx) * scale_stride_token +
-            static_cast<int64_t>(g_idx) * scale_stride_group;
-        scale[scale_idx] = y_s;
+        if (moe_layout.enabled()) {
+          moe_layout.store(row_idx, g_idx, y_s);
+        } else {
+          const int64_t scale_idx =
+              static_cast<int64_t>(row_idx) * scale_stride_token +
+              static_cast<int64_t>(g_idx) * scale_stride_group;
+          scale[scale_idx] = y_s;
+        }
       }
 
       if (active) {

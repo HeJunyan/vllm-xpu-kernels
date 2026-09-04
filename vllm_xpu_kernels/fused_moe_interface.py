@@ -14,7 +14,7 @@ except ImportError as e:
     FUSEDMOE_UNAVAILABLE_REASON = str(e)
     FUSEDMOE_AVAILABLE = False
 
-from .moe_utils import quant_act_xpu, ref_fused_moe, reorder_mxfp_scales
+from .moe_utils import mxfp_scale_padded_rows, quant_act_xpu, ref_fused_moe
 
 REF_FUSED_MOE_ENV = "VLLM_XPU_FUSED_MOE_USE_REF"
 USE_MXFP4_FP8_ENV = "VLLM_XPU_FUSED_MOE_USE_MXFP4_FP8"
@@ -418,9 +418,19 @@ class XpuFusedMoe:
         if expert_map is None and self.ep_size > 1:
             expert_map = self.expert_map
 
+        # mx recipes need the activation scales in the per-expert MN-major,
+        # M-padded-to-4 surface the mxfp grouped-GEMM mainloop indexes. Both
+        # producers of that surface (the remap kernel for gemm1, the act quant
+        # kernel for gemm2) write it directly, so no reorder pass is needed.
+        mx_act_scale = (act_quant and not per_tensor_scale
+                        and a1q_scale.dtype == torch.float8_e8m0fnu)
+        padded_scale_rows = mxfp_scale_padded_rows(num_moe_inputs,
+                                                   self.num_experts)
         if act_quant and not per_tensor_scale:
-            remapped_scales = torch.empty(
-                (num_rows * self.n_experts_per_token, a1q_scale.shape[1]),
+            alloc = torch.zeros if mx_act_scale else torch.empty
+            remapped_scales = alloc(
+                (padded_scale_rows if mx_act_scale else num_moe_inputs,
+                 a1q_scale.shape[1]),
                 dtype=a1q_scale.dtype,
                 device=a1q_scale.device)
         else:
@@ -436,6 +446,13 @@ class XpuFusedMoe:
             (num_rows, self.n_experts_per_token),
             dtype=torch.int32,
             device=hidden_states.device)
+        # Per-expert row prefixes of the padded scale surface. remap computes
+        # them anyway, and publishing them lets gemm2's quant kernel emit that
+        # surface directly instead of running a reorder pass.
+        expert_scale_desc = torch.empty(
+            (2, self.num_experts + 1),
+            dtype=torch.int32,
+            device=hidden_states.device) if mx_act_scale else None
 
         torch.ops._moe_C.remap_hidden_states(
             hidden_states=hidden_states,
@@ -447,7 +464,8 @@ class XpuFusedMoe:
             unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
             topk_ids=topk_ids,
             total_experts_num=self.total_experts_num,
-            local_experts_num=self.local_experts_num)
+            local_experts_num=self.local_experts_num,
+            expert_scale_desc=expert_scale_desc)
 
         ########### gemm1 ##################
         # The grouped-GEMM writes ptr_D as its policy ElementOutput, so the
@@ -460,13 +478,9 @@ class XpuFusedMoe:
                                 dtype=gemm_output_dtype,
                                 device=output.device)
 
-        gemm1_act_scale = remapped_scales
-        if per_tensor_scale:
-            gemm1_act_scale = a1q_scale
-        elif remapped_scales is not None \
-                and remapped_scales.dtype == torch.float8_e8m0fnu:
-            gemm1_act_scale = reorder_mxfp_scales(remapped_scales,
-                                                  rows_per_expert)
+        # remapped_scales is already in the layout the GEMM expects (mx
+        # recipes get the padded MN-major surface straight out of remap).
+        gemm1_act_scale = a1q_scale if per_tensor_scale else remapped_scales
         torch.ops._xpu_C.cutlass_grouped_gemm_interface(
             ptr_A=remapped_hidden_states,
             ptr_A_scale=gemm1_act_scale,
@@ -499,10 +513,14 @@ class XpuFusedMoe:
                                 device=output.device)
 
         if act_quant:
-            act_output, gemm2_act_scale = quant_act_xpu(act_output, self.recipe)
-            if gemm2_act_scale.dtype == torch.float8_e8m0fnu:
-                gemm2_act_scale = reorder_mxfp_scales(gemm2_act_scale,
-                                                      rows_per_expert)
+            # mx recipes get the padded MN-major surface straight out of the
+            # quant kernel: the rows are already grouped per expert here, so
+            # the descriptor tells it where each scale belongs.
+            act_output, gemm2_act_scale = quant_act_xpu(
+                act_output, self.recipe, expert_scale_desc, padded_scale_rows)
+            assert (expert_scale_desc is not None
+                    or gemm2_act_scale.dtype != torch.float8_e8m0fnu), \
+                "mx activation scales must come from the fused layout path"
         torch.ops._xpu_C.cutlass_grouped_gemm_interface(
             ptr_A=act_output,
             ptr_A_scale=gemm2_act_scale if act_quant else None,

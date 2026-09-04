@@ -75,21 +75,36 @@ def dequant_mxfp8(x_lp, x_scale):
         (x_scale.reshape(-1, 1).to(torch.float32))
     return x.reshape(ori_shape)
 
-def quant_mxfp_act_xpu(x, recipe):
+def quant_mxfp_act_xpu(x, recipe, expert_scale_desc=None, scale_rows=0):
     assert recipe in ("mxfp8", "mxfp4")
     if recipe == "mxfp8":
-        return _quant_mxfp8_act_xpu(x)
+        return _quant_mxfp8_act_xpu(x, expert_scale_desc, scale_rows)
     else:
-        return _quant_mxfp4_act_xpu(x)
+        return _quant_mxfp4_act_xpu(x, expert_scale_desc, scale_rows)
 
-def _quant_mxfp8_act_xpu(x):
+
+def _alloc_mx_act_scale(x, scale_k, expert_scale_desc, scale_rows):
+    # Without a MoE descriptor the kernel writes float32 scales that the
+    # caller converts to e8m0. With one it writes the padded MN-major e8m0
+    # surface the mxfp grouped-GEMM mainloop indexes directly, which removes
+    # both the conversion pass and the separate reorder pass.
+    if expert_scale_desc is None:
+        return torch.empty(x.shape[:-1] + (scale_k, ),
+                           device=x.device,
+                           dtype=torch.float32)
+    return torch.zeros((scale_rows, scale_k),
+                       device=x.device,
+                       dtype=torch.float8_e8m0fnu)
+
+
+def _quant_mxfp8_act_xpu(x, expert_scale_desc=None, scale_rows=0):
     MXFP8_BLOCK_SIZE = 32
     assert x.shape[-1] % MXFP8_BLOCK_SIZE == 0
 
     eps = 1e-10
     x_q = torch.empty_like(x, device=x.device, dtype=torch.float8_e4m3fn)
-    shape = x.shape[:-1] + (x.shape[-1] // MXFP8_BLOCK_SIZE,)
-    x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
+    x_s = _alloc_mx_act_scale(x, x.shape[-1] // MXFP8_BLOCK_SIZE,
+                              expert_scale_desc, scale_rows)
     torch.ops._C.per_token_group_fp8_quant(
         x,
         x_q,
@@ -101,23 +116,28 @@ def _quant_mxfp8_act_xpu(x):
         True,
         False,
         False,  # dummy_is_scale_transposed, dummy_is_tma_aligned
+        expert_scale_desc,
     )
-    x_s = x_s.to(torch.float8_e8m0fnu)
+    if expert_scale_desc is None:
+        x_s = x_s.to(torch.float8_e8m0fnu)
     return x_q, x_s
 
-def _quant_mxfp4_act_xpu(x):
+def _quant_mxfp4_act_xpu(x, expert_scale_desc=None, scale_rows=0):
     MXFP4_BLOCK_SIZE = 32
     eps = 1e-10
     M, N = x.shape
     # Packed FP4 output: two nibbles per byte
     x_q = torch.empty(M, N // 2, device=x.device, dtype=torch.uint8)
-    x_s = torch.empty(M, N // MXFP4_BLOCK_SIZE, device=x.device)
+    x_s = _alloc_mx_act_scale(x, N // MXFP4_BLOCK_SIZE, expert_scale_desc,
+                              scale_rows)
 
-    torch.ops._C.per_token_group_quant_mxfp4(x, x_q, x_s, MXFP4_BLOCK_SIZE, eps)
+    torch.ops._C.per_token_group_quant_mxfp4(x, x_q, x_s, MXFP4_BLOCK_SIZE,
+                                             eps, expert_scale_desc)
 
     x_q = x_q.view(torch.float4_e2m1fn_x2)
-    x_s = x_s.to(dtype=torch.float8_e8m0fnu, 
-                 memory_format=torch.preserve_format)
+    if expert_scale_desc is None:
+        x_s = x_s.to(dtype=torch.float8_e8m0fnu,
+                     memory_format=torch.preserve_format)
     return x_q, x_s
 
 def quant_fp8_pertensor_act(x):
@@ -430,14 +450,24 @@ def ref_fused_moe(recipe,
                                 num_experts)
     return output
 
-def quant_act_xpu(x, recipe):
+def quant_act_xpu(x, recipe, expert_scale_desc=None, scale_rows=0):
+    """Quantize MoE activations.
+
+    ``expert_scale_desc`` is the int32 ``[2, num_experts + 1]`` tensor that
+    ``remap_hidden_states`` publishes. When given, the mx kernels write the
+    per-expert MN-major, M-padded-to-4 scale surface (``scale_rows`` tall)
+    that the grouped GEMM indexes directly. The rows of ``x`` must already be
+    grouped per expert, as they are between the two grouped GEMMs, which is
+    what lets the quant kernel place each scale at its final position and
+    makes the reorder pass unnecessary.
+    """
     if recipe in ("mxfp4", "mxfp8"):
-        return quant_mxfp_act_xpu(x, recipe)
+        return quant_mxfp_act_xpu(x, recipe, expert_scale_desc, scale_rows)
     elif recipe == "mxfp4_fp8":
         # W4A8: mxfp4 weights + mxfp8 activations. The activation is quantized
         # to mxfp8 (e4m3 + e8m0 per-32-block scale) to match the XE3 W4A8
         # grouped-GEMM kernel (see PR #165).
-        return quant_mxfp_act_xpu(x, "mxfp8")
+        return quant_mxfp_act_xpu(x, "mxfp8", expert_scale_desc, scale_rows)
     elif recipe == "fp8block":
         return quant_fp8_block_act(x)
     elif recipe == "fp8":
@@ -445,13 +475,19 @@ def quant_act_xpu(x, recipe):
     else:
         raise NotImplementedError(f"Unsupported recipe for quant_act_xpu: {recipe}") # noqa: E501
     
-def reorder_mxfp_scales(A_scales, rows_per_expert):  
+def mxfp_scale_padded_rows(num_rows, num_experts):
     # After cutlass-sycl PR #570, the optimized mxfp mainloop requires the
     # per-expert scale-A surface width (M dim, since scale is MN-major) to be
-    # a multiple of 4 (ScaleAlignElems for 8-bit scales). Pad each expert's M
-    # up to a multiple of 4 with zeros so the cumulative scale offsets used by
-    # the grouped-gemm kernel (sum of round_up_4(rows)) remain aligned.
+    # a multiple of 4 (ScaleAlignElems for 8-bit scales). Each expert's M is
+    # rounded up to a multiple of 4, so the worst case adds 3 rows per expert.
+    return num_rows + 3 * num_experts
+
+
+def reorder_mxfp_scales(A_scales, rows_per_expert):
+    # Pad each expert's M up to a multiple of 4 with zeros so the cumulative
+    # scale offsets used by the grouped-gemm kernel (sum of round_up_4(rows))
+    # remain aligned.
     num_experts = rows_per_expert.shape[0]
-    total_padded = A_scales.shape[0] + 3 * num_experts
+    total_padded = mxfp_scale_padded_rows(A_scales.shape[0], num_experts)
     return torch.ops._moe_C.reorder_mxfp_scales(A_scales, rows_per_expert,
                                                 total_padded)
