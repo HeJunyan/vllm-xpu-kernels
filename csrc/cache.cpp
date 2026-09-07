@@ -76,14 +76,14 @@ class reshape_and_cache_kernel {
       scalar_t tgt_value = value_[src_value_idx];
       if constexpr (kv_dt == Fp8KVCacheDataType::kFp8E5M2) {
         key_cache_[dst_key_idx] =
-            static_cast<at::Float8_e5m2>(tgt_key * (*k_scale_));
+            static_cast<at::Float8_e5m2>(tgt_key / (*k_scale_));
         value_cache_[dst_value_idx] =
-            static_cast<at::Float8_e5m2>(tgt_value * (*v_scale_));
+            static_cast<at::Float8_e5m2>(tgt_value / (*v_scale_));
       } else if constexpr (kv_dt == Fp8KVCacheDataType::kFp8E4M3) {
         key_cache_[dst_key_idx] =
-            static_cast<at::Float8_e4m3fn>(tgt_key * (*k_scale_));
+            static_cast<at::Float8_e4m3fn>(tgt_key / (*k_scale_));
         value_cache_[dst_value_idx] =
-            static_cast<at::Float8_e4m3fn>(tgt_value * (*v_scale_));
+            static_cast<at::Float8_e4m3fn>(tgt_value / (*v_scale_));
       } else {  // kv_dt == Fp8KVCacheDataType::kAuto
         key_cache_[dst_key_idx] = tgt_key;
         value_cache_[dst_value_idx] = tgt_value;
@@ -156,9 +156,9 @@ class reshape_and_cache_flash_strided_kernel {
     // Scale ops are identical for every head of this token — construct once.
     constexpr int VEC_SIZE = (sizeof(scalar_t) == 2) ? 8 : 4;
     const float k_scale_val =
-        (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *k_scale_;
+        (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : 1.0f / *k_scale_;
     const float v_scale_val =
-        (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *v_scale_;
+        (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : 1.0f / *v_scale_;
     using KVOp = fp8::CopyWithScaleOp<cache_t, scalar_t, kv_dt>;
     KVOp k_op{k_scale_val};
     KVOp v_op{v_scale_val};
