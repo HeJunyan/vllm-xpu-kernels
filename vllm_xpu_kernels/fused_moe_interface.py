@@ -350,15 +350,18 @@ class XpuFusedMoe:
         topk_ids,
         expert_map=None,
         a1q_scale=None,
+        a2_scale=None,
     ):
         if self._use_ref:
             self._apply_ref(output, hidden_states,
                             topk_weights, topk_ids,
-                            expert_map, a1q_scale)
+                            expert_map, a1q_scale,
+                            a2_scale)
         else:
             self._apply_kernel(output, hidden_states,
                                topk_weights, topk_ids,
-                               expert_map, a1q_scale)
+                               expert_map, a1q_scale,
+                               a2_scale)
 
     def _apply_ref(
         self,
@@ -368,6 +371,7 @@ class XpuFusedMoe:
         topk_ids,
         expert_map=None,
         a1q_scale=None,
+        a2_scale=None,
     ):
         return ref_fused_moe(recipe=self.recipe,
                             output=output,
@@ -387,6 +391,7 @@ class XpuFusedMoe:
                             ep_size=self.ep_size,
                             expert_map=expert_map,
                             a1q_scale=a1q_scale,
+                            a2_scale=a2_scale,
                             gemm1_clamp_limit=self.gemm1_clamp_limit)
 
     def _apply_kernel(
@@ -397,6 +402,7 @@ class XpuFusedMoe:
         topk_ids,
         expert_map=None,
         a1q_scale=None,
+        a2_scale=None,
     ):
         num_rows, hidden_size = hidden_states.shape
         num_moe_inputs = self.n_experts_per_token * num_rows
@@ -511,13 +517,13 @@ class XpuFusedMoe:
         gemm2_output = torch.empty((num_moe_inputs, gemm_hidden_size),
                                 dtype=gemm_output_dtype,
                                 device=output.device)
-
         if act_quant:
             # mx recipes get the padded MN-major surface straight out of the
             # quant kernel: the rows are already grouped per expert here, so
             # the descriptor tells it where each scale belongs.
             act_output, gemm2_act_scale = quant_act_xpu(
-                act_output, self.recipe, expert_scale_desc, padded_scale_rows)
+                act_output, self.recipe, expert_scale_desc, padded_scale_rows,
+                static_scale=a2_scale)
             assert (expert_scale_desc is not None
                     or gemm2_act_scale.dtype != torch.float8_e8m0fnu), \
                 "mx activation scales must come from the fused layout path"

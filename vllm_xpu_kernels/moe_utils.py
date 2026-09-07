@@ -140,21 +140,6 @@ def _quant_mxfp4_act_xpu(x, expert_scale_desc=None, scale_rows=0):
                      memory_format=torch.preserve_format)
     return x_q, x_s
 
-def quant_fp8_pertensor_act(x):
-    """
-    Quantize to per-tensor fp8: one global scalar for the whole tensor.
-
-    Returns (q, scale) where scale has shape [1] (float32), matching what the
-    per-tensor grouped-GEMM policy expects for ptr_A_scale.
-    """
-    x_fp = x.to(torch.float32)
-    scale = (x_fp.abs().max() / FP8_E4M3_MAX).clamp(
-        min=torch.finfo(torch.float32).eps).reshape(1)
-    q = (x_fp / scale).clamp(FP8_E4M3_MIN,
-                             FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-    return q, scale
-
-
 def qdq_fp8_act(x):
     x_fp = x.to(torch.float32)
     scale = (x_fp.abs().max() / FP8_E4M3_MAX).clamp(
@@ -289,6 +274,7 @@ def ref_fused_moe(recipe,
                   ep_size=1,
                   expert_map=None,
                   a1q_scale=None,
+                  a2_scale=None,
                   gemm1_clamp_limit: Optional[float] = None,
 ):
     """
@@ -341,7 +327,8 @@ def ref_fused_moe(recipe,
     
 
     # ---- remap hidden states (unchanged from _apply_kernel) ----
-    if a1q_scale is not None:
+    per_tensor_scale = a1q_scale is not None and a1q_scale.numel() == 1
+    if a1q_scale is not None and not per_tensor_scale:
         remapped_scales = torch.empty(
                 (num_rows * n_experts_per_token, a1q_scale.shape[1]),
                 dtype=a1q_scale.dtype,
@@ -362,7 +349,7 @@ def ref_fused_moe(recipe,
 
     torch.ops._moe_C.remap_hidden_states(
         hidden_states=hidden_states,
-        hidden_states_scales=a1q_scale,
+        hidden_states_scales=None if per_tensor_scale else a1q_scale,
         remapped_hidden_states=remapped_hidden_states,
         remapped_hidden_states_scales=remapped_scales,
         expert_map=expert_map,
@@ -391,7 +378,11 @@ def ref_fused_moe(recipe,
         tokens_i = remapped_hidden_states[offset:offset + n_tokens]
 
         # activation: quant → dequant round-trip
-        if a1q_scale is not None:
+        if per_tensor_scale:
+            # Per-tensor: dequant with the single global scale (keep scale on-device)
+            tokens_i_qdq = (tokens_i.to(torch.float32)
+                            * a1q_scale.to(torch.float32)).to(compute_dtype)
+        elif a1q_scale is not None:
             tokens_i_qdq = dequant_act(
                 tokens_i,
                 remapped_scales[offset:offset + n_tokens],
@@ -433,7 +424,14 @@ def ref_fused_moe(recipe,
         act_i = act_output[offset:offset + n_tokens]
 
         # activation: quant → dequant round-trip
-        act_i_qdq = qdq_act(act_i, recipe).to(compute_dtype)
+        if a2_scale is not None:
+            # Static per-tensor: quantize with static scale, then dequant
+            act_i_qdq = ((act_i.float() / a2_scale.float()).clamp(
+                FP8_E4M3_MIN, FP8_E4M3_MAX
+            ).to(torch.float8_e4m3fn).float() * a2_scale.float()).to(
+                compute_dtype)
+        else:
+            act_i_qdq = qdq_act(act_i, recipe).to(compute_dtype)
 
         # weight dequant
         w2_scales_i = None if w2_scales is None else w2_scales[i]
@@ -450,7 +448,24 @@ def ref_fused_moe(recipe,
                                 num_experts)
     return output
 
-def quant_act_xpu(x, recipe, expert_scale_desc=None, scale_rows=0):
+def quant_fp8_pertensor_act(x: torch.Tensor):
+    """Dynamic per-tensor FP8 quantization (single global scale)."""
+    x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(1, device=x.device, dtype=torch.float32)
+    torch.ops._C.dynamic_scaled_fp8_quant(x_fp8, x, scale)
+    return x_fp8, scale
+
+
+def quant_fp8_static_pertensor_act(x: torch.Tensor,
+                                    static_scale: torch.Tensor):
+    """Static per-tensor FP8 quantization using pre-computed scale."""
+    x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale = static_scale.float().reshape(1)
+    torch.ops._C.static_scaled_fp8_quant(x_fp8, x, scale, None)
+    return x_fp8, scale
+
+
+def quant_act_xpu(x, recipe, expert_scale_desc=None, scale_rows=0, static_scale=None):
     """Quantize MoE activations.
 
     ``expert_scale_desc`` is the int32 ``[2, num_experts + 1]`` tensor that
@@ -471,6 +486,8 @@ def quant_act_xpu(x, recipe, expert_scale_desc=None, scale_rows=0):
     elif recipe == "fp8block":
         return quant_fp8_block_act(x)
     elif recipe == "fp8":
+        if static_scale is not None:
+            return quant_fp8_static_pertensor_act(x, static_scale)
         return quant_fp8_pertensor_act(x)
     else:
         raise NotImplementedError(f"Unsupported recipe for quant_act_xpu: {recipe}") # noqa: E501
