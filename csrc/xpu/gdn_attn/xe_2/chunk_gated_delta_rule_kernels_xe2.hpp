@@ -31,6 +31,11 @@ struct chunk_gemm_policy_64x64x32_4x2 {
   using SGLayout = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
 };
 
+struct chunk_gemm_policy_64x64x32_4x4 {
+  using WGTile = Shape<_64, _64, _32>;
+  using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
+};
+
 struct chunk_gemm_policy_16x16x16 {
   using WGTile = Shape<_16, _16, _16>;
   using SGLayout = Layout<Shape<_1, _1, _1>, Stride<_1, _1, _0>>;
@@ -40,6 +45,10 @@ using chunk_gemm_policy_compute_A = chunk_gemm_policy_64x64x32_2x2;
 using chunk_gemm_policy_inverse = chunk_gemm_policy_16x16x16;
 using chunk_gemm_policy_compute_wu = chunk_gemm_policy_64x64x32_4x2;
 using chunk_gemm_policy_fwd_o = chunk_gemm_policy_64x64x32_4x2;
+// Larger sub-group layout used for chunk_fwd_o when the launch grid does not
+// saturate the GPU: more sub-groups per work-group extract additional XMX
+// throughput per output tile when there are otherwise idle Xe cores.
+using chunk_gemm_policy_fwd_o_big = chunk_gemm_policy_64x64x32_4x4;
 
 CUTE_DEVICE float
 act_softplus(float& x, float beta = 1.0f, float threshold = 20.0f) {
@@ -1239,7 +1248,7 @@ class ChunkInverseKernel;
 template <typename T, typename StateTag>
 class ChunkComputeWUKernel;
 
-template <typename T, typename StateT>
+template <typename T, typename StateT, bool BigSG>
 class ChunkFwdOKernel;
 
 template <typename T, typename StateT>
@@ -1461,51 +1470,81 @@ void kernel_launcher(
   });
 
   // compute O
+  //
+  // chunk_fwd_o is the dominant sub-kernel of the delta stage. Its launch grid
+  // is (batch_size, num_v_heads * dv_split): when this does not fill the GPU,
+  // a wider sub-group layout (more sub-groups per work-group) raises XMX
+  // utilization per output tile; when the grid already saturates the machine,
+  // the compact layout keeps more work-groups resident. Pick per launch.
   using WGTileFwdO = chunk_gemm_policy_fwd_o::WGTile;
   using SGLayoutFwdO = chunk_gemm_policy_fwd_o::SGLayout;
-  using MMAFwdO = typename TiledMMAHelper<
+  using MMAFwdOSmall = typename TiledMMAHelper<
       MMA_Atom<decltype(op)>,
       Layout<WGTileFwdO>,
       SGLayoutFwdO>::TiledMMA;
-  auto mmaFwdO = MMAFwdO{};
-  int MaxThreadsPerWorkgroupFwdO = size(mmaFwdO);
-  sycl::range<3> local_fwd_o(1, 1, MaxThreadsPerWorkgroupFwdO);
+  using WGTileFwdOBig = chunk_gemm_policy_fwd_o_big::WGTile;
+  using SGLayoutFwdOBig = chunk_gemm_policy_fwd_o_big::SGLayout;
+  using MMAFwdOBig = typename TiledMMAHelper<
+      MMA_Atom<decltype(op)>,
+      Layout<WGTileFwdOBig>,
+      SGLayoutFwdOBig>::TiledMMA;
+
   // Split head_v_dim (dv_split tiles) across the grid so each work-group
   // owns one output tile.
   const int fwd_o_dv_split = head_v_dim / chunk_size;
-  sycl::range<3> global_fwd_o(batch_size, num_v_heads * fwd_o_dv_split, 1);
+  const int fwd_o_wgs = batch_size * num_v_heads * fwd_o_dv_split;
+  // Use the wider sub-group layout (more sub-groups per output tile) only when
+  // the grid has fewer work-groups than Xe cores, so some cores would
+  // otherwise sit idle. Once fwd_o_wgs >= 2*sm_count every core already has work
+  // and the wider layout only adds extra scheduling waves (measured regression
+  // on batched shapes), so fall back to the compact layout.
+  const bool use_big_fwd_o = fwd_o_wgs < 2 * sm_count;
   int slm_size_fwd_o = chunk_size + chunk_size + chunk_size;
 
-  queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> local_mem(
-        sycl::range<1>(slm_size_fwd_o), cgh);
-    cgh.parallel_for<ChunkFwdOKernel<T, StateT>>(
-        sycl::nd_range<3>{global_fwd_o * local_fwd_o, local_fwd_o},
-        kernel_props,
-        [=](auto) {
-          chunk_fwd_o_kernel<T, StateT, MMAFwdO>(
-              local_mem,
-              core_attn_out,
-              A,
-              w,
-              u,
-              q,
-              k,
-              a,
-              ssm_state,
-              ssm_state_stride_0,
-              query_start_loc,
-              cache_indices,
-              has_initial_state,
-              token_indx,
-              batch_size,
-              total_virtual_seqlen,
-              num_k_heads,
-              head_k_dim,
-              num_v_heads,
-              head_v_dim);
-        });
-  });
+  auto launch_fwd_o = [&](auto big_tag) {
+    constexpr bool BigSG = decltype(big_tag)::value;
+    using MMAFwdO = std::conditional_t<BigSG, MMAFwdOBig, MMAFwdOSmall>;
+    int MaxThreadsPerWorkgroupFwdO = size(MMAFwdO{});
+    sycl::range<3> local_fwd_o(1, 1, MaxThreadsPerWorkgroupFwdO);
+    sycl::range<3> global_fwd_o(batch_size, num_v_heads * fwd_o_dv_split, 1);
+
+    queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> local_mem(
+          sycl::range<1>(slm_size_fwd_o), cgh);
+      cgh.parallel_for<ChunkFwdOKernel<T, StateT, BigSG>>(
+          sycl::nd_range<3>{global_fwd_o * local_fwd_o, local_fwd_o},
+          kernel_props,
+          [=](auto) {
+            chunk_fwd_o_kernel<T, StateT, MMAFwdO>(
+                local_mem,
+                core_attn_out,
+                A,
+                w,
+                u,
+                q,
+                k,
+                a,
+                ssm_state,
+                ssm_state_stride_0,
+                query_start_loc,
+                cache_indices,
+                has_initial_state,
+                token_indx,
+                batch_size,
+                total_virtual_seqlen,
+                num_k_heads,
+                head_k_dim,
+                num_v_heads,
+                head_v_dim);
+          });
+    });
+  };
+
+  if (use_big_fwd_o) {
+    launch_fwd_o(std::true_type{});
+  } else {
+    launch_fwd_o(std::false_type{});
+  }
 }
 
 void chunk_gated_delta_rule_impl_xe2(
