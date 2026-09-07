@@ -583,7 +583,7 @@ class group_idx_and_topk_idx_kernel {
       num_equalto_topkth_group = target_num_min - pre_count_equal_to_top_value;
     }
 
-    item.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item.get_group());
 
     warp_topk::WarpSelect</*capability*/ WARP_SIZE,
                           /*greater*/ true,
@@ -624,7 +624,7 @@ class group_idx_and_topk_idx_kernel {
       queue.done(sg, local_id);
     }
     // after done(), smem is used for merging results among warps
-    item.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item.get_group());
     if (case_id < num_tokens && if_proceed_next_topk) {
       // Get the topk_idx
       queue.dumpIdx(s_topk_idx);
@@ -650,7 +650,7 @@ class group_idx_and_topk_idx_kernel {
       }
     }
 
-    item.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item.get_group());
 
     if (case_id < num_tokens) {
       if (if_proceed_next_topk) {
