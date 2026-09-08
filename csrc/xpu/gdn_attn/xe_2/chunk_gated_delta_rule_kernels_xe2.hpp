@@ -724,12 +724,6 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
   int chunk_id = item.get_group(1) / num_v_heads;
   const int global_chunk_range = item.get_group_range(1) / num_v_heads;
 
-  // l2norm for q, k
-  auto sg = item.get_sub_group();
-  int sg_id = sg.get_group_linear_id();
-  int sg_range = sg.get_group_linear_range();
-  int sg_local_id = sg.get_local_linear_id();
-
   float* slm_mem = static_cast<float*>(
       slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>()
           .get());
