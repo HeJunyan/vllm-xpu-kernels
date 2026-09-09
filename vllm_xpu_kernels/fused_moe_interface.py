@@ -18,6 +18,7 @@ from .moe_utils import mxfp_scale_padded_rows, quant_act_xpu, ref_fused_moe
 
 REF_FUSED_MOE_ENV = "VLLM_XPU_FUSED_MOE_USE_REF"
 USE_MXFP4_FP8_ENV = "VLLM_XPU_FUSED_MOE_USE_MXFP4_FP8"
+PRINT_ACTIVATED_EXPERTS_ENV = "VLLM_XPU_FUSED_MOE_PRINT_ACTIVATED_EXPERTS"
 
 def _is_env_enabled(env_name: str, default: str = "0") -> bool:
     value = os.environ.get(env_name, default).strip().upper()
@@ -26,6 +27,10 @@ def _is_env_enabled(env_name: str, default: str = "0") -> bool:
 
 def _should_use_ref_fused_moe(is_mxfp8: bool) -> bool:
     return _is_env_enabled(REF_FUSED_MOE_ENV)
+
+
+def _should_print_activated_experts() -> bool:
+    return _is_env_enabled(PRINT_ACTIVATED_EXPERTS_ENV)
 
 
 def _get_recipe(is_fp8, is_mxfp8, is_mxfp4, is_int4, is_block_fp8):
@@ -472,6 +477,11 @@ class XpuFusedMoe:
             total_experts_num=self.total_experts_num,
             local_experts_num=self.local_experts_num,
             expert_scale_desc=expert_scale_desc)
+
+        if _should_print_activated_experts() and num_rows > 1 \
+                and num_rows < 1024:
+            activated_experts = (rows_per_expert != 0).sum().item()
+            print("activated_experts", activated_experts, flush=True)
 
         ########### gemm1 ##################
         # The grouped-GEMM writes ptr_D as its policy ElementOutput, so the
