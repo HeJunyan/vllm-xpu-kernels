@@ -756,31 +756,21 @@ struct FMHAFwdMainloop<
       }
       /* k masking for remainder tiles */
       if (check_remainder_k && K == blk_k1 - 1) {
-        if constexpr (Fp8Q) {
-          // Fp8 path
-          Tensor cKrem = make_identity_tensor(make_shape(seq_len, seq_len));
-          Tensor gKrem = local_tile(
-              cKrem, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
-          auto cS_rem = thr_mma_qk.partition_C(gKrem);
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrS.size(); i++) {
-            if (get<1>(cS_rem(i)) >= seq_len) {
-              tSrS(i) = ElementS(-INFINITY);
-            }
-          }
-        } else {
-          // Non-fp8 path
-          FragSCol k_rem_mask;
-          int k =
-              get<0>(tKgK(0, 0, 0, K, 0)) + get_sub_group().get_local_id()[0];
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
-            k_rem_mask(i) =
-                (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
-          }
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrS.size(); i++) {
-            tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
+        // Mask KV columns that fall past the logical sequence length. Derive the
+        // per-element column coordinate from the MMA C partition (the same layout
+        // as tSrS) rather than from the copy-K partition + broadcast: the copy
+        // and MMA-output subgroup layouts need not agree on how lanes map to KV
+        // columns, and a mismatch would mask the wrong columns (leaving garbage
+        // scores in the remainder that inflate the softmax row-max -> P == 0 ->
+        // inf). This mirrors the LocalMask/CausalMask coordinate handling above.
+        Tensor cKrem = make_identity_tensor(make_shape(seq_len, seq_len));
+        Tensor gKrem = local_tile(
+            cKrem, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+        auto cS_rem = thr_mma_qk.partition_C(gKrem);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tSrS.size(); i++) {
+          if (get<1>(cS_rem(i)) >= seq_len) {
+            tSrS(i) = ElementS(-INFINITY);
           }
         }
       }
