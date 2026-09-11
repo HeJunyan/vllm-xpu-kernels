@@ -195,6 +195,7 @@ class cmake_build_ext(build_ext):
             "MOE_KERNELS_ENABLED",
             "GDN_KERNELS_ENABLED",
             "MQA_LOGITS_KERNELS_ENABLED",
+            "MHC_KERNELS_ENABLED",
             "XPU_SPECIFIC_KERNELS_ENABLED",
             "XPUMEM_ALLOCATOR_ENABLED",
             "BUILD_QUANT_ASM_XE3",

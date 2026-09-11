@@ -38,6 +38,7 @@
 #include "moe_array_mma.hpp"
 #include "moe_tile_scheduler.hpp"
 #include "cute/tensor.hpp"
+#include "moe_grouped_gemm/collective/xe_moe_gemm_greedy.hpp"
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -101,8 +102,14 @@ class GemmUniversal<
       cute::is_same_v<TileScheduler_, GroupScheduler>,
       "Only Group Scheduler is supported with this code.");
   using TileSchedulerTag = TileScheduler_;
-  using TileScheduler =
-      typename cutlass::gemm::kernel::detail::PersistentTileSchedulerMoE;
+  static constexpr bool DirectStore =
+      cute::is_same_v<typename DispatchPolicy::Schedule, KernelMoEMXFP8Greedy>;
+  using TileScheduler = cute::conditional_t<
+      cute::is_base_of_v<
+          KernelMoEMXFP8ArrayCooperative,
+          typename DispatchPolicy::Schedule>,
+      detail::PersistentTileSchedulerMXFP8<TileShape>,
+      detail::PersistentTileSchedulerMoE>;
   using TileSchedulerArguments = typename TileScheduler::Arguments;
   using TileSchedulerParams = typename TileScheduler::Params;
 
@@ -214,6 +221,9 @@ class GemmUniversal<
         args.N, args.K, args.mainloop);
     implementable &= CollectiveEpilogue::template can_implement<ProblemShape>(
         args.N, args.K, args.epilogue);
+    if constexpr (DirectStore) {
+      implementable &= args.epilogue.ptr_C == nullptr;
+    }
 
     return implementable;
   }
@@ -321,10 +331,17 @@ class GemmUniversal<
     ProblemShapeMNKL problem_shape_MNKL;
     typename CollectiveMainloop::Base::Params base_params;
     EpilogueTensors CD_tensors;
+    auto work_rows = [&](auto const& work) {
+      if constexpr (TileScheduler::TracksExpertOffsets) {
+        return work.rows;
+      } else {
+        return params.rows_per_expert[work.L_idx];
+      }
+    };
 
     if (work_tile_info.is_valid()) {
       curr_group = work_tile_info.L_idx;
-      auto M_ = static_cast<int>(params.rows_per_expert[curr_group]);
+      auto M_ = work_rows(work_tile_info);
       problem_shape_MNKL = append<4>(Shape<int, int, int>{M_, N, K}, 1);
     }
 
@@ -332,22 +349,17 @@ class GemmUniversal<
       auto M = get<0>(problem_shape_MNKL);
       auto N = get<1>(problem_shape_MNKL);
       auto K = get<2>(problem_shape_MNKL);
-      auto L = get<3>(problem_shape_MNKL);
-
-      Tensor mA_mkl = cute::get_xe_tensor(make_shape(M, K, L));  //(m,k,l)
-      Tensor mB_nkl = cute::get_xe_tensor(make_shape(N, K, L));  //(n,k,l)
 
       auto m_coord = work_tile_info.M_idx;
       auto n_coord = work_tile_info.N_idx;
 
-      auto gA_mkl = local_tile(
-          mA_mkl, select<0, 2>(workgroup_shape), make_coord(m_coord, _, 0));
-      auto gB_nkl = local_tile(
-          mB_nkl, select<1, 2>(workgroup_shape), make_coord(n_coord, _, 0));
-
-      CollectiveMainloop collective_mma;
       if (did_group_change) {
-        advance_offset_to(curr_group);
+        if constexpr (TileScheduler::TracksExpertOffsets) {
+          expert_first_token_offset = work_tile_info.row_offset;
+          expert_first_scale_offset = work_tile_info.scale_offset;
+        } else {
+          advance_offset_to(curr_group);
+        }
         base_params = CollectiveMainloop::Base::to_underlying_arguments(
             problem_shape_MNKL,
             CollectiveMainloop::to_base_arguments(
@@ -360,52 +372,87 @@ class GemmUniversal<
       }
       auto tile_coord = make_coord(m_coord, n_coord, _, 0);
 
-      // Get the number of K tiles to compute for this work as well as the
-      // starting K tile offset of the work.
-      int work_k_tile_count = TileScheduler::get_work_k_tile_count(
-          work_tile_info, K, workgroup_shape);
-      int work_k_tile_start =
-          TileScheduler::get_work_k_tile_start(work_tile_info);
-      auto k_tile_iter = cute::make_coord_iterator(
-          idx2crd(work_k_tile_start, make_shape(K)), make_shape(K));
+      if constexpr (DirectStore) {
+        // This read-only application helper derives register fragment types
+        // from the input engine, which must have non-const element types.
+        auto input_view = [](auto const& tensor) {
+          using Element = cute::remove_const_t<
+              typename cute::remove_cvref_t<decltype(tensor)>::element_type>;
+          return make_tensor(
+              make_gmem_ptr(
+                  const_cast<Element*>(raw_pointer_cast(tensor.data()))),
+              tensor.layout());
+        };
+        // The application mainloop takes a row origin, not an M tile index.
+        // Bias uses a separate instantiation of the generic epilogue below.
+        auto D = make_tensor(
+            make_gmem_ptr(
+                params.epilogue.ptr_D + expert_first_token_offset * N),
+            make_shape(M, N),
+            make_stride(N, _1{}));
+        MoE::moe_gemm_scaled_greedy<1, 32, void, void, void>(
+            input_view(base_params.mA_mkl(_, _, 0)),
+            input_view(base_params.mB_nkl(_, _, 0)),
+            input_view(base_params.mAscale),
+            input_view(base_params.mBscale),
+            D,
+            make_coord(int(m_coord * size<0>(workgroup_shape)), n_coord, _, 0),
+            TiledMma{},
+            1,
+            32);
+      } else {
+        auto L = get<3>(problem_shape_MNKL);
+        Tensor mA_mkl = cute::get_xe_tensor(make_shape(M, K, L));
+        Tensor mB_nkl = cute::get_xe_tensor(make_shape(N, K, L));
+        auto gA_mkl = local_tile(
+            mA_mkl, select<0, 2>(workgroup_shape), make_coord(m_coord, _, 0));
+        auto gB_nkl = local_tile(
+            mB_nkl, select<1, 2>(workgroup_shape), make_coord(n_coord, _, 0));
+        CollectiveMainloop collective_mma;
+        int work_k_tile_count = TileScheduler::get_work_k_tile_count(
+            work_tile_info, K, workgroup_shape);
+        int work_k_tile_start =
+            TileScheduler::get_work_k_tile_start(work_tile_info);
+        auto k_tile_iter = cute::make_coord_iterator(
+            idx2crd(work_k_tile_start, make_shape(K)), make_shape(K));
 
-      TiledMma tiled_mma;
-      Tensor accumulators =
-          partition_fragment_C(tiled_mma, take<0, 2>(workgroup_shape));
+        TiledMma tiled_mma;
+        Tensor accumulators =
+            partition_fragment_C(tiled_mma, take<0, 2>(workgroup_shape));
 
-      // Perform the collective scoped MMA
-      collective_mma(
-          accumulators,
-          gA_mkl,
-          gB_nkl,
-          accumulators,
-          k_tile_iter,
-          work_k_tile_count,
-          tile_coord,
-          K,
-          thread_idx,
-          base_params);
-
-      TileScheduler::fixup(
-          params.scheduler, work_tile_info, accumulators, -1, -1);
-
-      if (TileScheduler::compute_epilogue(work_tile_info, params.scheduler)) {
-        CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-
-        if (did_group_change) {
-          CD_tensors = epilogue.update_tensor_shape_stride(
-              curr_group, problem_shape_MNKL, expert_first_token_offset);
-          did_group_change = false;
-        }
-
-        epilogue(
-            problem_shape_MNKL,
-            subgroup_shape,
-            tile_coord,
+        collective_mma(
             accumulators,
-            tiled_mma,
+            gA_mkl,
+            gB_nkl,
+            accumulators,
+            k_tile_iter,
+            work_k_tile_count,
+            tile_coord,
+            K,
             thread_idx,
-            CD_tensors);
+            base_params);
+
+        TileScheduler::fixup(
+            params.scheduler, work_tile_info, accumulators, -1, -1);
+
+        if (TileScheduler::compute_epilogue(work_tile_info, params.scheduler)) {
+          CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
+
+          if (did_group_change) {
+            CD_tensors = epilogue.update_tensor_shape_stride(
+                curr_group, problem_shape_MNKL, expert_first_token_offset);
+            did_group_change = false;
+          }
+
+          epilogue(
+              problem_shape_MNKL,
+              subgroup_shape,
+              tile_coord,
+              accumulators,
+              tiled_mma,
+              thread_idx,
+              CD_tensors);
+        }
       }
 
       // Get next work tile
@@ -417,7 +464,7 @@ class GemmUniversal<
 
       if (did_group_change && work_tile_info.is_valid()) {
         curr_group = work_tile_info.L_idx;
-        auto M_ = static_cast<int>(params.rows_per_expert[curr_group]);
+        auto M_ = work_rows(work_tile_info);
         problem_shape_MNKL = append<4>(Shape<int, int, int>{M_, N, K}, 1);
       }
     }

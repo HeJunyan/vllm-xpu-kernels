@@ -43,6 +43,10 @@ namespace cutlass::gemm {
 
 struct KernelMoEArrayCooperative {};
 
+struct KernelMoEMXFP8ArrayCooperative : KernelMoEArrayCooperative {};
+
+struct KernelMoEMXFP8Greedy : KernelMoEMXFP8ArrayCooperative {};
+
 template <int Stages_, class KernelSchedule = KernelMoEArrayCooperative>
 struct MainloopMoE16Group {
   constexpr static int Stages = Stages_;

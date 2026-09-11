@@ -67,6 +67,8 @@ class PersistentTileSchedulerMoE {
   } current_group_info_;
 
  public:
+  static constexpr bool TracksExpertOffsets = false;
+
   struct WorkTileInfo {
     int32_t M_idx = 0;
     int32_t N_idx = 0;
@@ -530,6 +532,149 @@ class PersistentTileSchedulerMoE {
   CUTLASS_DEVICE WorkTileInfo initial_work_tile_info(ClusterShape) {
     return get_current_work();
   }
+};
+
+// Full-K, AlongN scheduling. Uniform counts use arithmetic ownership after a
+// subgroup-parallel count check; other distributions use one forward scan.
+template <class TileShape>
+class PersistentTileSchedulerMXFP8 : public PersistentTileSchedulerMoE {
+ public:
+  static constexpr bool TracksExpertOffsets = true;
+
+  struct WorkTileInfo : PersistentTileSchedulerMoE::WorkTileInfo {
+    int64_t row_offset = 0;
+    int64_t scale_offset = 0;
+    int32_t rows = 0;
+  };
+
+  static bool can_implement(Arguments const& args) {
+    return args.max_swizzle_size == 1 &&
+           args.raster_order == RasterOrderOptions::AlongN;
+  }
+
+  CUTLASS_DEVICE
+  PersistentTileSchedulerMXFP8(
+      Params const& params,
+      const int* rows_per_expert,
+      int64_t N,
+      int64_t K,
+      int64_t num_experts)
+      : rows_per_expert_(rows_per_expert),
+        num_experts_(num_experts),
+        tiles_n_(cute::ceil_div(N, cute::get<1>(TileShape{}))) {
+    scheduler_params = params;
+    tile_in_group_ =
+        uint64_t(BlockIdxX()) + uint64_t(BlockIdxY()) * uint64_t(GridDimX());
+    grid_stride_ =
+        uint64_t(GridDimX()) * uint64_t(GridDimY()) * uint64_t(GridDimZ());
+    workgroup_idx_ = tile_in_group_;
+    load_group();
+    // A power-of-two expert tile count also implies power-of-two tiles_n_.
+    // Never infer uniformity from the host-side average used for dispatch.
+    if (group_tiles_ != 0 && (group_tiles_ & (group_tiles_ - 1)) == 0) {
+      auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+      bool equal_rows = true;
+      for (int64_t expert = sg.get_local_linear_id(); expert < num_experts_;
+           expert += sg.get_local_linear_range()) {
+        equal_rows = equal_rows && rows_per_expert_[expert] == group_rows_;
+      }
+      uniform_ = sycl::all_of_group(sg, equal_rows);
+      if (uniform_) {
+        uniform_total_tiles_ = uint64_t(num_experts_) * group_tiles_;
+        full_waves_ = uniform_total_tiles_ / grid_stride_;
+        expert_divmod_ = FastDivmodU64Pow2(group_tiles_);
+        n_divmod_ = FastDivmodU64Pow2(tiles_n_);
+      }
+    }
+  }
+
+  CUTLASS_DEVICE
+  WorkTileInfo get_current_work() {
+    if (uniform_) {
+      // Match the benchmark's mirrored order in the latter complete waves;
+      // leave the final partial wave unmirrored.
+      auto source = workgroup_idx_;
+      if (wave_idx_ >= full_waves_ / 2 && wave_idx_ < full_waves_) {
+        source = grid_stride_ - 1 - source;
+      }
+      const auto tile = wave_idx_ * grid_stride_ + source;
+      if (tile >= uniform_total_tiles_) {
+        return {};
+      }
+      const auto expert = expert_divmod_.divide(tile);
+      const auto within_expert = expert_divmod_.modulus(tile);
+      return {
+          {static_cast<int32_t>(n_divmod_.divide(within_expert)),
+           static_cast<int32_t>(n_divmod_.modulus(within_expert)),
+           static_cast<int32_t>(expert),
+           true},
+          int64_t(expert) * group_rows_,
+          int64_t(expert) * ((int64_t(group_rows_) + 3) & ~int64_t(3)),
+          group_rows_};
+    }
+    while (group_idx_ < num_experts_) {
+      if (tile_in_group_ < group_tiles_) {
+        return {
+            {static_cast<int32_t>(tile_in_group_ / tiles_n_),
+             static_cast<int32_t>(tile_in_group_ % tiles_n_),
+             group_idx_,
+             true},
+            row_offset_,
+            scale_offset_,
+            group_rows_};
+      }
+      tile_in_group_ -= group_tiles_;
+      row_offset_ += group_rows_;
+      scale_offset_ += (int64_t(group_rows_) + 3) & ~int64_t(3);
+      ++group_idx_;
+      load_group();
+    }
+    return {};
+  }
+
+  template <class ClusterShape>
+  CUTLASS_DEVICE WorkTileInfo initial_work_tile_info(ClusterShape) {
+    return get_current_work();
+  }
+
+  CUTLASS_DEVICE
+  auto fetch_next_work(WorkTileInfo) {
+    if (uniform_) {
+      ++wave_idx_;
+    } else {
+      tile_in_group_ += grid_stride_;
+    }
+    return cute::make_tuple(get_current_work(), true);
+  }
+
+ private:
+  CUTLASS_DEVICE
+  void load_group() {
+    if (group_idx_ < num_experts_) {
+      group_rows_ = rows_per_expert_[group_idx_];
+      group_tiles_ =
+          cute::ceil_div(int64_t(group_rows_), cute::get<0>(TileShape{})) *
+          tiles_n_;
+    }
+  }
+
+  const int* rows_per_expert_;
+  int64_t num_experts_;
+  uint64_t tiles_n_;
+  uint64_t tile_in_group_ = 0;
+  uint64_t grid_stride_ = 0;
+  uint64_t workgroup_idx_ = 0;
+  uint64_t wave_idx_ = 0;
+  uint64_t uniform_total_tiles_ = 0;
+  uint64_t full_waves_ = 0;
+  FastDivmodU64Pow2 expert_divmod_;
+  FastDivmodU64Pow2 n_divmod_;
+  bool uniform_ = false;
+  uint64_t group_tiles_ = 0;
+  int32_t group_idx_ = 0;
+  int32_t group_rows_ = 0;
+  int64_t row_offset_ = 0;
+  int64_t scale_offset_ = 0;
 };
 
 }  // namespace cutlass::gemm::kernel::detail

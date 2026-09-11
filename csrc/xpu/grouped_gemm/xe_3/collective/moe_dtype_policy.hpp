@@ -192,32 +192,10 @@ class moe_bf16_policy : public moe_policy_base {
   CALL_GENERATE_GEMM();
 };
 
-// BF16 tile variants selected by pick_bf16_variant() for wave-quantization.
-class moe_bf16_256x128_policy : public moe_bf16_policy {
- public:
-  using TileShape = Shape<_256, _128, _32>;
-  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
-  using TiledMma = typename TiledMMAHelper<
-      MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
-      Layout<TileShape>,
-      SGLayout>::TiledMMA;
-  CALL_GENERATE_GEMM();
-};
-
+// Automatic BF16 fallback for wave utilization.
 class moe_bf16_128x256_policy : public moe_bf16_policy {
  public:
   using TileShape = Shape<_128, _256, _32>;
-  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
-  using TiledMma = typename TiledMMAHelper<
-      MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
-      Layout<TileShape>,
-      SGLayout>::TiledMMA;
-  CALL_GENERATE_GEMM();
-};
-
-class moe_bf16_128x128_policy : public moe_bf16_policy {
- public:
-  using TileShape = Shape<_128, _128, _32>;
   using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, ElementA>>,
@@ -343,34 +321,11 @@ class moe_mxfp8_policy : public moe_policy_base {
   CALL_GENERATE_GEMM();
 };
 
-// MXFP8 prefill tile variants selected by pick_prefill_tile() to keep the
-// 32 Xe cores fully packed (wave quantization). Mirrors the bf16 variants.
-class moe_mxfp8_256x128_policy : public moe_mxfp8_policy {
- public:
-  using TileShape = Shape<_256, _128, _64>;
-  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
-  using TiledMma = typename TiledMMAHelper<
-      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
-      Layout<TileShape>,
-      SGLayout>::TiledMMA;
-  CALL_GENERATE_GEMM();
-};
-
+// Automatic MXFP8 fallback for wave utilization.
 class moe_mxfp8_128x256_policy : public moe_mxfp8_policy {
  public:
   using TileShape = Shape<_128, _256, _64>;
   using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
-  using TiledMma = typename TiledMMAHelper<
-      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
-      Layout<TileShape>,
-      SGLayout>::TiledMMA;
-  CALL_GENERATE_GEMM();
-};
-
-class moe_mxfp8_128x128_policy : public moe_mxfp8_policy {
- public:
-  using TileShape = Shape<_128, _128, _64>;
-  using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
       Layout<TileShape>,
@@ -473,7 +428,6 @@ class moe_mxfp4_downproj_wide_policy : public moe_mxfp4_policy {
   CALL_GENERATE_GEMM();
 };
 
-// MXFP4 prefill tile variants selected by pick_prefill_tile().
 // Tuned short-K tile with 16 subgroups and PipelineStages 2.
 // The 4x4 subgroup grid preserves the 64x64 per-subgroup output of the former
 // 512x256/8x4 policy while reducing the workgroup to 256 threads. This permits
@@ -495,17 +449,6 @@ class moe_mxfp4_128x256_policy : public moe_mxfp4_policy {
  public:
   using TileShape = Shape<_128, _256, _128>;
   using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
-  using TiledMma = typename TiledMMAHelper<
-      MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
-      Layout<TileShape>,
-      SGLayout>::TiledMMA;
-  CALL_GENERATE_GEMM();
-};
-
-class moe_mxfp4_128x128_policy : public moe_mxfp4_policy {
- public:
-  using TileShape = Shape<_128, _128, _128>;
-  using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_BDPAS_TT<8, float, ElementA>>,
       Layout<TileShape>,

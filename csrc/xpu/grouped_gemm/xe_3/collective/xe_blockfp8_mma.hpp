@@ -506,7 +506,10 @@ struct CollectiveMma<
         int K_groups = cute::ceil_div(K, GROUP_K);
         int n_scale_idx = int(n_coord / 128);
         int k_group_idx = int(k_tile * SG_K / GROUP_K);
-        float scaleB = mainloop.ptr_SB[n_scale_idx * K_groups + k_group_idx];
+        float scaleB =
+            n_coord < shape<0>(mainloop.mB_nkl)
+                ? mainloop.ptr_SB[int64_t(n_scale_idx) * K_groups + k_group_idx]
+                : 0.0f;
         float combined_scale[sg_m_rows];
         CUTLASS_PRAGMA_UNROLL
         for (int i1 = 0; i1 < acc_m1; ++i1) {
@@ -514,8 +517,11 @@ struct CollectiveMma<
           for (int i0 = 0; i0 < acc_m0; ++i0) {
             int row = i1 * acc_m0 + i0;
             combined_scale[row] =
-                mainloop.ptr_SA[(m_coord + row) * K_groups + k_group_idx] *
-                scaleB;
+                m_coord + row < M ? mainloop.ptr_SA
+                                            [int64_t(m_coord + row) * K_groups +
+                                             k_group_idx] *
+                                        scaleB
+                                  : 0.0f;
           }
         }
 
