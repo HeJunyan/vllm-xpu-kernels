@@ -756,21 +756,17 @@ struct FMHAFwdMainloop<
       }
       /* k masking for remainder tiles */
       if (check_remainder_k && K == blk_k1 - 1) {
-        // Mask KV columns that fall past the logical sequence length. Derive the
-        // per-element column coordinate from the MMA C partition (the same layout
-        // as tSrS) rather than from the copy-K partition + broadcast: the copy
-        // and MMA-output subgroup layouts need not agree on how lanes map to KV
-        // columns, and a mismatch would mask the wrong columns (leaving garbage
-        // scores in the remainder that inflate the softmax row-max -> P == 0 ->
-        // inf). This mirrors the LocalMask/CausalMask coordinate handling above.
-        Tensor cKrem = make_identity_tensor(make_shape(seq_len, seq_len));
-        Tensor gKrem = local_tile(
-            cKrem, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
-        auto cS_rem = thr_mma_qk.partition_C(gKrem);
+        // Tensor-free remainder masking
+        constexpr int n_reps = tile_k / intel::sg_size;
+        constexpr int elems_per_n = tSrS.size() / n_reps;
+        int k_base = K * tile_k + lane_id;
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tSrS.size(); i++) {
-          if (get<1>(cS_rem(i)) >= seq_len) {
-            tSrS(i) = ElementS(-INFINITY);
+        for (int n = 0; n < n_reps; n++) {
+          if (k_base + n * intel::sg_size >= seq_len) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < elems_per_n; j++) {
+              tSrS(n * elems_per_n + j) = ElementS(-INFINITY);
+            }
           }
         }
       }
