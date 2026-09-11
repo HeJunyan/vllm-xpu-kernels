@@ -140,7 +140,10 @@ struct chunk_policy_head512 {
 // -----------------------------------------------------------------------------
 struct fp8_chunk_policy_head128 {
   using ShapeQK = Shape<_512, _64, _128>;
-  using ShapePV = Shape<_512, _128, _64>;
+  // V is split into VTiles=2 sub-tiles (head_size_vo / 64). Halving the live V
+  // fragment frees the register headroom the mainloop needs to keep the next
+  // K tile in flight (see preload_k in chunk_prefill_mainloop.hpp).
+  using ShapePV = Shape<_512, _64, _64>;
   using ShapeOut = Shape<_512, _128>;
   using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
 };

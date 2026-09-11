@@ -551,3 +551,107 @@ def test_chunk_prefill_full_fp8_sink(
         is_causal=True,
         use_sink=True,
     )
+
+
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2],
+                         ids=format_tc)
+@pytest.mark.parametrize("o_dtype", [torch.float16, torch.bfloat16],
+                         ids=format_tc)
+@pytest.mark.parametrize("query_len,kv_len",
+                         [(17, 17), (33, 145), (529, 193), (513, 2049)])
+@pytest.mark.parametrize("q_start,k_start,q_padding,k_padding",
+                         [(0, 0, 0, 0), (3, 5, 512, 64)])
+@pytest.mark.parametrize("input_pattern,head_major",
+                         [("normal", False), ("normal", True),
+                          ("increasing-max", False), ("uniform", False)])
+@torch.inference_mode()
+def test_nonpaged_full_fp8_pipeline(
+    fp8_dtype: torch.dtype,
+    o_dtype: torch.dtype,
+    query_len: int,
+    kv_len: int,
+    q_start: int,
+    k_start: int,
+    q_padding: int,
+    k_padding: int,
+    input_pattern: str,
+    head_major: bool,
+) -> None:
+    """Cover biased online maxima, input strides, and partial/padded tiles."""
+    if not _is_xe3():
+        pytest.skip("Full fp8 attention is XE3-only (CRI simulator / NVL-P).")
+
+    gen = torch.Generator(device="cpu").manual_seed(42)
+    query_capacity = q_start + query_len + q_padding
+    kv_capacity = k_start + kv_len + k_padding
+    tensors = [
+        torch.randn(length, 2, 128, generator=gen, device="cpu")
+        for length in (query_capacity, kv_capacity, kv_capacity)
+    ]
+    if input_pattern == "increasing-max":
+        tensors[0].fill_(1)
+        tensors[1].copy_(
+            torch.linspace(-2, 2, kv_capacity).view(-1, 1, 1))
+    descales = [(x.abs().max() / 200).float() for x in tensors]
+    quantized = [(x / scale).to(fp8_dtype)
+                 for x, scale in zip(tensors, descales)]
+    if input_pattern == "uniform":
+        quantized[0].zero_()
+    q, k, v = [x.to("xpu") for x in quantized]
+    if head_major:
+        q, k, v = [x.transpose(0, 1).contiguous().transpose(0, 1)
+                   for x in (q, k, v)]
+    q_scale, k_scale, v_scale = [x.to("xpu") for x in descales]
+    out = torch.full((query_capacity, 2, 128),
+                     float("nan"),
+                     device="xpu",
+                     dtype=o_dtype)
+    actual = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        query_len + q_padding,
+        torch.tensor([q_start, q_start + query_len],
+                     device="xpu",
+                     dtype=torch.int32),
+        kv_len + k_padding,
+        cu_seqlens_k=torch.tensor([k_start, k_start + kv_len], device="xpu",
+                                  dtype=torch.int32),
+        q_descale=q_scale,
+        k_descale=k_scale.expand(1, 2),
+        v_descale=v_scale.expand(1, 2),
+        out=out,
+    )
+
+    # Match online softmax and the FP32 -> FP16 -> FP8 probability conversion,
+    # including the +8 exponent offset. Dense normalized-P rounding is not
+    # equivalent at the small probabilities exercised by this test.
+    q_ref, k_ref, v_ref = [
+        x[start:start + length].float().transpose(0, 1)
+        for x, start, length in zip(quantized, (q_start, k_start, k_start),
+                                    (query_len, kv_len, kv_len))
+    ]
+    score_scale = descales[0] * descales[1] * (128**-0.5) * math.log2(math.e)
+    row_max = torch.full((2, query_len, 1),
+                         torch.finfo(torch.float32).min,
+                         device="cpu")
+    row_sum = torch.zeros_like(row_max)
+    accum = torch.zeros((2, query_len, 128), device="cpu")
+    for start in range(0, kv_len, 64):
+        scores = q_ref @ k_ref[:, start:start + 64].transpose(-1, -2)
+        scores *= score_scale
+        new_max = torch.maximum(row_max, scores.amax(dim=-1, keepdim=True))
+        rescale = torch.exp2(row_max - new_max)
+        probabilities = torch.exp2(scores - new_max + 8)
+        row_sum = row_sum * rescale + probabilities.sum(dim=-1, keepdim=True)
+        packed = probabilities.half().to(fp8_dtype).float()
+        accum = accum * rescale + packed @ v_ref[:, start:start + 64]
+        row_max = new_max
+    expected = (accum * (descales[2] / row_sum)).transpose(0, 1)
+    actual = actual.cpu().float()
+    torch.testing.assert_close(actual[q_start:q_start + query_len],
+                               expected,
+                               atol=5e-3,
+                               rtol=3e-2)
+    assert actual[:q_start].isnan().all()
+    assert actual[q_start + query_len:].isnan().all()

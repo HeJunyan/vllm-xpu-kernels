@@ -32,7 +32,14 @@
 
 #pragma once
 
+// Mirrors the default in xe_3/chunk_prefill.hpp: the mainloop keys register
+// budget decisions off the same GRF size the kernel launch requests.
+#ifndef VLLM_GRF_SIZE
+  #define VLLM_GRF_SIZE 256
+#endif
+
 #include <array>
+#include <cstdint>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
@@ -42,6 +49,7 @@
 #include "cute/algorithm/subgroup_algorithms.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/util/sycl_vec.hpp"
+#include "cute/util/xe_split_barrier.hpp"
 #include "flash_attention_v2/collective/fmha_fusion.hpp"
 
 namespace cutlass::fmha {
@@ -78,6 +86,23 @@ using namespace cute;
 
 
 #if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
+CUTE_DEVICE
+uint32_t fp8_subgroup_any_less(float const& lhs, float const& rhs) {
+  uint32_t result;
+  asm(
+      "{\n"
+      ".decl OUT_UD v_type=G type=UD num_elts=16 alias=<%0,0>\n"
+      ".decl LHS_F v_type=G type=F num_elts=16 alias=<%1,0>\n"
+      ".decl RHS_F v_type=G type=F num_elts=16 alias=<%2,0>\n"
+      ".decl ANY_LESS v_type=P num_elts=16\n"
+      "cmp.lt (M1_NM, 16) ANY_LESS LHS_F(0,0)<1;1,0> RHS_F(0,0)<1;1,0>\n"
+      "(ANY_LESS.any) sel (M1_NM, 16) OUT_UD(0,0)<1> 0x1:ud 0x0:ud\n"
+      "}\n"
+      : "=rw"(result)
+      : "rw"(lhs), "rw"(rhs));
+  return result;
+}
+
 CUTE_DEVICE
 void
 cvt_f32x2_to_bf16x2_bias(float                  const& src0,
@@ -152,6 +177,13 @@ void cvt_f32x2_to_e4m3x2_pack(
       : "rw"(src0), "rw"(src1));
 }
 #else
+CUTE_DEVICE
+uint32_t fp8_subgroup_any_less(
+    float const& /*lhs*/, float const& /*rhs*/) {
+  CUTE_INVALID_CONTROL_PATH(
+      "fp8_subgroup_any_less requires Intel Xe SYCL device target");
+}
+
 CUTE_DEVICE
 void
 cvt_f32x2_to_bf16x2_bias(float                  const& /*src0*/,
@@ -412,9 +444,79 @@ struct FMHAFwdMainloop<
   // fp8 dynamic range.
   static constexpr bool Fp8Q =
       is_any_of_v<ElementQ, float_e5m2_t, float_e4m3_t>;
+  static constexpr ElementS Fp8ExpOffset = Fp8Q ? ElementS(8) : ElementS(0);
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PagedKV = PagedKV_;
+  static constexpr bool UseTlaPipeline =
+      Fp8Q && VLLM_GRF_SIZE >= 512 && !PagedKV && !CausalMask && !LocalMask;
+  static constexpr bool FuseVScale = UseTlaPipeline;
+#if defined(SYCLTLA_TARGET_XESIM)
+  static constexpr bool UseSplitBarrier = false;
+#else
+  static constexpr bool UseSplitBarrier = UseTlaPipeline;
+#endif
+
+  static constexpr int kAtomsPerD =
+      decltype(get<2>(TileShapeQK{}))::value /
+      decltype(get<2>(typename TiledMMAQK::AtomShape_MNK{}))::value;
+
+  // Software-pipelined K load.
+  //
+  // Normally GEMM 1 does copy(K) -> reorder(tKrK, tSrK) -> gemm(tSrK), which
+  // keeps two full K fragments live and pins the load immediately in front of
+  // the DPAS that consumes it, exposing the whole global-load latency every
+  // iteration. When the DPAS B operand is 8-bit and a K tile is a single
+  // D-tile, the raw loaded fragment can be fed to the MMA directly via
+  // gemm_qk_wide_b(), which drops tSrK entirely. The register budget freed by
+  // that lets the K tile for iteration i+1 be issued at the end of iteration i,
+  // so the load latency is covered by the PV GEMM and softmax.
+  // NOTE: this trades registers for latency hiding and is only profitable when
+  // the kernel actually gets a 512-GRF budget (requested via
+  // intelex::grf_size<VLLM_GRF_SIZE>). At 256 GRF the extra cross-iteration
+  // live fragment spills badly, so key it off the configured GRF budget.
+  static constexpr bool preload_k =
+      VLLM_GRF_SIZE >= 512 &&
+      sizeof_bits_v<typename TiledMMAQK::ValTypeB> == 8 && DTiles == 1 &&
+      (kAtomsPerD == 2 || kAtomsPerD == 4);
+
+  // Load V[0] before the softmax (and V[VV+1] inside the PV loop) so the V
+  // latency is covered by the exponentials / row reductions.
+  static constexpr bool preload_v = Fp8Q;
+
+  // DPAS with a "wide" B operand: consumes the raw copy-ordered K fragment as
+  // the MMA B operand, indexing the two K-atoms packed in each wide register
+  // via a byte offset instead of materializing a reordered tSrK.
+  template <bool NoAcc, int KAtom, class ATensor, class BTensor, class CTensor>
+  CUTE_DEVICE static constexpr void gemm_qk_wide_b(
+      ATensor const& A, BTensor const& B, CTensor& C) {
+    using MMAOp = typename TiledMMAQK::MMA_Op;
+    using DVector = typename remove_extent<typename MMAOp::DRegisters>::type;
+    using AVector = typename remove_extent<typename MMAOp::ARegisters>::type;
+    using BVector = typename remove_extent<typename MMAOp::BRegisters>::type;
+    using BWideVector = typename MMAOp::BWideVector;
+    using CVector = typename remove_extent<typename MMAOp::CRegisters>::type;
+
+    constexpr int MAtoms =
+        decltype(size<1>(typename CTensor::layout_type{}))::value;
+    constexpr int NAtoms =
+        decltype(size<2>(typename CTensor::layout_type{}))::value;
+    constexpr int Owner = NAtoms * (KAtom / 2);
+    constexpr int BByteOffset = (KAtom % 2) * sizeof(BVector);
+
+    static_assert(sizeof(BWideVector) == 2 * sizeof(BVector));
+
+    auto rB = recast<BWideVector>(B);
+    for_each(make_seq<NAtoms>{}, [&](auto n) {
+      for_each(make_seq<MAtoms>{}, [&](auto m) {
+        auto rD = recast<DVector>(C(_, m, n));
+        auto rA = recast<AVector>(A(_, m));
+        auto rC = recast<CVector>(C(_, m, n));
+        MMAOp::template fma<NoAcc, BByteOffset>(
+            rD[0], rA[0], rB[Owner + decltype(n)::value], rC[0]);
+      });
+    });
+  }
 
   // User-facing arguments
   struct Arguments {
@@ -580,8 +682,14 @@ struct FMHAFwdMainloop<
     /* Create TiledCopy objects for prefetches */
     constexpr int RegularKVPrefetchSGs = cute::bit_floor(static_cast<unsigned>(SGPerWG::value));
     constexpr int RegularKVPrefetchThreads = RegularKVPrefetchSGs * intel::sg_size;
-    int const prefetch_thr_id = thr_id < RegularKVPrefetchThreads ? thr_id : 0;
+    constexpr bool AllSGsPrefetch =
+        UseTlaPipeline && RegularKVPrefetchSGs == SGPerWG::value;
+    int const prefetch_thr_id =
+        AllSGsPrefetch ? thr_id
+                      : (thr_id < RegularKVPrefetchThreads ? thr_id : 0);
     const auto subgroup_id = thr_id / intel::sg_size;
+    bool const prefetch_sg_active =
+        AllSGsPrefetch || subgroup_id < RegularKVPrefetchSGs;
 
     auto prefetch_k =
         make_block_2d_prefetch<RegularKVPrefetchSGs>(tile_shape_k, K_2D);
@@ -639,9 +747,31 @@ struct FMHAFwdMainloop<
     auto prepared_pk  = prepare_payloads(prefetch_k, pKgK(_,_,_,next_page_idx));
     auto prepared_pv  = prepare_payloads(prefetch_v, pVgV(_,_,_,next_page_idx));
 
-    if (subgroup_id < RegularKVPrefetchSGs) {
-      prefetch(prefetch_k, prepared_pk);
-      prefetch(prefetch_v, prepared_pv);
+    if (prefetch_sg_active) {
+      if constexpr (UseTlaPipeline) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int stage = 0; stage < Stages; ++stage) {
+          prefetch(prefetch_k, prepared_pk);
+          prepared_pk += k_seq_delta(kv_stride);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int stage = 0; stage < Stages; ++stage) {
+          prefetch(prefetch_v, prepared_pv);
+          prepared_pv += v_seq_delta(kv_stride);
+        }
+      } else {
+        prefetch(prefetch_k, prepared_pk);
+        prefetch(prefetch_v, prepared_pv);
+
+        // The pipelined K load consumes the next tile during this iteration,
+        // so its prefetch must run one tile further ahead.
+        if constexpr (preload_k) {
+          int const pf_next = PagedKV ? get_paged_idx(blk_k0 + 1, idx_b)
+                                     : (blk_k0 + 1);
+          prepared_pk += k_seq_delta((pf_next - next_page_idx) * kv_stride);
+          prefetch(prefetch_k, prepared_pk);
+        }
+      }
     }
 
     clear(tArA);
@@ -658,9 +788,9 @@ struct FMHAFwdMainloop<
       scale_v = *static_cast<const float*>(params.scale_v);
     }
     // Full-fp8: fold the per-tensor q/k descales into the softmax scale (S = Q·K
-    // is linear in Q and K) and defer scale_v to a single post-loop output
-    // rescale (O = sum P_i·V_i is linear in V). K/V are then consumed directly
-    // as fp8 by the DPAS GEMMs, so the per-element dequantize is skipped.
+    // is linear in Q and K) and defer scale_v until after the KV loop, fusing
+    // it into epilogue normalization on the TLA path. K/V are consumed
+    // directly as fp8 by DPAS, so per-element dequantization is skipped.
     if constexpr (Fp8Q) {
       effective_scale = params.scale * ElementS(scale_k);
       if (params.scale_q != nullptr) {
@@ -670,12 +800,26 @@ struct FMHAFwdMainloop<
       }
     }
 
-    constexpr int kAtomsPerD =
-          decltype(get<2>(TileShapeQK{}))::value /
-          decltype(get<2>(typename TiledMMAQK::AtomShape_MNK{}))::value;
+    /* Prime the software-pipelined K load with the first tile. From here on
+       tKrK always holds the K tile for the iteration about to run. */
+    if constexpr (preload_k) {
+      if (blk_k0 < blk_k1) {
+        copy(copy_k, prepared_k[0], tKrK);
+      }
+    }
 
-    /* Main loop, blocked in k. */
-    for (int K = blk_k0; K < blk_k1; K++) {
+    /* Main loop body. is_last_block is a compile-time flag so the remainder
+       mask and the next-tile K preload are compiled out of every iteration
+       except the peeled final one. */
+    auto mainloop_body = [&](auto is_last_block, int K) {
+      constexpr bool IsLastBlock = decltype(is_last_block)::value;
+
+      // Keep the cooperative K/V prefetchers on the same tile. Without this
+      // pacing, data-dependent softmax rescaling lets subgroups drift apart
+      // over long KV loops and evict tiles before other subgroups consume them.
+      if constexpr (UseSplitBarrier) {
+        barrier_arrive(ScopeWorkgroup);
+      }
 
       bool need_causal = false;
       if constexpr (CausalMask) {
@@ -694,45 +838,68 @@ struct FMHAFwdMainloop<
           PagedKV ? tKgK(_, _, _, page_idx, _) : tKgK(_, _, _, K, _);
       auto tVgV_cache =
           PagedKV ? tVgV(_, _, _, _, page_idx) : tVgV(_, _, _, _, K);
+      (void)tKgK_cache;
+      (void)tVgV_cache;
 
-      /* V prefetch for next iter */
-      if (subgroup_id < RegularKVPrefetchSGs) {
-        prepared_pv += v_seq_delta(page_offset);
+      /* The non-paged FP8 pipeline prefetches V Stages tiles ahead. */
+      if (prefetch_sg_active) {
+        if constexpr (!UseTlaPipeline) {
+          prepared_pv += v_seq_delta(page_offset);
+        }
         prefetch(prefetch_v, prepared_pv);
+        if constexpr (UseTlaPipeline) {
+          prepared_pv += v_seq_delta(kv_stride);
+        }
       }
 
       /* GEMM 1: S = Q * K^T */
-      CUTLASS_PRAGMA_UNROLL
-      for (int D = 0; D < DTiles; D++) {
-        copy(copy_k, prepared_k[D], tKrK);
-        prepared_k[D] += k_seq_delta(page_offset);
-        reorder(tKrK, tSrK);
+      if constexpr (preload_k) {
+        /* tKrK was loaded a full iteration ahead; consume it in copy order. */
+        auto const& tSrQ_d = tSrQ_arr[0];
+        for_each(make_seq<kAtomsPerD>{}, [&](auto k) {
+          constexpr int KAtom = decltype(k)::value;
+          gemm_qk_wide_b<KAtom == 0, KAtom>(tSrQ_d(_, _, k), tKrK, tSrS);
+        });
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int D = 0; D < DTiles; D++) {
+          copy(copy_k, prepared_k[D], tKrK);
+          prepared_k[D] += k_seq_delta(page_offset);
+          reorder(tKrK, tSrK);
 
-        if constexpr (Fp8KV && !Fp8Q) {
-          dequantize(tSrK, scale_k);
-        }
-
-        auto const& tSrQ_d = tSrQ_arr[D];
-        if (D == 0) {
-          cute::gemm<true>(mma_qk, tSrQ_d(_, _, 0), tSrK(_, _, 0), tSrS);
-          CUTLASS_PRAGMA_UNROLL
-          for (int k = 1; k < kAtomsPerD; k++) {
-            cute::gemm(mma_qk, tSrQ_d(_, _, k), tSrK(_, _, k), tSrS);
+          if constexpr (Fp8KV && !Fp8Q) {
+            dequantize(tSrK, scale_k);
           }
-        } else {
-          cute::gemm(mma_qk, tSrQ_d, tSrK, tSrS);
+
+          auto const& tSrQ_d = tSrQ_arr[D];
+          if (D == 0) {
+            cute::gemm<true>(mma_qk, tSrQ_d(_, _, 0), tSrK(_, _, 0), tSrS);
+            CUTLASS_PRAGMA_UNROLL
+            for (int k = 1; k < kAtomsPerD; k++) {
+              cute::gemm(mma_qk, tSrQ_d(_, _, k), tSrK(_, _, k), tSrS);
+            }
+          } else {
+            cute::gemm(mma_qk, tSrQ_d, tSrK, tSrS);
+          }
         }
       }
 
       /* K prefetch for next iteration */
-      if (subgroup_id < RegularKVPrefetchSGs) {
-        prepared_pk += k_seq_delta(page_offset);
+      if (prefetch_sg_active) {
+        if constexpr (!UseTlaPipeline) {
+          prepared_pk += k_seq_delta(page_offset);
+        }
         prefetch(prefetch_k, prepared_pk);
+        if constexpr (UseTlaPipeline) {
+          prepared_pk += k_seq_delta(kv_stride);
+        }
       }
 
       /* Early V-load for VV=0: overlap memory latency with softmax scalar work */
-      copy(copy_v, prepared_v[0], tVrV);
-      prepared_v[0] += v_seq_delta(page_offset);
+      if constexpr (!preload_v) {
+        copy(copy_v, prepared_v[0], tVrV);
+        prepared_v[0] += v_seq_delta(page_offset);
+      }
 
       /* Causal masking and k remainder masking */
       if constexpr (CausalMask) {
@@ -754,18 +921,22 @@ struct FMHAFwdMainloop<
           }
         }
       }
-      /* k masking for remainder tiles */
-      if (check_remainder_k && K == blk_k1 - 1) {
-        // Tensor-free remainder masking
-        constexpr int n_reps = tile_k / intel::sg_size;
-        constexpr int elems_per_n = tSrS.size() / n_reps;
-        int k_base = K * tile_k + lane_id;
-        CUTLASS_PRAGMA_UNROLL
-        for (int n = 0; n < n_reps; n++) {
-          if (k_base + n * intel::sg_size >= seq_len) {
-            CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < elems_per_n; j++) {
-              tSrS(n * elems_per_n + j) = ElementS(-INFINITY);
+      /* k masking for remainder tiles. Only reachable in the peeled final
+         iteration, so this predicated masking work is compiled out of the
+         steady-state loop entirely. */
+      if constexpr (IsLastBlock) {
+        if (check_remainder_k && K == blk_k1 - 1) {
+          // Tensor-free remainder masking
+          constexpr int n_reps = tile_k / intel::sg_size;
+          constexpr int elems_per_n = tSrS.size() / n_reps;
+          int k_base = K * tile_k + lane_id;
+          CUTLASS_PRAGMA_UNROLL
+          for (int n = 0; n < n_reps; n++) {
+            if (k_base + n * intel::sg_size >= seq_len) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int j = 0; j < elems_per_n; j++) {
+                tSrS(n * elems_per_n + j) = ElementS(-INFINITY);
+              }
             }
           }
         }
@@ -792,31 +963,58 @@ struct FMHAFwdMainloop<
         }
       }
 
+      /* Load + reorder V[0] ahead of the softmax so its latency is covered by
+         the row reductions and exponentials. */
+      if constexpr (preload_v) {
+        copy(copy_v, prepared_v[0], tVrV);
+        prepared_v[0] += v_seq_delta(page_offset);
+        reorder(tVrV, tArV);
+      }
+
       /* Apply softmax (deferred row-sum hreduce) */
       auto [rescale, tS_partial_sum, needs_rescale] = softmax(effective_scale, tSrS, tA_max, tA_sum);
       auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-      bool const subgroup_needs_rescale = sycl::any_of_group(sg, needs_rescale);
+      bool const subgroup_needs_rescale = [&] {
+        if constexpr (UseTlaPipeline) {
+          return needs_rescale != 0;
+        } else {
+          return sycl::any_of_group(sg, needs_rescale != 0);
+        }
+      }();
       constexpr int kSumSize = decltype(tA_sum.size())::value;
       constexpr bool kSumDivVT = (kSumSize % VTiles == 0);
       constexpr int kSumPerVT = kSumDivVT ? (kSumSize / VTiles) : 0;
 
       using ElementP = typename TiledMMAPV::ValTypeA;
-      if constexpr (!Fp8Q) {
+      if constexpr (UseTlaPipeline || !Fp8Q) {
         reorder(tSrS, tArP);
       }
       else {
         reorder_to_P_fp8<ElementP>(tSrS, tArP);
       }
 
+      /* Issue the K tile for the next iteration. Placing it here leaves the
+         whole PV GEMM below to cover the load latency. tKrK is dead from the
+         GEMM 1 above, and with the wide-B path there is no tSrK staging copy,
+         so this costs no extra live registers. */
+      if constexpr (preload_k) {
+        if constexpr (!IsLastBlock) {
+          prepared_k[0] += k_seq_delta(page_offset);
+          copy(copy_k, prepared_k[0], tKrK);
+        }
+      }
+
       /* GEMM 2: A += P * V, split in v dimension.
-       * VV=0 pre-loaded before softmax; VV>0 loaded inline. */
+       * V[0] is pre-loaded above; V[VV+1] is issued right after the VV GEMM. */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        if (VV > 0) {
-          copy(copy_v, prepared_v[VV], tVrV);
-          prepared_v[VV] += v_seq_delta(page_offset);
+        if constexpr (!preload_v) {
+          if (VV > 0) {
+            copy(copy_v, prepared_v[VV], tVrV);
+            prepared_v[VV] += v_seq_delta(page_offset);
+          }
+          reorder(tVrV, tArV);
         }
-        reorder(tVrV, tArV);
 
         if (subgroup_needs_rescale) {
           CUTLASS_PRAGMA_UNROLL
@@ -836,12 +1034,43 @@ struct FMHAFwdMainloop<
           dequantize(tArV, scale_v);
         }
         cute::gemm(mma_pv, tArP, tArV, tArA(_,_,_,VV));
+
+        if constexpr (preload_v) {
+          if (VV + 1 < VTiles) {
+            copy(copy_v, prepared_v[VV + 1], tVrV);
+            prepared_v[VV + 1] += v_seq_delta(page_offset);
+            reorder(tVrV, tArV);
+          }
+        }
       }
 
+      if constexpr (UseSplitBarrier) {
+        barrier_wait(ScopeWorkgroup);
+      }
+    };
+
+    /* Main loop, blocked in k. The final tile is peeled so the remainder mask
+       and the absent next-tile preload are resolved at compile time. */
+    {
+      int K = blk_k0;
+      for (; K < blk_k1 - 1; K++) {
+        mainloop_body(std::bool_constant<false>{}, K);
+      }
+      if (K < blk_k1) {
+        mainloop_body(std::bool_constant<true>{}, K);
+      }
     }
 
-    // Full-fp8: apply the deferred per-tensor V scale once after the K loop.
-    if constexpr (Fp8Q) {
+    // The epilogue (including sinks and LSE) expects an unbiased maximum.
+    if constexpr (UseTlaPipeline) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tA_max.size(); ++i) {
+        tA_max(i) += Fp8ExpOffset;
+      }
+    }
+
+    // Other full-FP8 paths keep their existing post-loop V rescale.
+    if constexpr (Fp8Q && !FuseVScale) {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tArA.size(); ++i) {
         tArA(i) *= ElementA(scale_v);
@@ -864,9 +1093,7 @@ struct FMHAFwdMainloop<
     // is scaled by 2^8 = 256 into a range better represented by fp8. The bias
     // is applied uniformly to every element of P and cancels in the final
     // O = (P·V) / rowsum(P) normalization (both numerator and denominator carry
-    // the same 256 factor). It is excluded from the running max so the online
-    // rescale factors are unaffected.
-    constexpr ElementS kFp8ExpOffset = Fp8Q ? ElementS(8) : ElementS(0);
+    // the same 256 factor).
 
     /* Compute row-wise maxima for this block */
     auto tS_bmax =
@@ -874,19 +1101,36 @@ struct FMHAFwdMainloop<
             tS, sycl::maximum<void>{});
 
     FragARow rescale;
-    bool needs_rescale = false;
+    uint32_t needs_rescale = 0;
+    // Keep max - offset as the pipeline's running state. The constant cancels
+    // in old_max - new_max, preserving online rescaling without keeping both
+    // biased and unbiased maxima live across the softmax MAD/EXP sequence.
+    FragARow tA_max_biased;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tA_max.size(); i++) {
-      ElementS new_max = sycl::max(tA_max(i), scale * tS_bmax(i));
-      needs_rescale |= new_max != tA_max(i);
+      ElementS block_max = scale * tS_bmax(i);
+      if constexpr (UseTlaPipeline) {
+        block_max -= Fp8ExpOffset;
+      }
+      ElementS new_max = sycl::max(tA_max(i), block_max);
+      if constexpr (UseTlaPipeline) {
+        needs_rescale |= fp8_subgroup_any_less(tA_max(i), new_max);
+      } else {
+        needs_rescale |= new_max != tA_max(i);
+      }
       rescale(i) = sycl::native::exp2(tA_max(i) - new_max);
       tA_max(i) = new_max;
+      if constexpr (UseTlaPipeline) {
+        tA_max_biased(i) = new_max;
+      } else {
+        tA_max_biased(i) = new_max - Fp8ExpOffset;
+      }
     }
 
     /* Scale S and subtract maxima, then exponentiate */
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS.size(); i++)
-      tS(i) = scale * tS(i) - broadcast<0>(tA_max, tS, i) + kFp8ExpOffset;
+      tS(i) = scale * tS(i) - broadcast<0>(tA_max_biased, tS, i);
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS.size(); i++)
@@ -1043,6 +1287,7 @@ struct DecodeFwdMainloop<
   static constexpr bool Fp8Q =
       is_any_of_v<ElementQ, float_e5m2_t, float_e4m3_t>;
   static constexpr bool LocalMask = LocalMask_;
+  static constexpr bool FuseVScale = false;
 
   // User-facing arguments
   struct Arguments {

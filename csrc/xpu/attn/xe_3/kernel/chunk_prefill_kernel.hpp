@@ -129,6 +129,14 @@ class XeFMHAFwdKernel {
   // Kernel level shared memory storage
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
   using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
+  static constexpr bool SkipOutOfRangeQSubgroups =
+      TileScheduler::kOneBatch && TileScheduler::kNoGQA &&
+      TileScheduler::kReverseQ && !is_var_len && !PagedKV && !CausalMask &&
+      !LocalMask && !Sink && !SoftmaxLSE && CollectiveMainloop::UseTlaPipeline &&
+      !CollectiveMainloop::UseSplitBarrier &&
+      is_empty_v<MainloopSharedStorage> &&
+      is_empty_v<EpilogueSharedStorage> &&
+      size<3>(typename TiledMMAPV::ThrLayoutVMNK{}) == 1;
   union SharedStorage {
     MainloopSharedStorage mainloop;
     EpilogueSharedStorage epilogue;
@@ -243,7 +251,10 @@ class XeFMHAFwdKernel {
 
     auto& p = params.kernel;
     ProblemShape const& s = p.shape;
-    int head_group_q = s.num_heads_q / s.num_heads_kv;
+    int head_group_q = 1;
+    if constexpr (!TileScheduler::kNoGQA) {
+      head_group_q = s.num_heads_q / s.num_heads_kv;
+    }
 
     int thr_id = int(ThreadIdxX());
     int sub_group_id = thr_id / intel::sg_size;
@@ -271,6 +282,13 @@ class XeFMHAFwdKernel {
       auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
       auto [seq_len_qo, seq_len_kv] = sequence_length_shape;
       if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo) continue;
+      if constexpr (SkipOutOfRangeQSubgroups) {
+        // This path has no WG barriers or shared reductions. Every lane in
+        // an entirely out-of-range Q subgroup can skip the attention loop.
+        if (blk_q * get<0>(TileShapeQK{}) + q_offset_sg >= seq_len_qo) {
+          continue;
+        }
+      }
 
       auto full_tile_offset = seq_len_kv - seq_len_qo;
       int seq_coord =
@@ -315,8 +333,8 @@ class XeFMHAFwdKernel {
                     1
               : 0;
 
-      // The mainloop wraps each K iteration in a workgroup-scoped barrier
-      // pair, so every subgroup in the workgroup must execute the same
+      // A mainloop with workgroup split barriers requires every subgroup
+      // (including out-of-range Q subgroups) to execute the same
       // K-loop trip count. Reduce the per-SG bounds across the WG:
       //   k_block0        = min across WG (start no later than any SG)
       //   k_blocks        = max across WG (end no earlier than any SG)
@@ -466,6 +484,12 @@ class XeFMHAFwdKernel {
 
       // Epilogue
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
+      float v_scale = 1.0f;
+      if constexpr (CollectiveMainloop::FuseVScale) {
+        v_scale = params.mainloop.scale_v
+                      ? *static_cast<const float*>(params.mainloop.scale_v)
+                      : 1.0f;
+      }
       if constexpr (Sink) {
         ElementSink s_head = p.ptr_S[head_q];
         epilogue.template operator()<false>(
@@ -475,7 +499,8 @@ class XeFMHAFwdKernel {
             tA_sum_partial,
             blk_qv,
             s_head,
-            thr_id);
+            thr_id,
+            v_scale);
       } else {
         epilogue.template operator()<false>(
             O(_, _, head_q, l_coord),
@@ -484,9 +509,79 @@ class XeFMHAFwdKernel {
             tA_sum_partial,
             blk_qv,
             static_cast<ElementSink>(0),
-            thr_id);
+            thr_id,
+            v_scale);
       }
     }
+  }
+};
+
+// Adapt the single ragged sequence on-device, never infer lengths from tensor
+// capacity. The common zero-offset/full-length case needs no pointer offsets;
+// padded buffers, shorter lengths and cumulative-prefix views use the same
+// fixed-shape body with their actual bounds and rebased pointers.
+template <class FixedKernel, class VarLenKernel>
+class XeFMHAFwdSingleBatchKernel : public VarLenKernel {
+ public:
+  using Params = typename VarLenKernel::Params;
+  static_assert(!FixedKernel::is_var_len && VarLenKernel::is_var_len);
+  static_assert(cute::is_same_v<
+                typename FixedKernel::TileScheduler,
+                typename VarLenKernel::TileScheduler>);
+  static_assert(
+      FixedKernel::SharedStorageSize == VarLenKernel::SharedStorageSize);
+  static_assert(
+      FixedKernel::TileScheduler::kOneBatch &&
+      FixedKernel::TileScheduler::kNoGQA);
+  static_assert(
+      !FixedKernel::PagedKV && !FixedKernel::CausalMask &&
+      !FixedKernel::LocalMask && !FixedKernel::Sink &&
+      !FixedKernel::SoftmaxLSE);
+
+  CUTLASS_DEVICE
+  void operator()(Params const& params, char* smem_buf) {
+    auto const& p = params.kernel;
+    auto const& s = p.shape;
+    typename FixedKernel::KernelParams kernel{
+        {1,
+         s.num_heads_q,
+         s.num_heads_kv,
+         int(s.seq_len_qo),
+         int(s.seq_len_kv),
+         s.head_size_qk,
+         s.head_size_vo},
+        p.Q,
+        p.dQ,
+        p.K,
+        p.dK,
+        p.V,
+        p.dV,
+        p.O,
+        p.dO,
+        p.ptr_S,
+        p.softmax_lse,
+        p.lse_stride,
+        p.is_prefill};
+
+    int const q_start = s.seq_len_qo.cumulative_length[0];
+    int const q_end = s.seq_len_qo.cumulative_length[1];
+    int const k_start = s.seq_len_kv.cumulative_length[0];
+    int const k_end = s.seq_len_kv.cumulative_length[1];
+    if (q_start != 0 || q_end != kernel.shape.seq_len_qo) {
+      kernel.shape.seq_len_qo = q_end - q_start;
+      kernel.Q += int64_t(q_start) * get<0>(kernel.dQ);
+      kernel.O += int64_t(q_start) * get<0>(kernel.dO);
+    }
+    if (k_start != 0 || k_end != kernel.shape.seq_len_kv) {
+      kernel.shape.seq_len_kv = k_end - k_start;
+      kernel.K += int64_t(k_start) * get<0>(kernel.dK);
+      kernel.V += int64_t(k_start) * get<1>(kernel.dV);
+    }
+    // Flattened inputs have zero batch strides. They remain correct here:
+    // batch is statically one and the specialized scheduler only returns 0.
+    typename FixedKernel::Params fixed_params{
+        kernel, params.mainloop, params.epilogue, params.scheduler};
+    FixedKernel{}(fixed_params, smem_buf);
   }
 };
 

@@ -36,6 +36,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/fast_math.h"
 #include "cutlass/kernel_hardware_info.h"
+#include "cute/util/type_traits.hpp"
 
 namespace cutlass::fmha::kernel {
 // Arch-tagged inline namespace: gives these definitions a mangled name
@@ -43,11 +44,22 @@ namespace cutlass::fmha::kernel {
 // while leaving name lookup (cutlass::fmha::...) unchanged.
 inline namespace vllm_xpu_xe3 {
 
-template <bool Causal>
+template <
+    bool Causal,
+    bool OneBatch = false,
+    bool NoGQA = false,
+    bool ReverseQ = false>
 struct XeFHMAIndividualTileScheduler {
+  static constexpr bool kOneBatch = OneBatch;
+  static constexpr bool kNoGQA = NoGQA;
+  static constexpr bool kReverseQ = ReverseQ;
+  struct EmptyDivmod {};
+  using NumHeadsDivmod =
+      cute::conditional_t<OneBatch, EmptyDivmod, FastDivmod>;
+
   struct Params {
     dim3 grid;
-    FastDivmod divmod_num_heads;
+    NumHeadsDivmod divmod_num_heads;
   };
 
   bool valid_ = true;
@@ -75,7 +87,12 @@ struct XeFHMAIndividualTileScheduler {
           size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),    // Q
           size(shape.batch * shape.num_heads_q));  // (h,b) -- split later
     }
-    return Params{grid, {shape.num_heads_q}};
+    Params params{};
+    params.grid = grid;
+    if constexpr (!OneBatch) {
+      params.divmod_num_heads = FastDivmod(shape.num_heads_q);
+    }
+    return params;
   }
 
   template <int Num_SGs>
@@ -93,17 +110,28 @@ struct XeFHMAIndividualTileScheduler {
     int head, idx_b;
     if constexpr (Causal) {
       // Causal: (V, (h,b), Q)
-      idx_b = BlockIdxY();
-      params.divmod_num_heads(idx_b, head, idx_b);
+      if constexpr (OneBatch) {
+        head = BlockIdxY();
+        idx_b = 0;
+      } else {
+        idx_b = BlockIdxY();
+        params.divmod_num_heads(idx_b, head, idx_b);
+      }
       // Reverse Q dispach order for causal
       int q_tile = params.grid.z - 1 - BlockIdxZ();
       return make_coord(q_tile, BlockIdxX(), head, idx_b);
     }
     else {
       // Non-causal: (V, Q, (h,b))
-      idx_b = BlockIdxZ();
-      params.divmod_num_heads(idx_b, head, idx_b);
-      return make_coord(BlockIdxY(), BlockIdxX(), head, idx_b);
+      if constexpr (OneBatch) {
+        head = BlockIdxZ();
+        idx_b = 0;
+      } else {
+        idx_b = BlockIdxZ();
+        params.divmod_num_heads(idx_b, head, idx_b);
+      }
+      int q_tile = ReverseQ ? params.grid.y - 1 - BlockIdxY() : BlockIdxY();
+      return make_coord(q_tile, BlockIdxX(), head, idx_b);
     }
   }
 

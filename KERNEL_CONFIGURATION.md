@@ -85,7 +85,7 @@ Config files are located in `csrc/xpu/attn/kernel_configs/`.
 | File | Kernels | Use Case |
 |------|---------|----------|
 | `chunk_prefill_full.conf` | 216 | All combinations — supports every model |
-| `chunk_prefill_default.conf` | ~13 | Llama, Qwen, DeepSeek MLA, Falcon (default build) |
+| `chunk_prefill_default.conf` | ~30 | Llama, Qwen, DeepSeek MLA, Falcon (default build) |
 
 ### Paged Decode
 
