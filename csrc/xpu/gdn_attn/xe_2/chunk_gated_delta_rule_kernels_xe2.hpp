@@ -1349,7 +1349,7 @@ void kernel_launcher(
         });
   });
 
-  if (vllm::xpu::is_bmg()) {
+  if (!vllm::xpu::is_pvc()) {
     using WGTileInverse = chunk_gemm_policy_inverse::WGTile;
     using SGLayoutInverse = chunk_gemm_policy_inverse::SGLayout;
     using MMAInverse = typename TiledMMAHelper<
