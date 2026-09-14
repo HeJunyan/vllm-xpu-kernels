@@ -1595,13 +1595,13 @@ void chunk_gated_delta_rule_impl_xe2(
 
   int padding_size = batch_size * (chunk_size - 1);
 
-  torch::Tensor A = torch::zeros(
+  torch::Tensor A = torch::empty(
       {num_v_heads, total_seqlen + padding_size, chunk_size},
       torch::dtype(dtype).device(device).requires_grad(false));
-  torch::Tensor w = torch::zeros(
+  torch::Tensor w = torch::empty(
       {num_v_heads, total_seqlen + padding_size, head_k_dim},
       torch::dtype(dtype).device(device).requires_grad(false));
-  torch::Tensor u = torch::zeros(
+  torch::Tensor u = torch::empty(
       {num_v_heads, total_seqlen + padding_size, head_v_dim},
       torch::dtype(dtype).device(device).requires_grad(false));
 
