@@ -1349,6 +1349,18 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
         current_chunk_size = seq_len - chunk_id * chunk_size;
       }
 
+      // Persistent U_old accumulator. When has_prev_state, U_old is produced
+      // by the compute_wu prologue and consumed by the W×S subtract below with
+      // no HBM round-trip: the prologue store would only be overwritten by the
+      // U_new store, so we keep it resident in registers instead.
+      auto thr_mma = mma.get_slice(local_id);
+      auto gU_persist = local_tile(
+          make_identity_tensor(make_shape(chunk_size, head_v_dim)),
+          wg_tile,
+          make_coord(0, dv, 0),
+          Step<_1, _1, X>{});
+      auto tSrU_reg = thr_mma.partition_sg_fragment_C(gU_persist);
+
       // ===== Inlined compute_wu: produce w/u for this chunk =====
       {
         // WAR fence before refilling the compute_wu scaling SLM.
@@ -1401,14 +1413,19 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
         {
           Tensor gU_wu = local_tile(
               cU_wu, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
-          auto tCrU_wu = thr_copy_U_wu.partition_sg_fragment_S(gU_wu);
-          auto tCgU_wu = thr_copy_U_wu.partition_D(gU_wu);
-          auto tSrU_wu = thr_mma_wu.partition_sg_fragment_C(gU_wu);
-          clear(tSrU_wu);
+          clear(tSrU_reg);
           gemm_TTS_k_multi(
-              A_wu_tensor, V_wu_T, tSrU_wu, 0, dv, mma, wu_beta_slm_ptr);
-          reorder(tSrU_wu, tCrU_wu);
-          copy(copy_U_wu, tCrU_wu, tCgU_wu);
+              A_wu_tensor, V_wu_T, tSrU_reg, 0, dv, mma, wu_beta_slm_ptr);
+          // When has_prev_state, U_old stays resident in tSrU_reg and the W×S
+          // epilogue below computes U_new in-place before storing, so skip the
+          // store here (it would only be overwritten). Otherwise there is no
+          // subtract, so persist U to HBM now for the transposed reads.
+          if (!has_prev_state) {
+            auto tCrU_wu = thr_copy_U_wu.partition_sg_fragment_S(gU_wu);
+            auto tCgU_wu = thr_copy_U_wu.partition_D(gU_wu);
+            reorder(tSrU_reg, tCrU_wu);
+            copy(copy_U_wu, tCrU_wu, tCgU_wu);
+          }
         }
 
         // w[full] = A_inv @ (g * k), only needed when previous state is used.
@@ -1499,13 +1516,9 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
 
       Tensor cU = make_identity_tensor(U_tensor.shape());
 
-      auto copy_U_c = get_block_2d_copy_C<void>(mma, U_tensor);
       auto copy_U_d = get_block_2d_copy_D<void>(mma, U_tensor);
 
-      auto thr_copy_U_c = copy_U_c.get_slice(local_id);
       auto thr_copy_U_d = copy_U_d.get_slice(local_id);
-
-      auto thr_mma = mma.get_slice(local_id);
 
       auto q_ptr =
           q + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
@@ -1601,21 +1614,17 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
             W_tensor, Q_tensor, S_tensor, tSrU_d, tSrO_c, 0, 0, dv, mma);
 
         // --- WS epilogue: U_new[dv] = U_old[dv] - W×S[dv] ---
+        // U_old is resident in registers (tSrU_reg) from the compute_wu
+        // prologue and W×S is in tSrU_d; both are MMA-C fragments for the same
+        // [chunk x dv] tile, so subtract in-place with no HBM round-trip for
+        // U_old (the prologue skipped its store on the has_prev_state path).
         auto tCrU_d = thr_copy_U_d.partition_sg_fragment_S(gU_C);
         auto tCgU_d = thr_copy_U_d.partition_D(gU_C);
-        auto tCrU_c_save = thr_copy_U_c.partition_sg_fragment_D(gU_C);
-        reorder(tSrU_d, tCrU_c_save);
-
-        auto tCgU_c = thr_copy_U_c.partition_S(gU_C);
-        auto tCrU_c = thr_copy_U_c.partition_sg_fragment_D(gU_C);
-        copy(copy_U_c, tCgU_c, tCrU_c);
-
         CUTE_UNROLL
-        for (int i = 0; i < tCrU_c_save.size(); ++i) {
-          tCrU_c(i) -= tCrU_c_save(i);
+        for (int i = 0; i < tSrU_reg.size(); ++i) {
+          tSrU_reg(i) -= tSrU_d(i);
         }
-
-        reorder(tCrU_c, tCrU_d);
+        reorder(tSrU_reg, tCrU_d);
         copy(copy_U_d, tCrU_d, tCgU_d);
 
         // --- QS epilogue: apply exp(g) scaling ---
