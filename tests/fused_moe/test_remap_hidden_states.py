@@ -474,12 +474,41 @@ def test_remap_hidden_states_mn_major_padded(num_rows, hidden_size,
             expected[idx] = src[r]
     torch.testing.assert_close(fused_flat, expected, rtol=0, atol=0)
 
-    # The fused surface must hold exactly what the standalone reorder pass
-    # would have produced from the unpadded scales.
-    plain = _run(False)[0].view(torch.float8_e8m0fnu)
-    ref = torch.ops._moe_C.reorder_mxfp_scales(plain, rows_per_expert,
-                                               total_padded)
-    torch.testing.assert_close(fused.cpu(),
-                               ref.view(torch.uint8).cpu(),
-                               rtol=0,
-                               atol=0)
+    # ---- Non-padded (expert_scale_desc=None) path + reorder_mxfp_scales ----
+    # A second run exercises the desc=None scale output (written row-major and
+    # permuted by RemapHiddenStates, with ScaleRemap not launched) and the
+    # standalone reorder_mxfp_scales op. Row placement inside an expert is
+    # atomic-decided, so this run's order may differ from the padded run above;
+    # validate each output against the source rows through *its own* row map
+    # instead of comparing bytes across runs.
+    plain, rpe2, row_map2, _ = _run(False)
+    plain_c = plain.cpu()
+    row_map2_c = row_map2.cpu()
+    rpe2_c = rpe2.cpu()
+    padded_rpe2 = (rpe2_c + 3) & ~3
+    row_prefix2 = torch.cat([zero, torch.cumsum(rpe2_c, 0, dtype=torch.int32)])
+    scale_prefix2 = torch.cat(
+        [zero, torch.cumsum(padded_rpe2, 0, dtype=torch.int32)])
+
+    # desc=None output is row-major permuted: source row r,i lands at row_map2.
+    expected_plain = torch.zeros_like(plain_c)
+    for r in range(num_rows):
+        for i in range(topk):
+            expected_plain[int(row_map2_c[r, i])] = src[r]
+    torch.testing.assert_close(plain_c, expected_plain, rtol=0, atol=0)
+
+    # reorder_mxfp_scales lifts that permuted surface into the padded MN-major
+    # layout; check it against the source rows through the same run's row map.
+    ref = torch.ops._moe_C.reorder_mxfp_scales(plain.view(torch.float8_e8m0fnu),
+                                               rpe2, total_padded)
+    ref_flat = ref.view(torch.uint8).cpu().flatten()
+    expected_pad = torch.zeros_like(ref_flat)
+    for r in range(num_rows):
+        for i in range(topk):
+            e = int(topk_ids_c[r, i])
+            m_local = int(row_map2_c[r, i]) - int(row_prefix2[e])
+            base = int(scale_prefix2[e]) * scale_k
+            ld = int(padded_rpe2[e])
+            idx = base + torch.arange(scale_k) * ld + m_local
+            expected_pad[idx] = src[r]
+    torch.testing.assert_close(ref_flat, expected_pad, rtol=0, atol=0)
