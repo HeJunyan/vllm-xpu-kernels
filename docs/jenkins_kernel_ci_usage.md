@@ -32,7 +32,6 @@ Jenkins kernel CI for this repository is online.
 - `FORCE_TRIGGER_KIND` can override detection for manual testing (`pr_auto`, `pr_merge`, `comment`, or `manual`).
 - Triggering itself is webhook-based (GitHub webhook -> Jenkins), replacing the older comment-polling/GHPRB setup.
 - The pipeline also publishes a GitHub commit status (`jenkins/vllm-xpu-kernel-ci`) back to the PR head SHA (or merge commit SHA for merge-triggered runs) for `pending`/`success`/`failure`/`error` states.
-- **Superseded-build cancellation**: when a new webhook-driven build starts for a PR (identified by the `PR_NUMBER`/`ISSUE_NUMBER` job parameter) that already has an older build still running, the pipeline automatically aborts that older build before proceeding. This prevents stale commits from continuing to build/test (and report GitHub status) after a newer push/comment has arrived for the same PR. This only compares builds of the same PR number; concurrent builds for different PRs are unaffected. This requires the Jenkins controller to allow the `@NonCPS` script's use of `jenkins.model.Jenkins`/`hudson.model.*` (approve the relevant signatures once under *Manage Jenkins > In-process Script Approval* if the job runs with the Groovy sandbox enabled).
 
 ## Artifact Publishing (Artifactory Upload)
 

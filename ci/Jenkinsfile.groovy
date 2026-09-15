@@ -1,51 +1,3 @@
-import jenkins.model.Jenkins
-import hudson.model.ParametersAction
-import hudson.model.Result
-
-// Resolves the PR/issue identifier a given previous build ran for, so we can tell whether
-// it belongs to the same PR as the build currently executing this script.
-@NonCPS
-def resolveBuildPrKey(build) {
-    def paramsAction = build?.getAction(ParametersAction)
-    if (!paramsAction) {
-        return null
-    }
-    for (String name : ['PR_NUMBER', 'ISSUE_NUMBER']) {
-        def value = paramsAction.getParameter(name)?.value?.toString()?.trim()
-        if (value) {
-            return value
-        }
-    }
-    return null
-}
-
-// Aborts any still-running older build of this job that was triggered for the same PR,
-// so a fresh push/comment supersedes (instead of queueing behind) a stale in-flight run.
-@NonCPS
-def abortSupersededBuilds(String jobFullName, int currentBuildNumber, String prKey) {
-    def job = Jenkins.instance?.getItemByFullName(jobFullName)
-    if (!job) {
-        return []
-    }
-
-    def abortedNumbers = []
-    for (build in job.builds) {
-        if (build.number >= currentBuildNumber || !build.isBuilding()) {
-            continue
-        }
-        if (resolveBuildPrKey(build) != prKey) {
-            continue
-        }
-        try {
-            build.doStop()
-        } catch (Throwable ignoredStopError) {
-            build.getExecutor()?.interrupt(Result.ABORTED)
-        }
-        abortedNumbers << build.number
-    }
-    return abortedNumbers
-}
-
 def stringParamOrEnvListOrDefault = { String paramName, List<String> envNames, String defaultValue ->
     def rawParamValue = params.containsKey(paramName) ? params.get(paramName) : null
     def paramValue = rawParamValue != null ? rawParamValue.toString().trim() : ''
@@ -233,20 +185,6 @@ if (TRIGGER_KIND_VALUE == 'pr_auto' && !ENABLE_PR_AUTOMATIC_TRIGGER_VALUE) {
 } else if (normalizedWebhookEvent && TRIGGER_KIND_VALUE == 'manual') {
     shouldRunBuild = false
     skipReason = "unsupported webhook event '${normalizedWebhookEvent}'"
-}
-
-// New PR pushes/comments should supersede a still-running older build for the same PR,
-// instead of that older (stale) build being left to keep running/reporting alongside it.
-def cancelSupersededKey = PR_NUMBER_VALUE?.trim() ?: ISSUE_NUMBER_VALUE?.trim()
-if (shouldRunBuild && cancelSupersededKey && TRIGGER_KIND_VALUE != 'manual') {
-    try {
-        def abortedBuildNumbers = abortSupersededBuilds(env.JOB_NAME, currentBuild.number as int, cancelSupersededKey)
-        if (abortedBuildNumbers) {
-            echo "[Jenkinsfile] Aborted superseded build(s) #${abortedBuildNumbers.join(', #')} for PR #${cancelSupersededKey} (superseded by this build #${currentBuild.number})"
-        }
-    } catch (Throwable abortError) {
-        echo "[Jenkinsfile] Failed to abort superseded builds for PR #${cancelSupersededKey}: ${abortError.getMessage()}"
-    }
 }
 
 def noProxy = '127.0.0.1,localhost,172.*,192.*,10.*,*.local,*.intel.com'
