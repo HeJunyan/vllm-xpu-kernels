@@ -1361,18 +1361,40 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
           Step<_1, _1, X>{});
       auto tSrU_reg = thr_mma.partition_sg_fragment_C(gU_persist);
 
+      // g_last is a plain global read (a[] is never written by this kernel),
+      // so hoist it above the SLM fill and fuse it into the unified pass.
+      float g_last_value =
+          a[(chunk_offset + current_chunk_size - 1) +
+            v_head_id * total_virtual_seqlen];
+      float g_last_value_exp = sycl::native::exp(g_last_value);
+
       // ===== Inlined compute_wu: produce w/u for this chunk =====
       {
-        // WAR fence before refilling the compute_wu scaling SLM.
+        // Single WAR fence before refilling ALL per-chunk scaling SLM buffers:
+        // wu_beta/wu_g (consumed by compute_wu) and g/g_multi/g_exp (consumed
+        // by the fwd_o body). Previous chunk's sub-groups may still read them.
         item.barrier(sycl::access::fence_space::local_space);
+        // Unified SLM fill: a[]/b[] and exp(a) are loaded once and shared
+        // across all five buffers. This merges the former two fill+barrier
+        // pairs (wu fill and g fill) into a single fill with one barrier.
         CUTE_UNROLL
         for (int e = local_id; e < chunk_size; e += local_range) {
           float beta_value =
               b[(chunk_offset + e) + v_head_id * total_virtual_seqlen];
           float a_value =
               a[(chunk_offset + e) + v_head_id * total_virtual_seqlen];
+          float exp_a = sycl::native::exp(a_value);
           wu_beta_slm_ptr[e] = beta_value;
-          wu_g_slm_ptr[e] = sycl::native::exp(a_value) * beta_value;
+          wu_g_slm_ptr[e] = exp_a * beta_value;
+          if (e < current_chunk_size) {
+            g_slm_ptr[e] = a_value;
+            g_multi_slm_ptr[e] = sycl::native::exp(g_last_value - a_value);
+            g_exp_slm_ptr[e] = exp_a;
+          } else {
+            g_slm_ptr[e] = 0.0f;
+            g_multi_slm_ptr[e] = 0.0f;
+            g_exp_slm_ptr[e] = 0.0f;
+          }
         }
         item.barrier(sycl::access::fence_space::local_space);
 
@@ -1464,35 +1486,11 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
           }
         }
         // Ensure w/u are globally visible before the fwd_o body reads them.
+        // This global_and_local barrier also publishes the g/g_multi/g_exp SLM
+        // writes from the unified fill above, so the fwd_o body needs no
+        // additional local barrier before consuming them.
         item.barrier(sycl::access::fence_space::global_and_local);
       }
-
-      float g_last_value =
-          a[(chunk_offset + current_chunk_size - 1) +
-            v_head_id * total_virtual_seqlen];
-      float g_last_value_exp = sycl::native::exp(g_last_value);
-      // WAR fence: the previous chunk iteration's sub-groups may
-      // still be reading g_slm_ptr/g_multi_slm_ptr/g_exp_slm_ptr in
-      // their output/state GEMM epilogues; all must arrive before any
-      // sub-group refills these SLM buffers for this chunk.
-      item.barrier(sycl::access::fence_space::local_space);
-      CUTE_UNROLL
-      for (int e = local_id; e < current_chunk_size; e += local_range) {
-        float g_cumsum_value =
-            a[(chunk_offset + e) + v_head_id * total_virtual_seqlen];
-        g_slm_ptr[e] = g_cumsum_value;
-        g_multi_slm_ptr[e] = sycl::native::exp(g_last_value - g_cumsum_value);
-        g_exp_slm_ptr[e] = sycl::native::exp(g_cumsum_value);
-      }
-
-      CUTE_UNROLL
-      for (int e = current_chunk_size + local_id; e < chunk_size;
-           e += local_range) {
-        g_slm_ptr[e] = 0.0f;
-        g_multi_slm_ptr[e] = 0.0f;
-        g_exp_slm_ptr[e] = 0.0f;
-      }
-      item.barrier(sycl::access::fence_space::local_space);
 
       auto W_ptr = w + v_head_id * total_virtual_seqlen * head_k_dim +
                    chunk_offset * head_k_dim;
