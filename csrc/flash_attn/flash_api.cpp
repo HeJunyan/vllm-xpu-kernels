@@ -14,7 +14,8 @@ inline int get_num_splits(
     const int& num_heads_q,
     const int& num_heads_kv,
     const int& max_seqlen_k,
-    const int& block_size) {
+    const int& block_size,
+    bool tune_saturated_short_decode = false) {
   auto device = queue.get_device();
   int num_xe_cores =
       device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
@@ -45,7 +46,7 @@ inline int get_num_splits(
     policy_split_cap = 64;
   }
 
-  int kv_tiles = (max_seqlen_k + kv_tile - 1) / kv_tile;
+  int kv_tiles = (int64_t{max_seqlen_k} + kv_tile - 1) / kv_tile;
 
   // Below ~16 tiles total the kernel falls back to single-split anyway; any
   // splitting only adds ReduceSplitK overhead.
@@ -59,10 +60,18 @@ inline int get_num_splits(
 
   int wgs_per_split = batch_size * num_heads_kv;
 
-  // Saturation guard: if the FMHA already saturates WG slots and the sequence
-  // is not long enough for splitting to deliver bandwidth gains, splitting
-  // only adds ReduceSplitK overhead.
-  if (wgs_per_split >= num_wg_slots && kv_tiles < 64) return 1;
+  if (wgs_per_split >= num_wg_slots && kv_tiles < 64) {
+    if (tune_saturated_short_decode && kv_tile == 64 && kv_tiles >= 32) {
+      // On the measured CRI BF16 Qwen decode shape, one wave is insufficient
+      // to hide memory latency. Bound total WGs to four waves: rounding up
+      // would turn three populated waves into six and regress bandwidth.
+      // Here the result is 1..4, within the policy, tile, and reduction caps.
+      return std::max(1, 4 * num_wg_slots / wgs_per_split);
+    }
+    // Preserve the legacy saturation guard for unmeasured configurations
+    // and sequences below the device kernel's 32-tile split threshold.
+    return 1;
+  }
 
   // (1) Parallelism term: enough splits so total FMHA WGs reach 4x WG-slot
   //     oversubscription, hiding memory latency.
@@ -90,6 +99,57 @@ inline int get_num_splits(
   // (5) Hard cap of 32 (beyond this the ReduceSplitK kernel dominates).
   return std::max(
       1, std::min({splits, max_splits_tiles, 32, policy_split_cap}));
+}
+
+inline bool tune_saturated_short_decode(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  // Limit the policy change to the architecture and shape validated by the
+  // Python benchmark. Other dtypes, GQA ratios and head sizes retain legacy.
+  return q.scalar_type() == at::kBFloat16 &&
+         k.scalar_type() == at::kBFloat16 &&
+         v.scalar_type() == at::kBFloat16 && q.size(1) == 32 &&
+         k.size(2) == 4 && q.size(2) == 128 && k.size(3) == 128 &&
+         v.size(3) == 128 && vllm::xpu::is_cri(q.device().index());
+}
+
+int64_t get_paged_decode_num_splits(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    int64_t max_seqlen_k) {
+  CHECK_DEVICE(q);
+  CHECK_DEVICE(k);
+  CHECK_DEVICE(v);
+  TORCH_CHECK(
+      q.device() == k.device() && q.device() == v.device(),
+      "Q/K/V must be on the same device");
+  TORCH_CHECK(
+      q.dim() == 3 && k.dim() == 4 && v.dim() == 4,
+      "Expected single-token Q [batch, heads, dim] and paged K/V caches");
+  TORCH_CHECK(
+      q.size(0) > 0 && q.size(0) <= std::numeric_limits<int>::max() &&
+          q.size(1) > 0 && q.size(1) <= std::numeric_limits<int>::max() &&
+          q.size(0) * q.size(1) <= std::numeric_limits<int>::max() &&
+          k.size(1) <= std::numeric_limits<int>::max() && k.size(2) > 0 &&
+          q.size(1) % k.size(2) == 0 &&
+          k.size(0) == v.size(0) && k.size(1) == v.size(1) &&
+          k.size(2) == v.size(2) && q.size(2) == k.size(3),
+      "Invalid paged decode shape");
+  TORCH_CHECK(
+      max_seqlen_k > 0 && max_seqlen_k <= std::numeric_limits<int>::max(),
+      "max_seqlen_k must be a positive int32");
+  TORCH_CHECK(
+      k.size(1) == 16 || k.size(1) == 32 ||
+          (k.size(1) > 0 && k.size(1) % 64 == 0),
+      "block_size must be 16, 32, or a positive multiple of 64");
+  return get_num_splits(
+      vllm::xpu::vllmGetQueue(q.device().index()),
+      q.size(0),
+      q.size(1),
+      k.size(2),
+      static_cast<int>(max_seqlen_k),
+      k.size(1),
+      tune_saturated_short_decode(q, k, v));
 }
 
 std::vector<at::Tensor> mha_varlen_fwd(
@@ -393,7 +453,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         num_heads_q,
         num_heads_kv,
         effective_seqlen_k,
-        block_size));
+        block_size,
+        tune_saturated_short_decode(q, k, v)));
 
     at::Tensor tmp_out =
         num_kv_splits == 1
@@ -459,6 +520,13 @@ std::vector<at::Tensor> mha_varlen_fwd(
 }  // namespace FLASH_NAMESPACE
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+  ops.def(
+      "get_paged_decode_num_splits(Tensor q, Tensor k, Tensor v, "
+      "int max_seqlen_k) -> int");
+  ops.impl(
+      "get_paged_decode_num_splits",
+      torch::kXPU,
+      &FLASH_NAMESPACE::get_paged_decode_num_splits);
   ops.def(
       "varlen_fwd(Tensor q, Tensor k, Tensor v, Tensor!? out, Tensor "
       "cu_seqlens_q, "
