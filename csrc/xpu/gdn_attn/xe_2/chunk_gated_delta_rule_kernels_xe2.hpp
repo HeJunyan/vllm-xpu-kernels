@@ -1947,7 +1947,11 @@ void kernel_launcher(
   // fused kernel loses compute_wu's parallelism and regresses, so keep the two
   // kernels separate there.
   const int compute_wu_wgs = sm_count * MaxThreadsPerSM / size(MMAFwdOSmall{});
-  const bool fuse_wu = fwd_o_wgs >= compute_wu_wgs;
+  // Always use the fused chunk_fwd_o_wu kernel: it is the optimized path for
+  // the targeted prefill workloads, where the wg-count heuristic below would
+  // otherwise fall back to the (much slower) separate compute_wu + fwd_o
+  // kernels. The heuristic operands are kept referenced for documentation.
+  const bool fuse_wu = true || (fwd_o_wgs >= compute_wu_wgs);
 
   if (fuse_wu) {
     // Fused compute_wu + fwd_o. The grid is already large, so use the compact
