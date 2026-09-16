@@ -76,6 +76,35 @@ static inline void barrier() {
 
 using namespace cute;
 
+#if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
+CUTE_DEVICE
+uint32_t
+subgroup_any_less(float const& lhs, float const& rhs)
+{
+  uint32_t result;
+  asm (
+    "{\n"
+    ".decl OUT_UD v_type=G type=UD num_elts=16 alias=<%0,0>\n"
+    ".decl LHS_F v_type=G type=F num_elts=16 alias=<%1,0>\n"
+    ".decl RHS_F v_type=G type=F num_elts=16 alias=<%2,0>\n"
+    ".decl ANY_LESS v_type=P num_elts=16\n"
+    "cmp.lt (M1_NM, 16) ANY_LESS LHS_F(0,0)<1;1,0> RHS_F(0,0)<1;1,0>\n"
+    "(ANY_LESS.any) sel (M1_NM, 16) OUT_UD(0,0)<1> 0x1:ud 0x0:ud\n"
+    "}\n"
+    : "=rw"(result)
+    : "rw"(lhs), "rw"(rhs)
+  );
+  return result;
+}
+#else
+CUTE_DEVICE
+uint32_t
+subgroup_any_less(float const& /* lhs */, float const& /* rhs */)
+{
+  CUTE_INVALID_CONTROL_PATH("subgroup_any_less requires Intel Xe SYCL device target");
+}
+#endif
+
 
 #if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
 CUTE_DEVICE
@@ -793,9 +822,8 @@ struct FMHAFwdMainloop<
       }
 
       /* Apply softmax (deferred row-sum hreduce) */
-      auto [rescale, tS_partial_sum, needs_rescale] = softmax(effective_scale, tSrS, tA_max, tA_sum);
+      auto [rescale, tS_partial_sum, subgroup_needs_rescale] = softmax(effective_scale, tSrS, tA_max, tA_sum);
       auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-      bool const subgroup_needs_rescale = sycl::any_of_group(sg, needs_rescale);
       constexpr int kSumSize = decltype(tA_sum.size())::value;
       constexpr bool kSumDivVT = (kSumSize % VTiles == 0);
       constexpr int kSumPerVT = kSumDivVT ? (kSumSize / VTiles) : 0;
@@ -874,11 +902,11 @@ struct FMHAFwdMainloop<
             tS, sycl::maximum<void>{});
 
     FragARow rescale;
-    bool needs_rescale = false;
+    uint32_t subgroup_needs_rescale = 0;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tA_max.size(); i++) {
       ElementS new_max = sycl::max(tA_max(i), scale * tS_bmax(i));
-      needs_rescale |= new_max != tA_max(i);
+      subgroup_needs_rescale |= subgroup_any_less(tA_max(i), new_max);
       rescale(i) = sycl::native::exp2(tA_max(i) - new_max);
       tA_max(i) = new_max;
     }
@@ -910,7 +938,7 @@ struct FMHAFwdMainloop<
       }
     }
 
-    return cute::make_tuple(rescale, tS_partial_sum, needs_rescale);
+    return cute::make_tuple(rescale, tS_partial_sum, subgroup_needs_rescale);
   }
 };
 
