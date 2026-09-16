@@ -1,8 +1,8 @@
 """
 Mini kernel tests for WAN 2.2 with reduced shapes for quick CI validation.
 
-Covers the same operations as test_wan22_kernels_ops_bf16.py and
-test_wan22_mxfp8_ops.py but with num_tokens=128, num_heads=1.
+Covers the same operations as test_wan22_kernels_ops_bf16.py but with
+num_tokens=128, num_heads=1.
 
 Usage:
     python -m pytest test_wan22_kernels_mini.py -v -s
@@ -275,58 +275,6 @@ class TestRoPEMini:
             return apply_rotary_emb(x, cos, sin, is_neox=False)
 
         benchmark_fn("RoPE SYCL [128, 1, 128]", run)
-
-
-# ============================================================================
-# MXFP8 Quantized GEMM
-# ============================================================================
-
-
-class TestMXFP8Mini:
-    """MXFP8 W8A8 quantized GEMM with num_tokens=128."""
-
-    @pytest.fixture(autouse=True)
-    def _setup_mxfp8(self):
-        """Import MXFP8 utilities or skip."""
-        if DEVICE == "cpu":
-            pytest.skip("MXFP8 tests require XPU")
-
-        # Fix sys.path for test imports
-        tests_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        if tests_dir not in sys.path:
-            sys.path.insert(0, tests_dir)
-
-        try:
-            from ops.mx_utils import to_mxfp
-            from register_ops import fp8_gemm
-            self._to_mxfp = to_mxfp
-            self._fp8_gemm = fp8_gemm
-        except ImportError as e:
-            pytest.skip(f"MXFP8 utilities not available: {e}")
-
-    def _run_mxfp8_gemm(self, name, m, n, k):
-        """Run MXFP8 GEMM benchmark."""
-        inputs_bf16 = torch.randn((m, k), dtype=torch.bfloat16, device="xpu") * 0.01
-        weights_bf16 = torch.randn((n, k), dtype=torch.bfloat16, device="xpu") * 0.01
-
-        def run():
-            # to_mxfp returns (scale_e8m0, data_fp8)
-            inputs_scale, inputs_lp = self._to_mxfp(inputs_bf16, format="mxfp8")
-            weights_scale, weights_lp = self._to_mxfp(weights_bf16, format="mxfp8")
-            weights_t = weights_lp.transpose(0, 1).contiguous()
-            return self._fp8_gemm(
-                inputs_lp, weights_t, torch.bfloat16,
-                inputs_scale, weights_scale, torch.Tensor(),
-            )
-
-        benchmark_fn(name, run)
-
-    def test_mxfp8_qkv_projection(self):
-        """MXFP8 QKV: [128, 128] x [384, 128]^T."""
-        self._run_mxfp8_gemm(
-            "MXFP8 QKV [128, 128]->[128, 384]",
-            BATCH_SIZE * NUM_TOKENS, 3 * HIDDEN_DIM, HIDDEN_DIM,
-        )
 
 
 # ============================================================================

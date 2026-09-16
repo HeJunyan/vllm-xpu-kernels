@@ -70,11 +70,16 @@ def pytest_collection_modifyitems(config, items):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """Generate report after all tests complete."""
-    try:
-        import test_wan22_kernels_ops_bf16
+    """Generate reports after all tests complete.
 
-        if test_wan22_kernels_ops_bf16.TEST_RESULTS:
-            test_wan22_kernels_ops_bf16.generate_markdown_report()
-    except Exception as e:
-        print(f"Warning: Could not generate report: {e}")
+    A pytest_sessionfinish defined in a test module is not collected as a hook,
+    so the report generators in those modules have to be driven from here.
+    """
+    for module_name in ("test_wan22_kernels_ops_bf16",):
+        try:
+            module = __import__(module_name)
+
+            if module.TEST_RESULTS:
+                module.generate_markdown_report()
+        except Exception as e:
+            print(f"Warning: Could not generate {module_name} report: {e}")
