@@ -115,42 +115,15 @@ class FMHAFwdEpilogue {
       make_layout(select<1, 0>(SGTileShapeO{}), Stride<E<1>, E<0>>{})));
   using ReduceFragARow = decltype(reduce<1>(ReduceFragA{}, sycl::plus<void>{}));
 
-  static constexpr bool UseTlaOutputStore =
-      CollectiveMainloop::FuseVScale && !Sink && ReduceK{} == _1{};
-  static constexpr XeStoreCachePolicy StoreCachePolicy =
-      UseTlaOutputStore ? XeStoreCachePolicy::kWT_WB_WB
-                        : XeStoreCachePolicy::kDefault;
-
-  static auto default_tiled_copy_O_base_helper() {
+  static auto default_tiled_copy_O_helper() {
     if constexpr (ReduceK{} == _1{})
-      return make_block_2d_copy_D<StoreCachePolicy>(
-          TiledMMAPV{}, TensorO2D{});
+      return make_block_2d_copy_D(TiledMMAPV{}, TensorO2D{});
     else
-      return make_block_2d_copy_D_subtiled<StoreCachePolicy>(
+      return make_block_2d_copy_D_subtiled(
           TiledMMAPV{},
           ReduceFragA{}.tv_layout(),
           ReduceSGLayout{},
           TensorO2D{});
-  }
-
-  static auto default_tiled_copy_O_helper() {
-    auto default_copy = default_tiled_copy_O_base_helper();
-    using DefaultStoreOp = typename decltype(default_copy)::CopyOp;
-    if constexpr (UseTlaOutputStore && sizeof_bits_v<ElementO> == 16 &&
-                  DefaultStoreOp::AtomWidth <= 16) {
-      static_assert(
-          DefaultStoreOp::CopyBits == 16 &&
-          DefaultStoreOp::AtomWidth % 2 == 0);
-      // Pack pairs of 16-bit outputs into the wider block-store message.
-      using D32StoreOp = XE_STORE_2D<
-          32,
-          DefaultStoreOp::AtomHeight,
-          DefaultStoreOp::AtomWidth,
-          StoreCachePolicy>;
-      return make_block_2d_copy_CD(D32StoreOp{}, TiledMMAPV{}, TensorO2D{});
-    } else {
-      return default_copy;
-    }
   }
 
   using DefaultTiledCopyO = decltype(default_tiled_copy_O_helper());
@@ -204,8 +177,7 @@ class FMHAFwdEpilogue {
       FragSPRow& tA_sum,         // Softmax row-wise partial sum (per-lane)
       QVCoord blk_qv,            // WG tile indices: (q,v)
       ElementSink const& tSink,  // Sink for current head
-      int thr_id,                // Work-item ID
-      float v_scale = 1.0f) {
+      int thr_id) {              // Work-item ID
 
     using namespace cute;
     using ElementA = typename FragA::element_type;
@@ -229,11 +201,7 @@ class FMHAFwdEpilogue {
             static_cast<ElementA>(tSink * kLog2e) - tA_max(i) +
             ElementA(kFp8SinkOffset));
       }
-      if constexpr (CollectiveMainloop::FuseVScale) {
-        rA_sum(i) = ElementA(v_scale) / rA_sum(i);
-      } else {
-        rA_sum(i) = ElementA(1) / rA_sum(i);
-      }
+      rA_sum(i) = ElementA(1) / rA_sum(i);
     }
 
     // CUTLASS_PRAGMA_UNROLL
@@ -256,12 +224,7 @@ class FMHAFwdEpilogue {
     for (int i = 0; i < rA.size(); i++)
       rA(i) *= broadcast<0>(rA_sum, rA, i);
     cute::reorder(rA, tOrO);
-    if constexpr (UseTlaOutputStore) {
-      auto prepared_o = prepare_payloads(copy_o, tOgO);
-      copy(copy_o, prepared_o, tOrO);
-    } else {
-      copy(copy_o, tOrO, tOgO);
-    }
+    copy(copy_o, tOrO, tOgO);
   }
 
   // Reduce k-blocks of A and A_sum across WG, if needed.

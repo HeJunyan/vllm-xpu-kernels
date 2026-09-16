@@ -290,9 +290,10 @@ struct FMHAConfig {
       decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
       SubgroupLayoutPV_>;
 
-  template <class Scheduler, bool FixedSingleBatch = false>
+  template <class Scheduler>
   static void run(sycl::queue& queue, const chunk_prefill_args_t& args) {
-    constexpr bool VarLen = !FixedSingleBatch;
+    constexpr bool VarLen = true;
+    // constexpr bool Paged = true;
     cutlass::KernelHardwareInfo hw_info;
 
     using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<VarLen>;
@@ -354,42 +355,13 @@ struct FMHAConfig {
         Scheduler,
         SoftmaxLSE>;
 
-    if constexpr (FixedSingleBatch) {
-      using VarLenKernel = cutlass::fmha::kernel::XeFMHAFwdKernel<
-          cutlass::fmha::kernel::FMHAProblemShape<true>,
-          CollectiveMainloop,
-          CollectiveEpilogue,
-          Scheduler,
-          SoftmaxLSE>;
-      using LaunchKernel =
-          cutlass::fmha::kernel::XeFMHAFwdSingleBatchKernel<
-              FMHAKernel,
-              VarLenKernel>;
-      KernelLauncher<LaunchKernel, true> launcher;
-      launcher.run(queue, args, hw_info);
-    } else {
-      KernelLauncher<FMHAKernel, VarLen> launcher;
-      launcher.run(queue, args, hw_info);
-    }
+    KernelLauncher<FMHAKernel, VarLen> launcher;
+
+    launcher.run(queue, args, hw_info);
   }
 
   static void
   kernel_dispatch(sycl::queue& queue, const chunk_prefill_args_t& args) {
-    constexpr bool FullFp8 =
-        is_any_of_v<ElementQ, float_e4m3_t, float_e5m2_t> &&
-        is_same_v<ElementQ, ElementK> && is_same_v<ElementQ, ElementV>;
-    if constexpr (
-        FullFp8 && VLLM_GRF_SIZE >= 512 && !Paged && !Causal && !Local &&
-        !Sink && !SoftmaxLSE && get<1>(TileShapeOutput{}) == 128) {
-      if (args.is_varlen && args.batch_size == 1 &&
-          args.num_heads_q == args.num_heads_k &&
-          args.cu_seqlens_q != nullptr && args.cu_seqlens_k != nullptr) {
-        using Scheduler =
-            cutlass::fmha::kernel::XeFHMAIndividualTileScheduler<
-                false, true, true, true>;
-        return run<Scheduler, true>(queue, args);
-      }
-    }
     return run<cutlass::fmha::kernel::XeFHMAIndividualTileScheduler<Causal>>(
         queue, args);
   }
