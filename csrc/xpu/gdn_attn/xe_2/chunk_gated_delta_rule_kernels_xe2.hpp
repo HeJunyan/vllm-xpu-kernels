@@ -1947,11 +1947,17 @@ void kernel_launcher(
   // fused kernel loses compute_wu's parallelism and regresses, so keep the two
   // kernels separate there.
   const int compute_wu_wgs = sm_count * MaxThreadsPerSM / size(MMAFwdOSmall{});
-  // Always use the fused chunk_fwd_o_wu kernel: it is the optimized path for
-  // the targeted prefill workloads, where the wg-count heuristic below would
-  // otherwise fall back to the (much slower) separate compute_wu + fwd_o
-  // kernels. The heuristic operands are kept referenced for documentation.
-  const bool fuse_wu = true || (fwd_o_wgs >= compute_wu_wgs);
+  // Fuse compute_wu into fwd_o only once the fused kernel's own launch grid is
+  // at least as wide as compute_wu's persistent grid. The fused kernel loops
+  // the dv tiles internally, so its grid is (batch_size * num_v_heads) work-
+  // groups (not the dv-split-widened fwd_o_wgs). Fusing serializes compute_wu
+  // behind fwd_o's per-batch chunk loop, so it only pays off (one fewer launch,
+  // w/u stay hot in L2) when that fused grid already saturates the GPU. For
+  // small batches (e.g. tp4 batch<8 -> <128 work-groups) the separate
+  // compute_wu + fwd_o path wins: compute_wu keeps its full-width grid and
+  // fwd_o runs a dv-split-widened grid, so idle cores stay fed.
+  const int fused_wgs = batch_size * num_v_heads;
+  const bool fuse_wu = (fused_wgs >= compute_wu_wgs);
 
   if (fuse_wu) {
     // Fused compute_wu + fwd_o. The grid is already large, so use the compact
