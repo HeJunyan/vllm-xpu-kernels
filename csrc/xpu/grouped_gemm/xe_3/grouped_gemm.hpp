@@ -215,7 +215,8 @@ at::Tensor grouped_gemm_func(
        rows_per_expert.data_ptr<int>(),                          \
        int(N),                                                   \
        int(K),                                                   \
-       int(groups)})
+       int(groups),                                              \
+       int64_t(ptr_A.size(0))})
 
 #define CALL_KERNEL_WITH_POLICY(POLICY)                \
   grouped_gemm::kernel_functor<POLICY>(                \

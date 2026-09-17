@@ -482,7 +482,77 @@ struct CollectiveMma<
     constexpr int acc_m0 = decltype(size<0>(accum))::value;
     constexpr int acc_m1 = decltype(size<1>(accum))::value;
     constexpr int sg_m_rows = acc_m0 * acc_m1;
-    for (int k_tile = k_start_idx; k_tile < k_tile_count + k_start_idx;
+    // Fold scales once per GROUP_K instead of once per K tile. The A
+    // and B scales are constant across k_tiles_per_group consecutive K tiles,
+    // so accumulate those tiles into `scaler` and promote them into `accum`
+    // only when the next tile crosses a scale-group boundary.
+    // Hoist the k-invariant scale work out of the mainloop (bounds,
+    // 64-bit address math, group index) and fetch each group's scales one group
+    // ahead of the promotion that consumes them, so those uniform loads retire
+    // under the DPAS tiles already in flight.
+    static_assert(
+        DispatchPolicy::PerTensor || GROUP_K % SG_K == 0,
+        "block-FP8 scale folding needs GROUP_K to be a whole number of "
+        "K tiles");
+    // What k_reload_factor above was meant to be: the number of K tiles one
+    // scale group spans, i.e. the fold interval.
+    constexpr int k_tiles_per_group = cute::max(GROUP_K / SG_K, 1);
+    static_assert(
+        DispatchPolicy::PerTensor || k_tiles_per_group == k_reload_factor,
+        "the scale fold interval must match GROUP_K / BLK_K");
+    const int k_tile_end = k_tile_count + k_start_idx;
+    const int scale_M = shape<0>(mainloop.mA_mkl);
+    const int scale_N = shape<0>(mainloop.mB_nkl);
+    const int scale_K_groups = cute::ceil_div(shape<1>(mainloop.mA_mkl),
+                                             GROUP_K);
+    // Clamp the scale coordinates once instead of predicating every fetch: a
+    // tile that runs past M or N has its accumulator dropped by the epilogue,
+    // and its A rows load as zero, so a clamped finite scale is as good as the
+    // zero the per-row branch used to select -- without the branch.
+    const int scale_rows =
+        cute::min(sg_m_rows, cute::max(1, scale_M - m_coord));
+    const int scale_m_base =
+        cute::max(0, cute::min(m_coord, scale_M - 1)) * scale_K_groups;
+    const int scale_n_base =
+        cute::max(0,
+                  cute::min(int(n_coord / GROUP_K),
+                            cute::ceil_div(scale_N, int(GROUP_K)) - 1)) *
+        scale_K_groups;
+    int k_group_idx = k_start_idx / k_tiles_per_group;
+    int k_group_fill = k_start_idx % k_tiles_per_group;
+    // Pack the A scales across lanes instead of one broadcast scalar
+    // per row. ptr_SA is row-major [M][K/GROUP_K], so the rows this tile needs
+    // for one group are scale_K_groups floats apart -- not contiguous, so not a
+    // vector load, but giving each lane its own row turns 16 scalar 4-byte
+    // sends into one gather, cuts the uniform multiply by scaleB by the same
+    // factor, and shrinks the live scale state from sg_m_rows GRF to
+    // ceil(sg_m_rows / 16).
+    static constexpr int kScaleVecs = cute::ceil_div(sg_m_rows, SubgroupSize);
+    // lane l of packed_scale[v] holds the combined scale of accumulator row
+    // v * SubgroupSize + l. Written a group ahead of the promotion that reads
+    // it, so the loads retire under the DPAS tiles already in flight.
+    float packed_scale[kScaleVecs];
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int scale_lane = int(get_sub_group_local_id());
+    auto fetch_scales = [&](int k_group) {
+      const float scaleB = float(mainloop.ptr_SB[scale_n_base + k_group]);
+      const int base = scale_m_base + k_group;
+      CUTLASS_PRAGMA_UNROLL
+      for (int v = 0; v < kScaleVecs; ++v) {
+        const int row = v * SubgroupSize + scale_lane;
+        // Rows past the tile's valid extent re-read the last valid row, which
+        // is what the scalar walk did by not advancing its offset.
+        const int r = row < scale_rows ? row : scale_rows - 1;
+        packed_scale[v] =
+            float(mainloop.ptr_SA[base + r * scale_K_groups]) * scaleB;
+      }
+    };
+    Tensor scaler = make_tensor_like(accum);
+    if constexpr (!DispatchPolicy::PerTensor) {
+      clear(scaler);
+      fetch_scales(k_group_idx);
+    }
+    for (int k_tile = k_start_idx; k_tile < k_tile_end;
          k_tile++, prefetch_k++) {
       barrier_arrive(barrier_scope);
 
@@ -500,47 +570,45 @@ struct CollectiveMma<
       if constexpr (DispatchPolicy::PerTensor) {
         cute::gemm(tiled_mma, tCrA, tCrB, accum);
       } else {
-        Tensor scaler = make_tensor_like(accum);
-        int M = shape<0>(mainloop.mA_mkl);
-        int K = shape<1>(mainloop.mA_mkl);
-        int K_groups = cute::ceil_div(K, GROUP_K);
-        int n_scale_idx = int(n_coord / 128);
-        int k_group_idx = int(k_tile * SG_K / GROUP_K);
-        float scaleB =
-            n_coord < shape<0>(mainloop.mB_nkl)
-                ? mainloop.ptr_SB[int64_t(n_scale_idx) * K_groups + k_group_idx]
-                : 0.0f;
-        float combined_scale[sg_m_rows];
-        CUTLASS_PRAGMA_UNROLL
-        for (int i1 = 0; i1 < acc_m1; ++i1) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i0 = 0; i0 < acc_m0; ++i0) {
-            int row = i1 * acc_m0 + i0;
-            combined_scale[row] =
-                m_coord + row < M ? mainloop.ptr_SA
-                                            [int64_t(m_coord + row) * K_groups +
-                                             k_group_idx] *
-                                        scaleB
-                                  : 0.0f;
-          }
-        }
-
         cute::gemm(tiled_mma, tCrA, tCrB, scaler);
 
-        CUTLASS_PRAGMA_UNROLL
-        for (int i0 = 0; i0 < acc_m0; ++i0) {
+        // One increment and one compare per K tile; no division, no scale
+        // addressing, nothing else on the DPAS critical path.
+        if (++k_group_fill == k_tiles_per_group || k_tile + 1 == k_tile_end) {
+          // Walk the packed vector outermost so its index is a constant of a
+          // <=5-trip unrolled loop; (row % acc_m0, row / acc_m0) is the same
+          // (i0, i1) pair, visited in the same order as before.
           CUTLASS_PRAGMA_UNROLL
-          for (int i1 = 0; i1 < acc_m1; ++i1) {
-            int row = i1 * acc_m0 + i0;
+          for (int v = 0; v < kScaleVecs; ++v) {
             CUTLASS_PRAGMA_UNROLL
-            for (int i2 = 0; i2 < size<2>(accum); ++i2) {
-              accum[make_coord(i0, i1, i2)] +=
-                  scaler[make_coord(i0, i1, i2)] * combined_scale[row];
+            for (int lane = 0; lane < SubgroupSize; ++lane) {
+              const int row = v * SubgroupSize + lane;
+              if (row >= sg_m_rows) {
+                continue;
+              }
+              // Broadcast this row's scale out of the packed vector: a
+              // register-region read, not a memory message.
+              const float row_scale =
+                  sycl::select_from_group(sg, packed_scale[v], lane);
+              const int i0 = row % acc_m0;
+              const int i1 = row / acc_m0;
+              CUTLASS_PRAGMA_UNROLL
+              for (int i2 = 0; i2 < size<2>(accum); ++i2) {
+                accum[make_coord(i0, i1, i2)] +=
+                    scaler[make_coord(i0, i1, i2)] * row_scale;
+              }
             }
           }
-        }
 
-        clear(scaler);
+          clear(scaler);
+          k_group_fill = 0;
+          // Issue the next group's scale loads now. They are not read until
+          // the next promotion, k_tiles_per_group DPAS tiles from here, which
+          // is what keeps their latency off the critical path.
+          if (++k_group_idx < scale_K_groups) {
+            fetch_scales(k_group_idx);
+          }
+        }
       }
 
       barrier_wait(barrier_scope);

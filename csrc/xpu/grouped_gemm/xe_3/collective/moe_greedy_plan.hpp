@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <limits>
+
+#include "cutlass/fast_math.h"
 
 namespace gpu::cutlass_kernel::grouped_gemm::greedy {
 
@@ -25,6 +29,27 @@ struct MidWindow {
   int hole_min = 0;
   int hole_max = 0;
 };
+
+struct MidOverride {
+  int n, k;
+  MidWindow window;
+};
+
+template <std::size_t Size>
+constexpr MidWindow mid_window_for(
+    MidOverride const (&overrides)[Size], int n, int k, MidWindow fallback) {
+  for (auto entry : overrides)
+    if (entry.n == n && entry.k == k) return entry.window;
+  return fallback;
+}
+
+// The helper store is only reachable when every expert holds the same count
+// above 128, so the packed row total must exceed groups * 128. Testing that
+// host-side bound keeps small and decode-shaped jobs on the smaller
+// native-only kernel instead of the larger combined one.
+constexpr bool may_have_large_uniform_experts(int64_t total_rows, int groups) {
+  return groups > 0 && total_rows > int64_t(groups) * 128;
+}
 
 constexpr Kind classify(int rows, MidWindow window) {
   if (rows <= 0) return Kind::Empty;
@@ -143,7 +168,7 @@ struct Work {
 
 // Counts remain on the device. Each persistent workgroup walks forward
 // through experts once, carrying both packed-row and padded-scale prefixes.
-template <int MidN, int NormalN = 512>
+template <int MidN, int NormalN = 512, bool OptimizeUniform = false>
 class Scheduler {
  public:
   constexpr Scheduler(
@@ -168,10 +193,28 @@ class Scheduler {
     if (uniform_) {
       expert_tiles_ = tiles(rows_);
       total_tiles_ = expert_tiles_ * groups_;
+      full_waves_ = total_tiles_ / workers_;
       if (expert_tiles_ > 0 && (expert_tiles_ & (expert_tiles_ - 1)) == 0) {
         divisor_shift_ = 0;
         for (int64_t q = expert_tiles_; q > 1; q >>= 1)
           ++divisor_shift_;
+      }
+      if constexpr (OptimizeUniform) {
+        // Amortize setup over multiple waves, and retain the wide decoder
+        // when tile indices cannot safely use FastDivmod's signed input.
+        fast_uniform_ = rows_ > 128 && total_tiles_ > workers_ &&
+                        total_tiles_ <= std::numeric_limits<int>::max();
+        if (fast_uniform_) {
+          uniform_kind_ = classify(rows_, window_);
+          expert_divmod_ = cutlass::FastDivmod(int(expert_tiles_));
+          n_divmod_ = cutlass::FastDivmod(int(columns(uniform_kind_)));
+          last_row_tile_ = row_tiles(uniform_kind_, rows_) - 1;
+          last_tile_ = row_tile(uniform_kind_, rows_, last_row_tile_);
+          penultimate_tile_ = row_tile(
+              uniform_kind_,
+              rows_,
+              last_row_tile_ > 0 ? last_row_tile_ - 1 : 0);
+        }
       }
     }
   }
@@ -179,11 +222,34 @@ class Scheduler {
   constexpr Work next() {
     int64_t local = linear_;
     if (uniform_) {
-      const int64_t full_waves = total_tiles_ / workers_;
-      const bool mirror = wave_ >= full_waves / 2 && wave_ < full_waves;
+      const bool mirror = wave_ >= full_waves_ / 2 && wave_ < full_waves_;
       const int source = mirror ? workers_ - 1 - worker_ : worker_;
       local = wave_++ * workers_ + source;
       if (local >= total_tiles_) return {-1, 0, 0, 0, 0, {}};
+      if constexpr (OptimizeUniform) {
+        if (fast_uniform_) {
+          int within, m_tile, n_tile;
+          expert_divmod_(expert_, within, int(local));
+          n_divmod_(m_tile, n_tile, within);
+          const bool mid = uniform_kind_ == Kind::Mid;
+          const int height = mid ? 320 : 256;
+          const RowTile tile =
+              m_tile == last_row_tile_ ? last_tile_
+              : m_tile == last_row_tile_ - 1
+                  ? penultimate_tile_
+                  : RowTile{
+                        mid ? Bucket::Mid320 : Bucket::Normal256,
+                        m_tile * height,
+                        height};
+          return {
+              expert_,
+              rows_,
+              n_tile,
+              int64_t(expert_) * rows_,
+              int64_t(expert_) * padded_rows(rows_),
+              tile};
+        }
+      }
       expert_ =
           int(divisor_shift_ >= 0 ? local >> divisor_shift_
                                   : local / expert_tiles_);
@@ -232,8 +298,13 @@ class Scheduler {
   int rows_ = 0, expert_ = 0, divisor_shift_ = -1;
   int64_t linear_, wave_ = 0;
   int64_t normal_n_tiles_, mid_n_tiles_, tiny_n_tiles_;
-  int64_t expert_tiles_ = 0, total_tiles_ = 0;
+  int64_t expert_tiles_ = 0, total_tiles_ = 0, full_waves_ = 0;
   int64_t row_offset_ = 0, scale_offset_ = 0;
+  bool fast_uniform_ = false;
+  Kind uniform_kind_ = Kind::Empty;
+  int last_row_tile_ = 0;
+  RowTile penultimate_tile_{}, last_tile_{};
+  cutlass::FastDivmod expert_divmod_, n_divmod_;
 };
 
 }  // namespace gpu::cutlass_kernel::grouped_gemm::greedy

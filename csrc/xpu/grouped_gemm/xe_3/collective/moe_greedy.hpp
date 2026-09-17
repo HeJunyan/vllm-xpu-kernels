@@ -9,7 +9,13 @@
 
 namespace gpu::cutlass_kernel::grouped_gemm {
 
-enum class GreedyStore { Native, CheckAlignment, Aligned };
+enum class GreedyStore {
+  Native,
+  CheckAlignment,
+  Aligned,
+  Uniform,
+  NativeNoBias
+};
 
 template <GreedyDtype>
 struct GreedyTraits;
@@ -52,6 +58,10 @@ struct GreedyTilePolicy {
   using ScaleCopyB = MoEGreedyScaleLoad<
       (K + 31) / 32,
       (Dtype == GreedyDtype::W4A8 || N / SGN > 32 ? 64 : 32)>;
+  using DirectStore = std::conditional_t<
+      Dtype == GreedyDtype::MXFP4,
+      cute::C<cute::XeStoreCachePolicy::kWB_UC_UC>,
+      void>;
   using Gemm = typename GenerateGemm<
       typename Base::ElementA,
       typename Base::ElementScaleA,
@@ -86,7 +96,8 @@ CUTLASS_DEVICE void greedy_tile(
     GreedyArguments const& args,
     greedy::Work const& work,
     int thread,
-    char* shared) {
+    char* shared,
+    bool use_direct = true) {
   using Base = typename Policy::Base;
   using Mainloop = typename Policy::Mainloop;
   using Epilogue = typename Policy::Epilogue;
@@ -115,13 +126,14 @@ CUTLASS_DEVICE void greedy_tile(
   auto mainloop =
       Mainloop::Base::to_underlying_arguments(problem, base_args, nullptr);
 
-  if constexpr (Direct != GreedyStore::Native) {
-    // Retain the tuned MXFP8 application mainloop for aligned, bias-free
-    // tiles. Padded4 expert bases that are not 64-byte aligned use the
-    // native collective's safe scale copies below.
-    if (Direct == GreedyStore::Aligned ||
-        ((reinterpret_cast<uintptr_t>(base_args.ptr_SA) & 63) == 0 &&
-         (reinterpret_cast<uintptr_t>(base_args.ptr_SB) & 63) == 0)) {
+  if constexpr (
+      Direct != GreedyStore::Native && Direct != GreedyStore::NativeNoBias) {
+    // The application helper requires genuinely aligned scale bases.
+    // Preserve safe native loads for unaligned padded4 expert segments.
+    if (use_direct &&
+        (Direct == GreedyStore::Aligned ||
+         ((reinterpret_cast<uintptr_t>(base_args.ptr_SA) & 63) == 0 &&
+          (reinterpret_cast<uintptr_t>(base_args.ptr_SB) & 63) == 0))) {
       auto input_view = [](auto const& tensor) {
         using Element = cute::remove_const_t<
             typename cute::remove_cvref_t<decltype(tensor)>::element_type>;
@@ -136,7 +148,12 @@ CUTLASS_DEVICE void greedy_tile(
               row * args.n),
           make_shape(m, args.n),
           make_stride(args.n, _1{}));
-      MoE::moe_gemm_scaled_greedy<1, 32, void, void, void>(
+      MoE::moe_gemm_scaled_greedy<
+          1,
+          32,
+          void,
+          void,
+          typename Policy::DirectStore>(
           input_view(mainloop.mA_mkl(_, _, 0)),
           input_view(mainloop.mB_nkl(_, _, 0)),
           input_view(mainloop.mAscale),
@@ -206,6 +223,11 @@ template <
     GreedyStore Direct = GreedyStore::Native>
 void launch_greedy_config(sycl::queue& stream, GreedyArguments args) {
   constexpr int K = GreedyTraits<Dtype>::TileK;
+  constexpr bool OptimizeUniform =
+      (Dtype == GreedyDtype::MXFP8 || Dtype == GreedyDtype::MXFP4) &&
+      Direct != GreedyStore::Native;
+  constexpr GreedyStore TinyDirect =
+      Direct == GreedyStore::Uniform ? GreedyStore::Native : Direct;
   // Wider tiles spill with the mixed-input and FP32 block-scale collectives.
   constexpr int NormalN = GreedyTraits<Dtype>::NormalN;
   using T8 = GreedyTilePolicy<Dtype, 8, 512, TinyK, true>;
@@ -239,6 +261,12 @@ void launch_greedy_config(sycl::queue& stream, GreedyArguments args) {
     // Retain the SYCL-TLA window for the previously tuned 1536x1536 cell.
     if (args.n == 1536 && args.k == 1536) window = {128, 576};
   }
+  const auto uniform_window = [&] {
+    if constexpr (OptimizeUniform)
+      return GreedyTraits<Dtype>::uniform_mid_window(args.n, args.k, window);
+    else
+      return window;
+  }();
   const auto device = stream.get_device();
   const int workers =
       device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
@@ -264,14 +292,16 @@ void launch_greedy_config(sycl::queue& stream, GreedyArguments args) {
             same &= args.counts[expert] == first;
           }
           const bool uniform = sycl::all_of_group(subgroup, same);
-          greedy::Scheduler<MidN, NormalN> scheduler(
+          greedy::Scheduler<MidN, NormalN, OptimizeUniform> scheduler(
               args.counts,
               args.groups,
               args.n,
-              window,
+              uniform && first > 128 ? uniform_window : window,
               int(item.get_group_linear_id()),
               workers,
               uniform);
+          const bool use_direct =
+              Direct != GreedyStore::Uniform || (uniform && first > 128);
           char* shared =
               storage.template get_multi_ptr<sycl::access::decorated::no>()
                   .get();
@@ -280,34 +310,40 @@ void launch_greedy_config(sycl::queue& stream, GreedyArguments args) {
             const int thread = int(item.get_local_linear_id());
             switch (work.tile.bucket) {
               case greedy::Bucket::Tiny8:
-                greedy_tile<T8, Direct>(args, work, thread, shared);
+                greedy_tile<T8, TinyDirect>(args, work, thread, shared);
                 break;
               case greedy::Bucket::Tiny32:
-                greedy_tile<T32, Direct>(args, work, thread, shared);
+                greedy_tile<T32, TinyDirect>(args, work, thread, shared);
                 break;
               case greedy::Bucket::Tiny64:
-                greedy_tile<T64, Direct>(args, work, thread, shared);
+                greedy_tile<T64, TinyDirect>(args, work, thread, shared);
                 break;
               case greedy::Bucket::Tiny128:
-                greedy_tile<T128, Direct>(args, work, thread, shared);
+                greedy_tile<T128, TinyDirect>(args, work, thread, shared);
                 break;
               case greedy::Bucket::Normal32:
-                greedy_tile<N32, Direct>(args, work, thread, shared);
+                greedy_tile<N32, Direct>(
+                    args, work, thread, shared, use_direct);
                 break;
               case greedy::Bucket::Normal192:
-                greedy_tile<N192, Direct>(args, work, thread, shared);
+                greedy_tile<N192, Direct>(
+                    args, work, thread, shared, use_direct);
                 break;
               case greedy::Bucket::Normal256:
-                greedy_tile<N256, Direct>(args, work, thread, shared);
+                greedy_tile<N256, Direct>(
+                    args, work, thread, shared, use_direct);
                 break;
               case greedy::Bucket::Mid192:
-                greedy_tile<M192, Direct>(args, work, thread, shared);
+                greedy_tile<M192, Direct>(
+                    args, work, thread, shared, use_direct);
                 break;
               case greedy::Bucket::Mid256:
-                greedy_tile<M256, Direct>(args, work, thread, shared);
+                greedy_tile<M256, Direct>(
+                    args, work, thread, shared, use_direct);
                 break;
               case greedy::Bucket::Mid320:
-                greedy_tile<M320, Direct>(args, work, thread, shared);
+                greedy_tile<M320, Direct>(
+                    args, work, thread, shared, use_direct);
                 break;
             }
           }
@@ -343,6 +379,19 @@ void launch_greedy(sycl::queue& stream, GreedyArguments args) {
             stream, args);
         return;
       }
+      // Mixing both MidN384 mainloops introduces private scratch storage.
+      launch_greedy_config<Dtype, 384, K, GreedyStore::NativeNoBias>(
+          stream, args);
+      return;
+    }
+  }
+  if constexpr (Dtype == GreedyDtype::MXFP4) {
+    if (!args.bias &&
+        greedy::may_have_large_uniform_experts(args.total_rows, args.groups)) {
+      // Match the benchmark mainloop/store only for large uniform experts;
+      // retain native execution for small, nonuniform, or unaligned jobs.
+      launch_greedy_config<Dtype, MidN, K, GreedyStore::Uniform>(stream, args);
+      return;
     }
   }
   if constexpr (AllowMid384) {

@@ -17,6 +17,9 @@ struct GreedyArguments {
   void* d;
   const int* counts;
   int n, k, groups;
+  // Per-expert counts stay on the device, but the packed row total is known
+  // on the host and bounds the largest possible uniform expert.
+  int64_t total_rows;
 };
 
 template <GreedyDtype Dtype>
