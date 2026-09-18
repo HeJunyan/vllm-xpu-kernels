@@ -862,6 +862,211 @@ _QWEN3_30B_A3B_PROFILE = {
 }
 
 # ---------------------------------------------------------------------------
+# Qwen3-32B (Qwen/Qwen3-32B) — dense
+#   - Qwen3 dense architecture, SiluAndMul (SwiGLU), RMSNorm, QK-Norm
+#   - hidden_size=5120, intermediate_size=25600
+#   - 64 attention heads, 8 KV heads, head_dim=128
+#   - neox-style RoPE; not MoE
+#
+# Target workload this profile covers (do not reuse 30B-A3B M values):
+#   max_num_batched_tokens=4096, isl/osl=3500/1500, max_concurrency=1 and 2
+#   Token dim M in {1, 2, 3500, 4096}:
+#     decode c1 / decode c2 / full prefill (isl) / batched-token cap
+# GEMM (m, n, k) follows test_mxfp8_gemm: C[m,n] = A[m,k] @ W[n,k].T
+#   shapes taken from Qwen3-32B prefill/decode traces, not from 30B MoE.
+# ---------------------------------------------------------------------------
+QWEN3_32B_HEAD_DIM = 128
+QWEN3_32B_NUM_HEADS = 64
+QWEN3_32B_NUM_KV_HEADS = 8
+# 128 * (8*2 + 64) = 10240
+QWEN3_32B_QKV_SIZE = (
+    QWEN3_32B_HEAD_DIM *
+    (QWEN3_32B_NUM_KV_HEADS * 2 + QWEN3_32B_NUM_HEADS)
+)
+QWEN3_32B_HIDDEN_SIZE = 5120
+QWEN3_32B_INTERMEDIATE_SIZE = 25600
+# decode c1 / decode c2 / prefill c1 (isl) / batched-token cap
+QWEN3_32B_NUM_TOKENS = [1, 2, 3500, 4096]
+_QWEN3_32B_PROFILE = {
+    # ---- Activation: SiluAndMul (SwiGLU), d = intermediate_size ----
+    "tests/test_activation.py": {
+        "test_act_and_mul": {
+            "activation": ["silu_and_mul"],
+            "num_tokens": QWEN3_32B_NUM_TOKENS,
+            "d": [QWEN3_32B_INTERMEDIATE_SIZE],
+        },
+        "test_activation": None,
+    },
+    # ---- RMSNorm (hidden_size for pre/post, head_dim for q_norm/k_norm) ----
+    "tests/test_layernorm.py": {
+        "test_rms_norm": {
+            "num_tokens": QWEN3_32B_NUM_TOKENS,
+            "hidden_size": [QWEN3_32B_HIDDEN_SIZE, QWEN3_32B_HEAD_DIM],
+        },
+    },
+    # ---- Rotary Embedding: neox style ----
+    "tests/test_rotary_embedding.py": {
+        "test_rotary_embedding_opcheck": {
+            "is_neox_style": [True],
+            "max_position": [8192],
+            "head_size": [QWEN3_32B_HEAD_DIM],
+            "seq_len": QWEN3_32B_NUM_TOKENS,
+        },
+    },
+    # ---- KV Cache: GQA 64q/8kv ----
+    "tests/test_cache.py": {
+        "test_reshape_and_cache_flash": {
+            "num_tokens": QWEN3_32B_NUM_TOKENS,
+            "num_heads": [QWEN3_32B_NUM_KV_HEADS],
+            "head_size": [QWEN3_32B_HEAD_DIM],
+            "block_size": [64],
+            "num_blocks": [128],
+            "dtype": [torch.bfloat16],
+        },
+    },
+    # ---- MXFP8 GEMM: qkv / o_proj / gate_up / down (dense FFN) ----
+    "tests/test_fp8_gemm_onednn.py": {
+        "test_mxfp8_gemm": {
+            "mnk_factors": [
+                # qkv_proj: [M, 5120] @ [5120, 10240]
+                (1, QWEN3_32B_QKV_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                (2, QWEN3_32B_QKV_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                (3500, QWEN3_32B_QKV_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                (4096, QWEN3_32B_QKV_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                # o_proj: [M, 8192] @ [8192, 5120]
+                (
+                    1,
+                    QWEN3_32B_HIDDEN_SIZE,
+                    QWEN3_32B_HEAD_DIM * QWEN3_32B_NUM_HEADS,
+                ),
+                (
+                    2,
+                    QWEN3_32B_HIDDEN_SIZE,
+                    QWEN3_32B_HEAD_DIM * QWEN3_32B_NUM_HEADS,
+                ),
+                (
+                    3500,
+                    QWEN3_32B_HIDDEN_SIZE,
+                    QWEN3_32B_HEAD_DIM * QWEN3_32B_NUM_HEADS,
+                ),
+                (
+                    4096,
+                    QWEN3_32B_HIDDEN_SIZE,
+                    QWEN3_32B_HEAD_DIM * QWEN3_32B_NUM_HEADS,
+                ),
+                # gate_up_proj: [M, 5120] @ [5120, 51200]
+                (1, 2 * QWEN3_32B_INTERMEDIATE_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                (2, 2 * QWEN3_32B_INTERMEDIATE_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                (3500, 2 * QWEN3_32B_INTERMEDIATE_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                (4096, 2 * QWEN3_32B_INTERMEDIATE_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                # down_proj: [M, 25600] @ [25600, 5120]
+                (1, QWEN3_32B_HIDDEN_SIZE, QWEN3_32B_INTERMEDIATE_SIZE),
+                (2, QWEN3_32B_HIDDEN_SIZE, QWEN3_32B_INTERMEDIATE_SIZE),
+                (3500, QWEN3_32B_HIDDEN_SIZE, QWEN3_32B_INTERMEDIATE_SIZE),
+                (4096, QWEN3_32B_HIDDEN_SIZE, QWEN3_32B_INTERMEDIATE_SIZE),
+            ],
+        },
+        # block_fp8 (recipe 128x128) for the same four projections
+        "test_fp8_gemm_per_block": {
+            "mnk_factors": [
+                # qkv_proj
+                (1, QWEN3_32B_QKV_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                (2, QWEN3_32B_QKV_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                (3500, QWEN3_32B_QKV_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                (4096, QWEN3_32B_QKV_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                # o_proj
+                (
+                    1,
+                    QWEN3_32B_HIDDEN_SIZE,
+                    QWEN3_32B_HEAD_DIM * QWEN3_32B_NUM_HEADS,
+                ),
+                (
+                    2,
+                    QWEN3_32B_HIDDEN_SIZE,
+                    QWEN3_32B_HEAD_DIM * QWEN3_32B_NUM_HEADS,
+                ),
+                (
+                    3500,
+                    QWEN3_32B_HIDDEN_SIZE,
+                    QWEN3_32B_HEAD_DIM * QWEN3_32B_NUM_HEADS,
+                ),
+                (
+                    4096,
+                    QWEN3_32B_HIDDEN_SIZE,
+                    QWEN3_32B_HEAD_DIM * QWEN3_32B_NUM_HEADS,
+                ),
+                # gate_up_proj
+                (1, 2 * QWEN3_32B_INTERMEDIATE_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                (2, 2 * QWEN3_32B_INTERMEDIATE_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                (3500, 2 * QWEN3_32B_INTERMEDIATE_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                (4096, 2 * QWEN3_32B_INTERMEDIATE_SIZE, QWEN3_32B_HIDDEN_SIZE),
+                # down_proj
+                (1, QWEN3_32B_HIDDEN_SIZE, QWEN3_32B_INTERMEDIATE_SIZE),
+                (2, QWEN3_32B_HIDDEN_SIZE, QWEN3_32B_INTERMEDIATE_SIZE),
+                (3500, QWEN3_32B_HIDDEN_SIZE, QWEN3_32B_INTERMEDIATE_SIZE),
+                (4096, QWEN3_32B_HIDDEN_SIZE, QWEN3_32B_INTERMEDIATE_SIZE),
+            ],
+            "batch": [1],
+            "group_size": [128],
+            "use_ue8m0": [False],
+        },
+    },
+    # ---- Flash Attention: GQA 64q/8kv ----
+    "tests/flash_attn/test_flash_attn_varlen_func.py": {
+        "test_varlen_with_paged_kv": {
+            "seq_lens": [
+                # single-seq full prefill: isl=3500 <= max_num_batched_tokens
+                # (c2 can also issue this when one seq takes the whole step)
+                [(3500, 3500)],
+            ],
+            "num_heads": [(QWEN3_32B_NUM_HEADS, QWEN3_32B_NUM_KV_HEADS)],
+            "head_size": [QWEN3_32B_HEAD_DIM],
+            "num_blocks": [2048],
+            "window_size": [(-1, -1)],
+            "is_paged": [True],
+        },
+        "test_decode_with_paged_kv": {
+            "seq_lens": [
+                # decode start (context = isl)
+                [(1, 3500)],
+                [(1, 3500)] * 2,
+                # mid-decode near the batched-token cap
+                [(1, 4096)],
+                [(1, 4096)] * 2,
+                # decode end (context = isl+osl = 5000)
+                [(1, 5000)],
+                [(1, 5000)] * 2,
+            ],
+            "num_heads": [(QWEN3_32B_NUM_HEADS, QWEN3_32B_NUM_KV_HEADS)],
+            "head_size": [QWEN3_32B_HEAD_DIM],
+            "num_blocks": [2048],
+            "window_size": [(-1, -1)],
+        },
+        "test_decode_with_paged_kv_mla": None,  # Not MLA
+    },
+    # ---- Merge attention states ----
+    "tests/test_merge_attn_states.py": {
+        "test_merge_attn_states": {
+            "num_tokens": QWEN3_32B_NUM_TOKENS,
+            "num_query_heads": [QWEN3_32B_NUM_HEADS],
+            "head_size": [QWEN3_32B_HEAD_DIM],
+            "output_dtype": [torch.bfloat16],
+        },
+    },
+    # ---- FP8 / MXFP8 quantization (param names must match the test) ----
+    "tests/test_fp8_quant.py": {
+        "test_per_block_mxfp8_quant": {
+            "num_tokens_block_quant": QWEN3_32B_NUM_TOKENS,
+            # hidden before qkv/gate_up; silu output before down_proj
+            "hidden_size_block_quant": [
+                QWEN3_32B_HIDDEN_SIZE,
+                QWEN3_32B_INTERMEDIATE_SIZE,
+            ],
+        },
+    },
+}
+
+# ---------------------------------------------------------------------------
 # Qwen3-235B-A22B (Qwen/Qwen3-235B-A22B-Instruct-2507)
 #   - Qwen3MoE architecture, SiluAndMul (SwiGLU), RMSNorm
 #   - hidden_size=4096, intermediate_size=12288, moe_intermediate_size=1536
@@ -1137,6 +1342,7 @@ ONDEMAND_PROFILES = {
     "llama4": _LLAMA4_PROFILE,
     "deepseek": _DEEPSEEK_PROFILE,
     "qwen3_30b_a3b": _QWEN3_30B_A3B_PROFILE,
+    "qwen3_32b": _QWEN3_32B_PROFILE,
     "qwen3_235b_a22b": _QWEN3_235B_A22B_PROFILE,
     "wan": _WAN_PROFILE,
 }

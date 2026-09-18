@@ -33,7 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = REPO_ROOT / "tests"
 
 # Scopes used for PO test generation
-PO_SCOPES = ["ondemand:llama3", "ondemand:qwen3_30b_a3b", "ondemand:qwen3_235b_a22b", "ondemand:wan"]
+PO_SCOPES = ["ondemand:llama3", "ondemand:qwen3_30b_a3b", "ondemand:qwen3_32b", "ondemand:qwen3_235b_a22b", "ondemand:wan"]
 
 # Test categories for grouping in output
 CATEGORIES = [
@@ -470,7 +470,7 @@ def main():
                              "(default: 0,1,3)")
     parser.add_argument("--scopes", type=str, default=None,
                         help="Comma-separated ondemand scopes for PO "
-                             "(default: llama3,qwen3_30b_a3b,qwen3_235b_a22b)")
+                             "(default: llama3,qwen3_30b_a3b,qwen3_32b,qwen3_235b_a22b)")
 
     args = parser.parse_args()
 
