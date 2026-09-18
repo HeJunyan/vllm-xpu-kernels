@@ -273,27 +273,80 @@ void launch_greedy_config(sycl::queue& stream, GreedyArguments args) {
       device
           .get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
   TORCH_CHECK(workers > 0, "Cannot determine the Xe3 greedy persistent grid");
+  const size_t plan_offset = (shared_size + 15) & ~size_t(15);
+  const bool fast_decode = greedy::is_decode_shape(args.total_rows);
+  const size_t shared_bytes =
+      plan_offset + (fast_decode ? greedy::decode_shared_bytes(args.groups)
+                                 : greedy::plan_bytes(args.groups));
   namespace oneapi = sycl::ext::oneapi::experimental;
   namespace intel = sycl::ext::intel::experimental;
   const oneapi::properties properties{
       oneapi::sub_group_size<16>, intel::grf_size<VLLM_GRF_SIZE>};
   stream.submit([&](sycl::handler& handler) {
-    sycl::local_accessor<char, 1> storage(sycl::range<1>(shared_size), handler);
+    sycl::local_accessor<char, 1> storage(sycl::range<1>(shared_bytes), handler);
     handler.parallel_for<GreedyKernel<Dtype, MidN, TinyK, Direct>>(
         sycl::nd_range<3>({1, 1, size_t(workers) * 512}, {1, 1, 512}),
         properties,
         [=](sycl::nd_item<3> item) {
           const auto subgroup = item.get_sub_group();
-          const int first = args.counts[0];
+          char* shared =
+              storage.template get_multi_ptr<sycl::access::decorated::no>()
+                  .get();
+          const int thread = int(item.get_local_linear_id());
+          // The plan scratch follows the epilogue storage in SLM. Decode uses
+          // a scheduler that knows every expert is Tiny, so it needs neither
+          // the tile prefix nor the search structure the general path builds.
+          if (fast_decode) {
+            char* base = shared + plan_offset;
+            int* records = reinterpret_cast<int*>(
+                base + greedy::decode_records_offset(args.groups));
+            greedy::build_decode_plan(
+                greedy::plan_storage(base, args.groups),
+                records,
+                args.counts,
+                args.groups,
+                item);
+            greedy::DecodeScheduler scheduler(
+                records,
+                args.groups,
+                args.n,
+                int(item.get_group_linear_id()),
+                workers);
+            for (auto work = scheduler.next(); work.valid();
+                 work = scheduler.next()) {
+              switch (work.tile.bucket) {
+                case greedy::Bucket::Tiny8:
+                  greedy_tile<T8, TinyDirect>(args, work, thread, shared);
+                  break;
+                case greedy::Bucket::Tiny32:
+                  greedy_tile<T32, TinyDirect>(args, work, thread, shared);
+                  break;
+                case greedy::Bucket::Tiny64:
+                  greedy_tile<T64, TinyDirect>(args, work, thread, shared);
+                  break;
+                default:
+                  greedy_tile<T128, TinyDirect>(args, work, thread, shared);
+                  break;
+              }
+            }
+            return;
+          }
+          greedy::PlanStorage plan =
+              greedy::plan_storage(shared + plan_offset, args.groups);
+          greedy::build_plan<MidN, NormalN>(
+              plan, args.counts, args.groups, args.n, window, item);
+          const int* counts = args.counts;
+          const int first = counts[0];
           bool same = true;
           for (int64_t expert = subgroup.get_local_linear_id();
                expert < args.groups;
                expert += 16) {
-            same &= args.counts[expert] == first;
+            same &= counts[expert] == first;
           }
           const bool uniform = sycl::all_of_group(subgroup, same);
           greedy::Scheduler<MidN, NormalN, OptimizeUniform> scheduler(
-              args.counts,
+              plan,
+              counts,
               args.groups,
               args.n,
               uniform && first > 128 ? uniform_window : window,
@@ -302,12 +355,8 @@ void launch_greedy_config(sycl::queue& stream, GreedyArguments args) {
               uniform);
           const bool use_direct =
               Direct != GreedyStore::Uniform || (uniform && first > 128);
-          char* shared =
-              storage.template get_multi_ptr<sycl::access::decorated::no>()
-                  .get();
           for (auto work = scheduler.next(); work.valid();
                work = scheduler.next()) {
-            const int thread = int(item.get_local_linear_id());
             switch (work.tile.bucket) {
               case greedy::Bucket::Tiny8:
                 greedy_tile<T8, TinyDirect>(args, work, thread, shared);

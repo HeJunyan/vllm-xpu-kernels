@@ -7,6 +7,8 @@
 
 #include "cutlass/fast_math.h"
 
+#include "../greedy_dispatch.hpp"
+
 namespace gpu::cutlass_kernel::grouped_gemm::greedy {
 
 enum class Kind { Empty, Tiny, Mid, Normal };
@@ -166,12 +168,280 @@ struct Work {
   constexpr bool valid() const { return expert >= 0; }
 };
 
-// Counts remain on the device. Each persistent workgroup walks forward
-// through experts once, carrying both packed-row and padded-scale prefixes.
+// Per-workgroup scheduling plan, staged in SLM. The prefix arrays hold
+// groups + 1 entries so that entry e is the total contributed by experts
+// below e.
+//
+// The entries are 32-bit because this is SLM on a persistent grid, where extra
+// shared memory per workgroup costs occupancy for the whole kernel; halving the
+// width measurably recovers throughput on shapes that issue many tiles. An
+// expert's row count is the step in the row prefix, so the counts are not
+// staged separately.
+struct PlanStorage {
+  int32_t* tile_prefix;
+  int32_t* row_prefix;
+  int32_t* scale_prefix;
+};
+
+constexpr std::size_t plan_bytes(int groups) {
+  return 3 * (std::size_t(groups) + 1) * sizeof(int32_t);
+}
+
+inline PlanStorage plan_storage(char* base, int groups) {
+  auto* p = reinterpret_cast<int32_t*>(base);
+  const std::size_t stride = std::size_t(groups) + 1;
+  return {p, p + stride, p + 2 * stride};
+}
+
+template <int MidN, int NormalN>
+constexpr int64_t n_tiles_for(Kind kind, int n) {
+  if (kind == Kind::Tiny) return (int64_t(n) + 511) / 512;
+  return kind == Kind::Mid ? (int64_t(n) + MidN - 1) / MidN
+                           : (int64_t(n) + NormalN - 1) / NormalN;
+}
+
+template <int MidN, int NormalN>
+constexpr int64_t tiles_for(int rows, MidWindow window, int n) {
+  const Kind kind = classify(rows, window);
+  return int64_t(row_tiles(kind, rows)) * n_tiles_for<MidN, NormalN>(kind, n);
+}
+
+// Build the plan cooperatively across the whole workgroup.
+//
+// The scheduler used to find the expert owning a tile by walking the counts
+// forward, a serial chain of dependent global loads run in every workgroup.
+// At 128 experts that measured ~15us, independent of N, K and the row count.
+//
+// The scan is Hillis-Steele over SLM. Two cheaper-looking shapes measured
+// worse: confining it to one subgroup serialises it and lost 8 to 12%, and
+// scanning per subgroup then adding the preceding totals makes every work item
+// walk up to 31 totals out of SLM and lost a further 5%. Barriers are not the
+// cost here; keeping every work item busy is.
+//
+// Workgroups are 512 wide and the expert count stays well below that, so each
+// work item owns at most one entry. The serial fallback guards the rest.
+template <int MidN, int NormalN, typename Item>
+void build_plan(
+    PlanStorage plan,
+    const int* counts,
+    int groups,
+    int n,
+    MidWindow window,
+    Item item) {
+  const int lid = int(item.get_local_linear_id());
+  const int lrange = int(item.get_local_range().size());
+  const int entries = groups + 1;
+  if (entries > lrange) {
+    if (lid == 0) {
+      int32_t tile = 0, row = 0, scale = 0;
+      plan.tile_prefix[0] = 0;
+      plan.row_prefix[0] = 0;
+      plan.scale_prefix[0] = 0;
+      for (int expert = 0; expert < groups; ++expert) {
+        const int rows = counts[expert];
+        tile += int32_t(tiles_for<MidN, NormalN>(rows, window, n));
+        row += int32_t(rows);
+        scale += int32_t(padded_rows(rows));
+        plan.tile_prefix[expert + 1] = tile;
+        plan.row_prefix[expert + 1] = row;
+        plan.scale_prefix[expert + 1] = scale;
+      }
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    return;
+  }
+  // Entry 0 is the empty prefix, so work item i carries expert i - 1.
+  const bool owns = lid < entries;
+  const bool live = owns && lid > 0;
+  const int rows = live ? counts[lid - 1] : 0;
+  if (owns) {
+    plan.tile_prefix[lid] =
+        live ? int32_t(tiles_for<MidN, NormalN>(rows, window, n)) : 0;
+    plan.row_prefix[lid] = live ? int32_t(rows) : 0;
+    plan.scale_prefix[lid] = live ? int32_t(padded_rows(rows)) : 0;
+  }
+  item.barrier(sycl::access::fence_space::local_space);
+  for (int offset = 1; offset < entries; offset <<= 1) {
+    const bool add = owns && lid >= offset;
+    int32_t tile = 0, row = 0, scale = 0;
+    if (add) {
+      tile = plan.tile_prefix[lid - offset];
+      row = plan.row_prefix[lid - offset];
+      scale = plan.scale_prefix[lid - offset];
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (add) {
+      plan.tile_prefix[lid] += tile;
+      plan.row_prefix[lid] += row;
+      plan.scale_prefix[lid] += scale;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+  }
+}
+
+// The compacted plan is only valid when no expert can exceed a single row
+// tile, which is exactly the 128-row ceiling of Kind::Tiny. Every non-empty
+// expert then owns one row tile and the same number of column tiles, so a
+// tile index maps to an active-expert index by a single division.
+constexpr int kFastDecodeMaxRows = 128;
+
+// Depends only on the packed row total, so the schedule is chosen before
+// launch. That is a function of the captured shape alone, so under a graph it
+// resolves once at capture.
+constexpr bool is_decode_shape(int64_t total_rows) {
+  return total_rows > 0 && total_rows <= kFastDecodeMaxRows;
+}
+
+// One record per active expert, in expert order, plus the active count in the
+// slot past the last expert. Four int32 keeps a record a single 16-byte load.
+struct PlanRecord {
+  int expert;
+  int row_offset;
+  int scale_offset;
+  int rows;
+};
+
+// The records follow the scan scratch, aligned so that a record is a single
+// aligned 16-byte load.
+constexpr std::size_t decode_records_offset(int groups) {
+  return (plan_bytes(groups) + 15) & ~std::size_t(15);
+}
+
+constexpr std::size_t decode_shared_bytes(int groups) {
+  return decode_records_offset(groups) +
+         4 * (std::size_t(groups) + 1) * sizeof(int32_t);
+}
+
+// Build the compacted decode plan cooperatively, in SLM, inside the GEMM.
+//
+// A pre-pass kernel would compute this once instead of once per workgroup, but
+// decode is captured into a graph, so every launch becomes a node replayed for
+// each of the model's grouped GEMMs and costs more than the scan it saves.
+//
+// `scan` carries the prefixes; tile_prefix holds the active indicator here,
+// since under the decode ceiling tile counts are uniform and never consulted.
+template <typename Item>
+CUTLASS_DEVICE void build_decode_plan(
+    PlanStorage scan,
+    int* records,
+    const int* counts,
+    int groups,
+    Item item) {
+  const int lid = int(item.get_local_linear_id());
+  const int lrange = int(item.get_local_range().size());
+  const int entries = groups + 1;
+  if (entries > lrange) {
+    if (lid == 0) {
+      int32_t row = 0, scale = 0, active = 0;
+      for (int expert = 0; expert < groups; ++expert) {
+        const int rows = counts[expert];
+        if (rows > 0) {
+          int* record = records + 4 * active;
+          record[0] = expert;
+          record[1] = row;
+          record[2] = scale;
+          record[3] = rows;
+          ++active;
+        }
+        row += int32_t(rows);
+        scale += int32_t(padded_rows(rows));
+      }
+      records[4 * groups] = active;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    return;
+  }
+  // Entry 0 is the empty prefix, so work item i carries expert i - 1 and the
+  // scan leaves each expert's exclusive prefix in its own slot.
+  const bool owns = lid < entries;
+  const bool live = owns && lid > 0;
+  const int rows = live ? counts[lid - 1] : 0;
+  if (owns) {
+    scan.tile_prefix[lid] = rows > 0 ? 1 : 0;
+    scan.row_prefix[lid] = int32_t(rows);
+    scan.scale_prefix[lid] = int32_t(padded_rows(rows));
+  }
+  item.barrier(sycl::access::fence_space::local_space);
+  for (int offset = 1; offset < entries; offset <<= 1) {
+    const bool add = owns && lid >= offset;
+    int32_t rank = 0, row = 0, scale = 0;
+    if (add) {
+      rank = scan.tile_prefix[lid - offset];
+      row = scan.row_prefix[lid - offset];
+      scale = scan.scale_prefix[lid - offset];
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (add) {
+      scan.tile_prefix[lid] += rank;
+      scan.row_prefix[lid] += row;
+      scan.scale_prefix[lid] += scale;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+  }
+  // Slot lid - 1 now holds the totals over experts below lid - 1, which is
+  // exactly this expert's rank among the active ones and its two offsets.
+  if (live && rows > 0) {
+    int* record = records + 4 * scan.tile_prefix[lid - 1];
+    record[0] = lid - 1;
+    record[1] = scan.row_prefix[lid - 1];
+    record[2] = scan.scale_prefix[lid - 1];
+    record[3] = rows;
+  }
+  if (lid == 0) records[4 * groups] = scan.tile_prefix[entries - 1];
+  item.barrier(sycl::access::fence_space::local_space);
+}
+
+// Decode-only scheduler. Under the 128-row ceiling every non-empty expert is
+// Kind::Tiny, owns exactly one row tile and contributes the same number of
+// column tiles, so scheduling collapses to one division per tile and none of
+// the general scheduler's search or uniform state is needed.
+class DecodeScheduler {
+ public:
+  DecodeScheduler(
+      const int* plan,
+      int groups,
+      int n,
+      int worker,
+      int workers)
+      : plan_(reinterpret_cast<const PlanRecord*>(plan)),
+        n_tiles_(int((int64_t(n) + 511) / 512)),
+        workers_(workers),
+        linear_(worker) {
+    total_tiles_ = int64_t(plan[4 * groups]) * n_tiles_;
+  }
+
+  Work next() {
+    const int64_t global = linear_;
+    if (global >= total_tiles_) return {-1, 0, 0, 0, 0, {}};
+    linear_ = global + workers_;
+    const int active = int(global) / n_tiles_;
+    const int n_tile = int(global) - active * n_tiles_;
+    const PlanRecord record = plan_[active];
+    return {
+        record.expert,
+        record.rows,
+        n_tile,
+        int64_t(record.row_offset),
+        int64_t(record.scale_offset),
+        row_tile(Kind::Tiny, record.rows, 0)};
+  }
+
+ private:
+  const PlanRecord* plan_;
+  int n_tiles_;
+  int workers_;
+  int64_t linear_;
+  int64_t total_tiles_;
+};
+
+// Counts remain on the device, staged into SLM by build_plan. Tiles are
+// assigned from a workgroup-wide prefix sum, so finding the expert that owns
+// a tile is a binary search over SLM rather than a walk over global memory.
 template <int MidN, int NormalN = 512, bool OptimizeUniform = false>
 class Scheduler {
  public:
   constexpr Scheduler(
+      PlanStorage plan,
       const int* counts,
       int groups,
       int n,
@@ -180,6 +450,9 @@ class Scheduler {
       int workers,
       bool uniform)
       : counts_(counts),
+        tile_prefix_(plan.tile_prefix),
+        row_prefix_(plan.row_prefix),
+        scale_prefix_(plan.scale_prefix),
         groups_(groups),
         window_(window),
         worker_(worker),
@@ -190,7 +463,27 @@ class Scheduler {
     tiny_n_tiles_ = (int64_t(n) + 511) / 512;
     mid_n_tiles_ = (int64_t(n) + MidN - 1) / MidN;
     rows_ = counts_[0];
-    if (uniform_) {
+    if (!uniform_) {
+      total_tiles_ = tile_prefix_[groups_];
+      // Resolve the first tile here so next() starts with a valid cached
+      // expert, seeding the lower bound for its searches.
+      if (linear_ < total_tiles_) {
+        int lo = 0, hi = groups_;
+        while (lo + 1 < hi) {
+          const int mid = (lo + hi) >> 1;
+          if (tile_prefix_[mid] <= linear_)
+            lo = mid;
+          else
+            hi = mid;
+        }
+        expert_ = lo;
+        row_offset_ = row_prefix_[lo];
+        scale_offset_ = scale_prefix_[lo];
+        rows_ = int(row_prefix_[lo + 1]) - int(row_offset_);
+      }
+      return;
+    }
+    {
       expert_tiles_ = tiles(rows_);
       total_tiles_ = expert_tiles_ * groups_;
       full_waves_ = total_tiles_ / workers_;
@@ -257,16 +550,31 @@ class Scheduler {
       row_offset_ = int64_t(expert_) * rows_;
       scale_offset_ = int64_t(expert_) * padded_rows(rows_);
     } else {
-      while (expert_ < groups_) {
-        const int64_t count = tiles(rows_);
-        if (local < count) break;
-        local -= count;
-        row_offset_ += rows_;
-        scale_offset_ += padded_rows(rows_);
-        if (++expert_ < groups_) rows_ = counts_[expert_];
+      const int64_t global = linear_;
+      if (global >= total_tiles_) return {-1, 0, 0, 0, 0, {}};
+      // Tiles are pulled in increasing order, so the owning expert never moves
+      // backwards and the previous one is a valid lower bound. A linear step
+      // is not viable: the grid strides by workers_ tiles, so consecutive
+      // tiles for one workgroup can sit tens of experts apart.
+      int lo = expert_;
+      // Sticky check first: an expert spanning many tiles often owns the next
+      // one too, and two reads confirm that against the seven a search costs.
+      if (!(tile_prefix_[lo] <= global && global < tile_prefix_[lo + 1])) {
+        int hi = groups_;
+        while (lo + 1 < hi) {
+          const int mid = (lo + hi) >> 1;
+          if (tile_prefix_[mid] <= global)
+            lo = mid;
+          else
+            hi = mid;
+        }
+        expert_ = lo;
+        row_offset_ = row_prefix_[lo];
+        scale_offset_ = scale_prefix_[lo];
+        rows_ = int(row_prefix_[lo + 1]) - int(row_offset_);
       }
-      if (expert_ == groups_) return {-1, 0, 0, 0, 0, {}};
-      linear_ = local + workers_;
+      local = global - tile_prefix_[lo];
+      linear_ = global + workers_;
     }
     const Kind kind = classify(rows_, window_);
     const int64_t n_tiles = columns(kind);
@@ -291,6 +599,9 @@ class Scheduler {
   }
 
   const int* counts_;
+  const int32_t* tile_prefix_;
+  const int32_t* row_prefix_;
+  const int32_t* scale_prefix_;
   int groups_;
   MidWindow window_;
   int worker_, workers_;
