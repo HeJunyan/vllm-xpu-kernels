@@ -513,16 +513,16 @@ _QWEN3_30B_A3B_PROFILE = {
     "tests/test_activation.py": {
         "test_act_and_mul": {
             "activation": ["silu_and_mul"],
-            "num_tokens": [1, 128, 2048],
+            "num_tokens": [1, 32, 4096, 8192],
             "d": [QWEN3_30B_MOE_INTERMEDIATE_SIZE],
         },
         "test_activation": None,
     },
-    # ---- RMSNorm ----
+    # ---- RMSNorm (hidden_size for pre/post norms, head_dim for q_norm/k_norm) ----
     "tests/test_layernorm.py": {
         "test_rms_norm": {
-            "num_tokens": [1, 128, 2048],
-            "hidden_size": [QWEN3_30B_HIDDEN_SIZE],
+            "num_tokens": [1, 32, 4096, 8192],
+            "hidden_size": [QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_HEAD_DIM],
         },
     },
     # ---- Rotary Embedding: neox style ----
@@ -531,13 +531,13 @@ _QWEN3_30B_A3B_PROFILE = {
             "is_neox_style": [True],
             "max_position": [1024],
             "head_size": [QWEN3_30B_HEAD_DIM],
-            "seq_len": [1, 128, 1024],
+            "seq_len": [1, 32, 4096, 8192],
         },
     },
     # ---- KV Cache: GQA 32q/4kv ----
     "tests/test_cache.py": {
         "test_reshape_and_cache_flash": {
-            "num_tokens": [1, 128],
+            "num_tokens": [1, 32, 4096, 8192],
             "num_heads": [QWEN3_30B_NUM_KV_HEADS],
             "head_size": [QWEN3_30B_HEAD_DIM],
             "block_size": [64],
@@ -545,12 +545,12 @@ _QWEN3_30B_A3B_PROFILE = {
             "dtype": [torch.bfloat16],
         },
     },
-    # ---- TopK routing: 128 experts, top-8 ----
+    # ---- TopK routing: 128 experts, top-8, sigmoid scoring ----
     "tests/test_topk.py": {
         "test_fused_topk_softmax": {
             "topk": [QWEN3_30B_TOPK],
             "n_expert": [QWEN3_30B_NUM_EXPERTS],
-            "n_token": [1, 128, 2048],
+            "n_token": [1, 32, 4096, 8192],
         },
     },
     "tests/test_fp8_gemm_onednn.py": {
@@ -558,7 +558,9 @@ _QWEN3_30B_A3B_PROFILE = {
             "mnk_factors": [
                 # qkv_proj
                 (1, QWEN3_30B_QKV_SIZE, QWEN3_30B_HIDDEN_SIZE),
-                (128, QWEN3_30B_QKV_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                (32, QWEN3_30B_QKV_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                (4096, QWEN3_30B_QKV_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                (8192, QWEN3_30B_QKV_SIZE, QWEN3_30B_HIDDEN_SIZE),
                 # out_proj
                 (
                     1,
@@ -566,11 +568,55 @@ _QWEN3_30B_A3B_PROFILE = {
                     QWEN3_30B_HEAD_DIM * QWEN3_30B_NUM_HEADS,
                 ),
                 (
-                    128,
+                    32,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    QWEN3_30B_HEAD_DIM * QWEN3_30B_NUM_HEADS,
+                ),
+                (
+                    4096,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    QWEN3_30B_HEAD_DIM * QWEN3_30B_NUM_HEADS,
+                ),
+                (
+                    8192,
                     QWEN3_30B_HIDDEN_SIZE,
                     QWEN3_30B_HEAD_DIM * QWEN3_30B_NUM_HEADS,
                 ),
             ],
+        },
+        # block_fp8 (recipe 128x128) for qkv_proj / out_proj
+        "test_fp8_gemm_per_block": {
+            "mnk_factors": [
+                # qkv_proj
+                (1, QWEN3_30B_QKV_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                (32, QWEN3_30B_QKV_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                (4096, QWEN3_30B_QKV_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                (8192, QWEN3_30B_QKV_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                # out_proj
+                (
+                    1,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    QWEN3_30B_HEAD_DIM * QWEN3_30B_NUM_HEADS,
+                ),
+                (
+                    32,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    QWEN3_30B_HEAD_DIM * QWEN3_30B_NUM_HEADS,
+                ),
+                (
+                    4096,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    QWEN3_30B_HEAD_DIM * QWEN3_30B_NUM_HEADS,
+                ),
+                (
+                    8192,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    QWEN3_30B_HEAD_DIM * QWEN3_30B_NUM_HEADS,
+                ),
+            ],
+            "batch": [1],
+            "group_size": [128],
+            "use_ue8m0": [False],
         },
     },
     # ---- Fused MoE: 128 experts, top-8 ----
@@ -584,19 +630,31 @@ _QWEN3_30B_A3B_PROFILE = {
                     2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
                 ),
                 (
-                    128,
+                    32,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                ),
+                (
+                    4096,
+                    QWEN3_30B_HIDDEN_SIZE,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                ),
+                (
+                    8192,
                     QWEN3_30B_HIDDEN_SIZE,
                     2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
                 ),
                 # down_proj
                 (1, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
-                (128, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                (32, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                (4096, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
+                (8192, QWEN3_30B_MOE_INTERMEDIATE_SIZE, QWEN3_30B_HIDDEN_SIZE),
             ],
             "e": [QWEN3_30B_NUM_EXPERTS],
             "topk": [QWEN3_30B_TOPK],
             "dtype": [torch.bfloat16],
             "has_bias": [True, False],
-            "recipe": ["mxfp8", "bf16"],
+            "recipe": ["mxfp8", "bf16", "fp8block"],
         },
     },
     # ---- Grouped GEMM: 128 experts, top-8 ----
@@ -610,13 +668,25 @@ _QWEN3_30B_A3B_PROFILE = {
                     QWEN3_30B_HIDDEN_SIZE,
                 ),
                 (
-                    128,
+                    32,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_30B_HIDDEN_SIZE,
+                ),
+                (
+                    4096,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_30B_HIDDEN_SIZE,
+                ),
+                (
+                    8192,
                     2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
                     QWEN3_30B_HIDDEN_SIZE,
                 ),
                 # down_proj
                 (1, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
-                (128, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
+                (32, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
+                (4096, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
+                (8192, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
             ],
             "e": [QWEN3_30B_NUM_EXPERTS],
             "topk": [QWEN3_30B_TOPK],
@@ -633,19 +703,65 @@ _QWEN3_30B_A3B_PROFILE = {
                     QWEN3_30B_HIDDEN_SIZE,
                 ),
                 (
-                    128,
+                    32,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_30B_HIDDEN_SIZE,
+                ),
+                (
+                    4096,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_30B_HIDDEN_SIZE,
+                ),
+                (
+                    8192,
                     2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
                     QWEN3_30B_HIDDEN_SIZE,
                 ),
                 # down_proj
                 (1, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
-                (128, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
+                (32, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
+                (4096, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
+                (8192, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
             ],
             "e": [QWEN3_30B_NUM_EXPERTS],
             "topk": [QWEN3_30B_TOPK],
             "dtype": [torch.bfloat16],
             "has_bias": [True, False],
             "recipe": ["mxfp8"],
+        },
+        "test_grouped_gemm_fp8block": {
+            "m,n,k": [
+                # gate_up_proj
+                (
+                    1,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_30B_HIDDEN_SIZE,
+                ),
+                (
+                    32,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_30B_HIDDEN_SIZE,
+                ),
+                (
+                    4096,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_30B_HIDDEN_SIZE,
+                ),
+                (
+                    8192,
+                    2 * QWEN3_30B_MOE_INTERMEDIATE_SIZE,
+                    QWEN3_30B_HIDDEN_SIZE,
+                ),
+                # down_proj
+                (1, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
+                (32, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
+                (4096, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
+                (8192, QWEN3_30B_HIDDEN_SIZE, QWEN3_30B_MOE_INTERMEDIATE_SIZE),
+            ],
+            "e": [QWEN3_30B_NUM_EXPERTS],
+            "topk": [QWEN3_30B_TOPK],
+            "has_bias": [True, False],
+            "recipe": ["128x128"],
         },
     },
 
@@ -660,7 +776,7 @@ _QWEN3_30B_A3B_PROFILE = {
     # ---- MoE align block size ----
     "tests/test_moe_align_block_size.py": {
         "test_moe_align_block_size": {
-            "m": [1, 128, 2048],
+            "m": [1, 32, 4096, 8192],
             "num_experts": [QWEN3_30B_NUM_EXPERTS],
             "topk": [QWEN3_30B_TOPK],
             "block_size": [128],
@@ -669,7 +785,7 @@ _QWEN3_30B_A3B_PROFILE = {
     # ---- MoE gather ----
     "tests/test_moe_gather.py": {
         "test_moe_gather": {
-            "input_len": [1, 128],
+            "input_len": [1, 32, 4096, 8192],
             "hidden_size": [QWEN3_30B_HIDDEN_SIZE],
             "num_experts": [QWEN3_30B_NUM_EXPERTS],
             "topk": [QWEN3_30B_TOPK],
@@ -678,7 +794,7 @@ _QWEN3_30B_A3B_PROFILE = {
     # ---- MoE sum ----
     "tests/test_moe_sum.py": {
         "test_moe_sum": {
-            "m": [1, 128],
+            "m": [1, 32, 4096, 8192],
             "topk": [QWEN3_30B_TOPK],
             "k": [QWEN3_30B_HIDDEN_SIZE],
         },
@@ -730,7 +846,7 @@ _QWEN3_30B_A3B_PROFILE = {
     # ---- Merge attention states ----
     "tests/test_merge_attn_states.py": {
         "test_merge_attn_states": {
-            "num_tokens": [1, 128],
+            "num_tokens": [1, 32, 4096, 8192],
             "num_query_heads": [QWEN3_30B_NUM_HEADS],
             "head_size": [QWEN3_30B_HEAD_DIM],
             "output_dtype": [torch.bfloat16],
@@ -739,8 +855,8 @@ _QWEN3_30B_A3B_PROFILE = {
     # ---- FP8 quantization ----
     "tests/test_fp8_quant.py": {
         "test_per_block_mxfp8_quant": {
-            "num_tokens": [1, 128],
-            "hidden_size": [LLAMA3_HIDDEN_SIZE],
+            "num_tokens": [1, 32, 4096, 8192],
+            "hidden_size": [QWEN3_30B_HIDDEN_SIZE],
         },
     },
 }
