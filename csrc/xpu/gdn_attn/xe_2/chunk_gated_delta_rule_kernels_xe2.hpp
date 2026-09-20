@@ -46,6 +46,11 @@ struct chunk_gemm_policy_64x64x32_4x1 {
   using SGLayout = Layout<Shape<_4, _1, _1>, Stride<_1, _1, _0>>;
 };
 
+struct chunk_gemm_policy_64x64x64_4x2 {
+  using WGTile = Shape<_64, _64, _64>;
+  using SGLayout = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+};
+
 struct chunk_gemm_policy_16x16x16 {
   using WGTile = Shape<_16, _16, _16>;
   using SGLayout = Layout<Shape<_1, _1, _1>, Stride<_1, _1, _0>>;
@@ -54,7 +59,9 @@ struct chunk_gemm_policy_16x16x16 {
 using chunk_gemm_policy_compute_A = chunk_gemm_policy_64x64x32_4x1;
 using chunk_gemm_policy_inverse = chunk_gemm_policy_16x16x16;
 using chunk_gemm_policy_compute_wu = chunk_gemm_policy_64x64x32_4x2;
-using chunk_gemm_policy_fwd_o = chunk_gemm_policy_64x64x32_8x1;
+// Match the cutlass xe35 reference fwd_o policy (64x64x64_4x2) now that the
+// build enables the 512-GRF Xe3.5 target the wide tile needs.
+using chunk_gemm_policy_fwd_o = chunk_gemm_policy_64x64x64_4x2;
 // Larger sub-group layout used for chunk_fwd_o when the launch grid does not
 // saturate the GPU: more sub-groups per work-group extract additional XMX
 // throughput per output tile when there are otherwise idle Xe cores.
@@ -1717,7 +1724,11 @@ void kernel_launcher(
 
   syclex::properties kernel_props{
       syclex::sub_group_size<cute::detail::subgroup_size>,
+#ifdef VLLM_GRF_SIZE
+      intelex::grf_size<VLLM_GRF_SIZE>};
+#else
       intelex::grf_size<256>};
+#endif
 
   // prepare data for A, W, U compute
   sycl::range<3> local_prepare(1, 1, MaxThreadsPerSM);

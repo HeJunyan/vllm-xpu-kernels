@@ -56,11 +56,11 @@ set(ONEDNN_GIT_REPO
 
 # rls-v3.13
 set(ONEDNN_GIT_TAG
-    "0e2a5bfeef1bfbffc3137464606540233086ce9b"
+    "d2e4335e04a617296aad6c4e3f92e2e33af2bb13"
     CACHE STRING "oneDNN git commit hash or tag")
 # ARCHITECTURE OPTIONS
 option(VLLM_XPU_ENABLE_XE2 "Enable XE2 architecture kernels" ON)
-option(VLLM_XPU_ENABLE_XE3 "Enable XE3 architecture kernels" OFF)
+option(VLLM_XPU_ENABLE_XE3 "Enable XE3 architecture kernels" ON)
 option(VLLM_XPU_ENABLE_XE_DEFAULT "Enable XE Default architecture kernels" ON)
 
 set(BUILD_ON_NVL $ENV{BUILD_ON_NVL})
