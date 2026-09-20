@@ -1348,31 +1348,53 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
         current_chunk_size = seq_len - chunk_id * chunk_size;
       }
 
-      // dv loop: iterate the head_v_dim output sub-blocks within a single
-      // work-group instead of launching one work-group per dv. The
-      // dv-independent work (per-chunk SLM fill, w = A_inv @ (g*k), and
-      // O2 = mask(Q*K^T)) is guarded to dv==0 and reused by later iterations,
-      // removing the redundant recomputation the old one-WG-per-dv grid did.
-      for (int dv = 0; dv < dv_split; ++dv) {
-        // g_last is a plain global read (a[] is never written by this kernel),
-        // so hoist it above the SLM fill and fuse it into the unified pass.
-        float g_last_value =
-            a[(chunk_offset + current_chunk_size - 1) +
-              v_head_id * total_virtual_seqlen];
-        float g_last_value_exp = sycl::native::exp(g_last_value);
+      /* g_last_value_exp never changes in the same chunk. */
+      float g_last_value =
+          a[(chunk_offset + current_chunk_size - 1) +
+            v_head_id * total_virtual_seqlen];
+      float g_last_value_exp = sycl::native::exp(g_last_value);
 
-        // ===== Inlined compute_wu: produce w/u for this chunk =====
-        {
-          // The per-chunk scaling SLM buffers are dv-independent, so fill them
-          // once (dv==0) and reuse across the dv loop.
-          if (dv == 0) {
-          // Single WAR fence before refilling ALL per-chunk scaling SLM buffers:
-          // wu_beta/wu_g (consumed by compute_wu) and g/g_multi/g_exp (consumed
-          // by the fwd_o body). Previous chunk's sub-groups may still read them.
+      for (int dv = 0; dv < dv_split; ++dv) {
+        /* W tensor */
+        auto W_ptr = w + v_head_id * total_virtual_seqlen * head_k_dim +
+                     chunk_offset * head_k_dim;
+        auto W_tensor_shape = make_shape(chunk_size, head_k_dim);
+        auto W_tensor = make_tensor(
+            make_gmem_ptr(W_ptr),
+            make_layout(W_tensor_shape, make_stride(head_k_dim, _1{})));
+
+        /* U tensor */
+        auto U_ptr = u + v_head_id * total_virtual_seqlen * head_v_dim +
+                     chunk_offset * head_v_dim;
+        auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
+        auto U_tensor = make_tensor(
+            make_gmem_ptr(U_ptr),
+            make_layout(U_tensor_shape, make_stride(head_v_dim, _1{})));
+
+        /* A inv tensor */
+        auto A_inv_ptr = A +
+                        static_cast<int64_t>(v_head_id) *
+                            total_virtual_seqlen * chunk_size +
+                        chunk_offset * chunk_size;
+        auto A_inv_shape = make_shape(chunk_size, chunk_size);
+        auto A_inv_tensor = make_tensor(
+            make_gmem_ptr(A_inv_ptr),
+            make_layout(A_inv_shape, make_stride(chunk_size, _1{})));
+
+        /* K transposed tensor. */
+        auto k_ptr =
+            k + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
+        auto K_tensor_T_shape = make_shape(head_k_dim, chunk_size);
+        auto K_tensor_T = make_tensor(
+            make_gmem_ptr(k_ptr),
+            make_layout(
+                K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
+
+        /* a/b/g and exp(a) are loaded and calculated once and shared later.
+           The per-chunk scaling SLM buffers are dv-independent. */
+        if (dv == 0) {
           item.barrier(sycl::access::fence_space::local_space);
-          // Unified SLM fill: a[]/b[] and exp(a) are loaded once and shared
-          // across all five buffers. This merges the former two fill+barrier
-          // pairs (wu fill and g fill) into a single fill with one barrier.
+
           CUTE_UNROLL
           for (int e = local_id; e < chunk_size; e += local_range) {
             float beta_value =
@@ -1392,113 +1414,64 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
               g_exp_slm_ptr[e] = 0.0f;
             }
           }
+
           item.barrier(sycl::access::fence_space::local_space);
-          }  // end if (dv == 0): per-chunk SLM fill
-
-          auto A_ptr_wu = A +
-                          static_cast<int64_t>(v_head_id) *
-                              total_virtual_seqlen * chunk_size +
-                          chunk_offset * chunk_size;
-          auto A_wu_shape = make_shape(chunk_size, chunk_size);
-          auto A_wu_tensor = make_tensor(
-              make_gmem_ptr(A_ptr_wu),
-              make_layout(A_wu_shape, make_stride(chunk_size, _1{})));
-
-          auto v_ptr_wu = v +
-                          static_cast<int64_t>(chunk_offset) * num_v_heads *
-                              head_v_dim +
-                          v_head_id * head_v_dim;
-          auto V_wu_T_shape = make_shape(head_v_dim, chunk_size);
-          auto V_wu_T = make_tensor(
-              make_gmem_ptr(v_ptr_wu),
-              make_layout(
-                  V_wu_T_shape, make_stride(_1{}, head_v_dim * num_v_heads)));
-
-          auto U_ptr_wu = u +
-                          static_cast<int64_t>(v_head_id) *
-                              total_virtual_seqlen * head_v_dim +
-                          chunk_offset * head_v_dim;
-          auto U_wu_shape = make_shape(chunk_size, head_v_dim);
-          auto U_wu_tensor = make_tensor(
-              make_gmem_ptr(U_ptr_wu),
-              make_layout(U_wu_shape, make_stride(head_v_dim, _1{})));
-
-          Tensor cU_wu = make_identity_tensor(U_wu_tensor.shape());
-          auto copy_U_wu = get_block_2d_copy_D<void>(mma, U_wu_tensor);
-          auto thr_copy_U_wu = copy_U_wu.get_slice(local_id);
-          auto thr_mma_wu = mma.get_slice(local_id);
-
-          // u[dv-slice] = A_inv @ (beta * v)
-          {
-            Tensor gU_wu = local_tile(
-                cU_wu, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
-            auto tCrU_wu = thr_copy_U_wu.partition_sg_fragment_S(gU_wu);
-            auto tCgU_wu = thr_copy_U_wu.partition_D(gU_wu);
-            auto tSrU_wu = thr_mma_wu.partition_sg_fragment_C(gU_wu);
-            clear(tSrU_wu);
-            gemm_TTS_k_multi(
-                A_wu_tensor, V_wu_T, tSrU_wu, 0, dv, mma, wu_beta_slm_ptr);
-            reorder(tSrU_wu, tCrU_wu);
-            copy(copy_U_wu, tCrU_wu, tCgU_wu);
-          }
-
-          // w[full] = A_inv @ (g * k). Both the value and its HBM destination are
-          // dv-independent, so compute and store it once (dv==0) and let the
-          // later dv iterations read it back from HBM via W_tensor below.
-          if (has_prev_state && dv == 0) {
-            auto k_ptr_wu = k +
-                            static_cast<int64_t>(chunk_offset) * num_k_heads *
-                                head_k_dim +
-                            kv_head_id * head_k_dim;
-            auto K_wu_T_shape = make_shape(head_k_dim, chunk_size);
-            auto K_wu_T = make_tensor(
-                make_gmem_ptr(k_ptr_wu),
-                make_layout(
-                    K_wu_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
-            auto W_ptr_wu = w +
-                            static_cast<int64_t>(v_head_id) *
-                                total_virtual_seqlen * head_k_dim +
-                            chunk_offset * head_k_dim;
-            auto W_wu_shape = make_shape(chunk_size, head_k_dim);
-            auto W_wu_tensor = make_tensor(
-                make_gmem_ptr(W_ptr_wu),
-                make_layout(W_wu_shape, make_stride(head_k_dim, _1{})));
-            Tensor cW_wu = make_identity_tensor(W_wu_tensor.shape());
-            auto copy_W_wu = get_block_2d_copy_D<void>(mma, W_wu_tensor);
-            auto thr_copy_W_wu = copy_W_wu.get_slice(local_id);
-            for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
-              Tensor gW_wu = local_tile(
-                  cW_wu, wg_tile, make_coord(0, dk, 0), Step<_1, _1, X>{});
-              auto tCrW_wu = thr_copy_W_wu.partition_sg_fragment_S(gW_wu);
-              auto tCgW_wu = thr_copy_W_wu.partition_D(gW_wu);
-              auto tSrW_wu = thr_mma_wu.partition_sg_fragment_C(gW_wu);
-              clear(tSrW_wu);
-              gemm_TTS_k_multi(
-                  A_wu_tensor, K_wu_T, tSrW_wu, 0, dk, mma, wu_g_slm_ptr);
-              reorder(tSrW_wu, tCrW_wu);
-              copy(copy_W_wu, tCrW_wu, tCgW_wu);
-            }
-          }
-          // Ensure w/u are globally visible before the fwd_o body reads them.
-          // This global_and_local barrier also publishes the g/g_multi/g_exp SLM
-          // writes from the unified fill above, so the fwd_o body needs no
-          // additional local barrier before consuming them.
-          item.barrier(sycl::access::fence_space::global_and_local);
         }
 
-        auto W_ptr = w + v_head_id * total_virtual_seqlen * head_k_dim +
-                     chunk_offset * head_k_dim;
-        auto W_tensor_shape = make_shape(chunk_size, head_k_dim);
-        auto W_tensor = make_tensor(
-            make_gmem_ptr(W_ptr),
-            make_layout(W_tensor_shape, make_stride(head_k_dim, _1{})));
+        /* compute w/u for this chunk */
+        auto v_ptr_wu = v +
+                        static_cast<int64_t>(chunk_offset) * num_v_heads *
+                            head_v_dim +
+                        v_head_id * head_v_dim;
+        auto V_wu_T_shape = make_shape(head_v_dim, chunk_size);
+        auto V_wu_T = make_tensor(
+            make_gmem_ptr(v_ptr_wu),
+            make_layout(
+                V_wu_T_shape, make_stride(_1{}, head_v_dim * num_v_heads)));
 
-        auto U_ptr = u + v_head_id * total_virtual_seqlen * head_v_dim +
-                     chunk_offset * head_v_dim;
-        auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
-        auto U_tensor = make_tensor(
-            make_gmem_ptr(U_ptr),
-            make_layout(U_tensor_shape, make_stride(head_v_dim, _1{})));
+        Tensor cU_wu = make_identity_tensor(U_tensor.shape());
+        auto copy_U_wu = get_block_2d_copy_D<void>(mma, U_tensor);
+        auto thr_copy_U_wu = copy_U_wu.get_slice(local_id);
+        auto thr_mma_wu = mma.get_slice(local_id);
+
+        /* u[dv] = A_inv @ (beta * v) */
+        Tensor gU_wu = local_tile(
+            cU_wu, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
+        auto tCrU_wu = thr_copy_U_wu.partition_sg_fragment_S(gU_wu);
+        auto tCgU_wu = thr_copy_U_wu.partition_D(gU_wu);
+        auto tSrU_wu = thr_mma_wu.partition_sg_fragment_C(gU_wu);
+
+        clear(tSrU_wu);
+        gemm_TTS_k_multi(
+            A_inv_tensor, V_wu_T, tSrU_wu, 0, dv, mma, wu_beta_slm_ptr);
+        reorder(tSrU_wu, tCrU_wu);
+        copy(copy_U_wu, tCrU_wu, tCgU_wu);
+
+        /* w = A_inv@(g*k). It's dv-independent, so compute and store it
+           only once (dv==0) and let the later dv iterations read it back
+           from HBM via W_tensor below. */
+        if (has_prev_state && dv == 0) {
+          Tensor cW_wu = make_identity_tensor(W_tensor.shape());
+          auto copy_W_wu = get_block_2d_copy_D<void>(mma, W_tensor);
+          auto thr_copy_W_wu = copy_W_wu.get_slice(local_id);
+
+          for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
+            Tensor gW_wu = local_tile(
+                cW_wu, wg_tile, make_coord(0, dk, 0), Step<_1, _1, X>{});
+            auto tCrW_wu = thr_copy_W_wu.partition_sg_fragment_S(gW_wu);
+            auto tCgW_wu = thr_copy_W_wu.partition_D(gW_wu);
+            auto tSrW_wu = thr_mma_wu.partition_sg_fragment_C(gW_wu);
+
+            clear(tSrW_wu);
+            gemm_TTS_k_multi(
+                A_inv_tensor, K_tensor_T, tSrW_wu, 0, dk, mma, wu_g_slm_ptr);
+            reorder(tSrW_wu, tCrW_wu);
+            copy(copy_W_wu, tCrW_wu, tCgW_wu);
+          }
+        }
+
+        /* Ensure w/u are globally visible before the fwd_o body reads them. */
+        item.barrier(sycl::access::fence_space::global_and_local);
 
         StateT* S_ptr = ssm_state_ptr;
         auto S_tensor_shape = make_shape(head_v_dim, head_k_dim);
@@ -1524,8 +1497,6 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
             make_layout(
                 Q_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
 
-        auto k_ptr =
-            k + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
         auto K_tensor_shape = make_shape(chunk_size, head_k_dim);
         auto K_tensor = make_tensor(
             make_gmem_ptr(k_ptr),
@@ -1654,12 +1625,6 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
           reorder(tSrO_c, tCrO_c);
           copy(copy_O_c, tCrO_c, tCgO_c);
         }
-
-        auto K_tensor_T_shape = make_shape(head_k_dim, chunk_size);
-        auto K_tensor_T = make_tensor(
-            make_gmem_ptr(k_ptr),
-            make_layout(
-                K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
 
         Tensor cS = make_identity_tensor(S_tensor.shape());
         auto copy_S_c = get_block_2d_copy_C<void>(mma, S_tensor);
