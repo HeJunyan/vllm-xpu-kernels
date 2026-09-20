@@ -678,22 +678,31 @@ function(add_xe3_kernel_library LIBRARY_NAME)
   install(TARGETS ${LIBRARY_NAME} LIBRARY DESTINATION ${ARG_DESTINATION}
                                           COMPONENT ${LIBRARY_NAME})
 
-  # Set link options for XE3 devices
-  set(XE3_GPU_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
+  # Set link options for XE3 devices. The GRF-per-thread internal option is
+  # required in both AOT and JIT builds, so it is always passed. Only the
+  # "-device <list>" AOT selector is conditional: when XE3_AOT_DEVICES is set we
+  # target that device via the spir64_gen backend (AOT), otherwise we route the
+  # same internal option through the generic spir64 backend (JIT), avoiding a
+  # broken empty "-device " argument or an invalid spir64_gen device link.
   if(BUILD_ON_NVL)
+    set(XE3_GRF_INTERNAL_OPTIONS "-internal_options -cl-intel-256-GRF-per-thread")
+  else()
+    set(XE3_GRF_INTERNAL_OPTIONS "-internal_options -cl-intel-512-GRF-per-thread")
+  endif()
+
+  set(XE3_GPU_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
+  if(XE3_AOT_DEVICES)
     list(
       APPEND
       XE3_GPU_LINK_FLAGS
       -Xsycl-target-backend=spir64_gen
-      "-device ${XE3_AOT_DEVICES} -internal_options -cl-intel-256-GRF-per-thread"
-    )
+      "-device ${XE3_AOT_DEVICES} ${XE3_GRF_INTERNAL_OPTIONS}")
   else()
     list(
       APPEND
       XE3_GPU_LINK_FLAGS
-      -Xsycl-target-backend=spir64_gen
-      "-device ${XE3_AOT_DEVICES} -internal_options -cl-intel-512-GRF-per-thread"
-    )
+      -Xsycl-target-backend=spir64
+      "${XE3_GRF_INTERNAL_OPTIONS}")
   endif()
   target_link_options(${LIBRARY_NAME} PRIVATE ${XE3_GPU_LINK_FLAGS})
 endfunction()

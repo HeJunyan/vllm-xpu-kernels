@@ -164,6 +164,29 @@ if(BUILD_ON_SIMULATOR_CRI OR BUILD_ON_NVL)
       CACHE STRING "oneDNN git commit hash or tag" FORCE)
 endif()
 
+# GDN, MQA-logits and MHC kernels are implemented only for XE2 (there is no
+# xe_3 / xe_default variant). Their op registrations are guarded by the
+# VLLM_*_ENABLED defines, so if we emit those defines while XE2 is disabled the
+# extension links references to symbols that were never built, producing an
+# "undefined symbol" ImportError at load time. Force these features off when
+# XE2 is not built.
+if(NOT VLLM_XPU_ENABLE_XE2)
+  if(GDN_KERNELS_ENABLED)
+    message(STATUS "VLLM_XPU_ENABLE_XE2=OFF: disabling GDN kernels (XE2-only).")
+    set(GDN_KERNELS_ENABLED OFF)
+  endif()
+  if(MQA_LOGITS_KERNELS_ENABLED)
+    message(
+      STATUS
+        "VLLM_XPU_ENABLE_XE2=OFF: disabling MQA-logits kernels (XE2-only).")
+    set(MQA_LOGITS_KERNELS_ENABLED OFF)
+  endif()
+  if(MHC_KERNELS_ENABLED)
+    message(STATUS "VLLM_XPU_ENABLE_XE2=OFF: disabling MHC kernels (XE2-only).")
+    set(MHC_KERNELS_ENABLED OFF)
+  endif()
+endif()
+
 message(STATUS "Kernel build configuration:")
 message(STATUS "  ONEDNN_GIT_REPO              = ${ONEDNN_GIT_REPO}")
 message(STATUS "  ONEDNN_GIT_TAG               = ${ONEDNN_GIT_TAG}")
@@ -295,6 +318,34 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
     set(XE2_AOT_DEVICES $ENV{VLLM_XPU_XE2_AOT_DEVICES})
   endif()
 
+  set(XE3_AOT_DEVICES "cri,cri-a0")
+  if(BUILD_ON_NVL)
+    set(XE3_AOT_DEVICES "${XE3_AOT_DEVICES},nvl-p-a0,nvl-p")
+  endif()
+  # Allow overriding XE3 AOT devices via env, including explicitly disabling
+  # AOT by setting an empty env var (e.g. export VLLM_XPU_XE3_AOT_DEVICES="").
+  # This keeps XE3 kernels enabled but compiles them JIT instead of AOT.
+  if(DEFINED ENV{VLLM_XPU_XE3_AOT_DEVICES})
+    set(XE3_AOT_DEVICES $ENV{VLLM_XPU_XE3_AOT_DEVICES})
+  endif()
+
+  # Resolve the effective AOT device list based on which architectures are
+  # enabled. An empty list means AOT is disabled and kernels are JIT-compiled.
+  # temporary solution.
+  if(VLLM_XPU_ENABLE_XE2 AND VLLM_XPU_ENABLE_XE3)
+    set(AOT_DEVICES "${XE2_AOT_DEVICES},${XE3_AOT_DEVICES}")
+  elseif(VLLM_XPU_ENABLE_XE2)
+    set(AOT_DEVICES ${XE2_AOT_DEVICES})
+  elseif(VLLM_XPU_ENABLE_XE3)
+    set(AOT_DEVICES ${XE3_AOT_DEVICES})
+  endif()
+  # Normalize: collapse empty entries and strip leading/trailing commas so that
+  # empty AOT device lists don't produce a malformed "-device ," that would
+  # re-enable (broken) AOT. When both lists are empty, AOT_DEVICES becomes empty
+  # and kernels are JIT-compiled.
+  string(REGEX REPLACE ",+" "," AOT_DEVICES "${AOT_DEVICES}")
+  string(REGEX REPLACE "^,|,$" "" AOT_DEVICES "${AOT_DEVICES}")
+
   # ============= COMPILE OPTIONS ==================
   set(SYCL_FLAGS "")
   set(SYCL_KERNEL_OPTIONS)
@@ -306,8 +357,12 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   set(SYCL_COMPILE_FLAGS ${SYCL_FLAGS})
   set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} "-O3" "-DNDEBUG")
-  if(VLLM_XPU_ENABLE_XE2 OR VLLM_XPU_ENABLE_XE3)
+  if(AOT_DEVICES)
+    # AOT: compile directly for the Intel GPU (gen) target.
     set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=spir64_gen)
+  elseif(VLLM_XPU_ENABLE_XE2 OR VLLM_XPU_ENABLE_XE3)
+    # JIT: emit generic SPIR-V, compiled to device code at runtime.
+    set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=spir64)
   endif()
   # Final build option be like: icpx -fsycl -fsycl-target=spir64_gen
   # ${SYCL_KERNEL_OPTIONS} -fsycl-host-compiler=gcc
@@ -328,19 +383,6 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
       ${SYCL_DEVICE_LINK_FLAGS}
       "-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"
   )
-  set(XE3_AOT_DEVICES "cri,cri-a0")
-  if(BUILD_ON_NVL)
-    set(XE3_AOT_DEVICES "${XE3_AOT_DEVICES},nvl-p-a0,nvl-p")
-  endif()
-
-  # temporary solution.
-  if(VLLM_XPU_ENABLE_XE2 AND VLLM_XPU_ENABLE_XE3)
-    set(AOT_DEVICES "${XE2_AOT_DEVICES},${XE3_AOT_DEVICES}")
-  elseif(VLLM_XPU_ENABLE_XE2)
-    set(AOT_DEVICES ${XE2_AOT_DEVICES})
-  elseif(VLLM_XPU_ENABLE_XE3)
-    set(AOT_DEVICES ${XE3_AOT_DEVICES})
-  endif()
   if(AOT_DEVICES)
     list(APPEND SYCL_DEVICE_LINK_FLAGS -fsycl-targets=spir64_gen
          -Xsycl-target-backend=spir64_gen)
