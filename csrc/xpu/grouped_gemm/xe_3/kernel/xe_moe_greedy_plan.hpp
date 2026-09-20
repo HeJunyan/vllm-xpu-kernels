@@ -7,7 +7,7 @@
 
 #include "cutlass/fast_math.h"
 
-#include "../greedy_dispatch.hpp"
+#include "../runner/greedy_dispatch.hpp"
 
 namespace gpu::cutlass_kernel::grouped_gemm::greedy {
 

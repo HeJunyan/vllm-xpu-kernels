@@ -9,7 +9,7 @@ namespace vllm {
 
 // Describes the per-expert, MN-major, M-padded-to-4 scale-A surface that the
 // mxfp grouped-GEMM mainloop indexes (see
-// grouped_gemm/xe_3/collective/moe_array_mma_mxfp.hpp: expert e's block is
+// grouped_gemm/xe_3/kernel/xe_moe_gemm_greedy.hpp: expert e's block is
 // based at sum_{i<e} round_up_4(rows[i]) * scale_k and has leading dim
 // round_up_4(rows[e])).
 //

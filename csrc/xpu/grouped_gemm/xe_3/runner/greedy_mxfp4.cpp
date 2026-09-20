@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "collective/moe_greedy.hpp"
+#include "../kernel/xe_moe_gemm_greedy.hpp"
 
 namespace gpu::cutlass_kernel::grouped_gemm {
 template <>
 struct GreedyTraits<GreedyDtype::MXFP4>
-    : GreedyFamily<moe_mxfp4_policy, 128, 1280, 768> {
+    : GreedyFamily<MoEMxfp4Config, 128, 1280, 768> {
   static constexpr int NormalN = 256;
   static constexpr bool AllowMid384 = false;
 

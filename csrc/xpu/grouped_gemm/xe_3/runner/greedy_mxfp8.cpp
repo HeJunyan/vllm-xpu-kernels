@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "collective/moe_greedy.hpp"
+#include "../kernel/xe_moe_gemm_greedy.hpp"
 
 namespace gpu::cutlass_kernel::grouped_gemm {
 template <>
 struct GreedyTraits<GreedyDtype::MXFP8>
-    : GreedyFamily<moe_mxfp8_policy, 64, 2048, 512> {
+    : GreedyFamily<MoEMxfp8Config, 64, 2048, 512> {
   static constexpr greedy::MidWindow
   uniform_mid_window(int n, int k, greedy::MidWindow fallback) {
     // Match the SYCL-TLA benchmark's measured uniform-expert M windows.

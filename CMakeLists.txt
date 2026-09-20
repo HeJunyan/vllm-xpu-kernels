@@ -371,7 +371,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
   # when building.
-  set(CUTLASS_REVISION_CRI "0d41aaa2e00c28320af2cb64bb8fb59233dbe4c5")
+  set(CUTLASS_REVISION_CRI "53a0410e6470623682bc68e756fabd3da9dfe741")
   set(CUTLASS_REVISION_DEFAULT "cd763790ad2f74d7294435ecf77682bac0062c3a")
   if(VLLM_XPU_ENABLE_XE3)
     # Bumped to the latest v0.1.0_next HEAD (libraries.ai.cutlass.internal).

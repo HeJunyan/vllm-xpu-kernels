@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "collective/moe_greedy.hpp"
+#include "../kernel/xe_moe_gemm_greedy.hpp"
 
 namespace gpu::cutlass_kernel::grouped_gemm {
 template <>
@@ -9,7 +9,7 @@ struct GreedyTraits<GreedyDtype::FP8Block>
     // for identical DPAS work. k_tiles_per_group becomes 2. This depends on
     // the lane-packed A scales in the mainloop: without the registers those
     // free, the doubled A/B fragments have nowhere to go.
-    : GreedyFamily<moe_fp8block_policy, 64, 2048, 512> {
+    : GreedyFamily<MoEFp8BlockConfig, 64, 2048, 512> {
   // MidN was 128, which cost 1.5x on Mid-bucket shapes. 256 matches per-tensor
   // FP8. The 320-row Mid tile is no longer capped: it used to spill 88
   // registers at N=256 in the single kernel every bucket shares, but packing
