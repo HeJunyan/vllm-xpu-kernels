@@ -121,6 +121,25 @@ VLLM_CHUNK_PREFILL_CONFIG=chunk_prefill_full.conf VLLM_PAGED_DECODE_CONFIG=paged
 
 See [KERNEL_CONFIGURATION.md](KERNEL_CONFIGURATION.md) for detailed guidance on kernel configuration, presets, and troubleshooting missing kernels.
 
+### GEMM Backend Configuration
+
+Automatic GEMM backend selection uses the packaged `gemm_shapes.conf` next to the
+extension `.so` by default. Set `VLLM_XPU_GEMM_CONFIG` before starting vLLM to use a
+custom config file instead:
+
+```bash
+export VLLM_XPU_GEMM_CONFIG=/path/to/gemm_shapes.conf
+```
+
+The path can be absolute or relative to the process working directory. An unset
+or empty value uses the packaged config. The custom file replaces the packaged
+config; listed shapes select SYCL-TLA, and unmatched shapes select oneDNN. Use the
+same format as [`gemm_shapes.conf`](vllm_xpu_kernels/gemm_shapes.conf).
+
+The config is loaded once per process on the first automatic backend selection.
+Setting `VLLM_XPU_GEMM_BACKEND=onednn` or `VLLM_XPU_GEMM_BACKEND=sycltla` forces that
+backend and bypasses the config file.
+
 ## Testing
 
 Run the full test suite with pytest:

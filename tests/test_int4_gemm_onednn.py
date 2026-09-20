@@ -4,9 +4,15 @@ from enum import Enum
 import pytest
 import torch
 
-from tests.register_ops import int4_gemm_w4a8, int4_gemm_w4a16
+from tests.register_ops import (int4_gemm_w4a8, int4_gemm_w4a16,
+                                onednn_available)
 from vllm_xpu_kernels.quantization._quantize_convert import (
     GPTQUtils, dequantize, dequantize_s8_to_float, dynamic_per_token_quant_ref)
+
+pytestmark = pytest.mark.skipif(
+    not onednn_available(),
+    reason="oneDNN kernels are not built "
+    "(rebuild with VLLM_XPU_ENABLE_ONEDNN=ON)")
 
 DEVICE = "cpu"
 KERNEL_DEVICE = "xpu"

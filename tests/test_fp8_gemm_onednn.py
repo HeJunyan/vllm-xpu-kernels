@@ -7,7 +7,13 @@ from tests.ops.fp8_quant_op import (fp8_block_dequant_2d, fp8_block_quant_2d,
                                     per_token_group_quant_fp8,
                                     scaled_fp8_quant)
 from tests.ops.mx_utils import from_blocked_format, to_mxfp
-from tests.register_ops import fp8_bmm, fp8_gemm, fp8_gemm_w8a16
+from tests.register_ops import (fp8_bmm, fp8_gemm, fp8_gemm_w8a16,
+                                onednn_available)
+
+pytestmark = pytest.mark.skipif(
+    not onednn_available(),
+    reason="oneDNN kernels are not built "
+    "(rebuild with VLLM_XPU_ENABLE_ONEDNN=ON)")
 
 DEVICE = "cpu"
 KERNEL_DEVICE = "xpu"
@@ -207,9 +213,10 @@ def test_fp8_gemm_per_channel(fp8_dtype, out_dtype, is_nt, batch, mnk_factors):
         [batch, m, k], dtype=out_dtype, device=DEVICE) / 10.0
     weight = torch.randn([n, k], dtype=out_dtype).to(DEVICE) / 10.0
 
-    input_fp8, scale_src_fp8 = scaled_fp8_quant(input.reshape(-1, k).to(KERNEL_DEVICE),
-                                               use_per_token_if_dynamic=True,
-                                               fp8_dtype=fp8_dtype)
+    input_fp8, scale_src_fp8 = scaled_fp8_quant(
+        input.reshape(-1, k).to(KERNEL_DEVICE),
+        use_per_token_if_dynamic=True,
+        fp8_dtype=fp8_dtype)
     input_fp8 = input_fp8.cpu()
     scale_src_fp8 = scale_src_fp8.cpu()
     weight_fp8, scale_wei_fp8 = scaled_fp8_quant(weight.to(KERNEL_DEVICE),

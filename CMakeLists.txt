@@ -83,6 +83,8 @@ option(MHC_KERNELS_ENABLED
 option(XPU_SPECIFIC_KERNELS_ENABLED
        "Build XPU-specific kernels (_xpu_C extension)" ON)
 option(XPUMEM_ALLOCATOR_ENABLED "Build xpumem_allocator extension" ON)
+option(VLLM_XPU_ENABLE_ONEDNN
+       "Build oneDNN-backed GEMM kernels (fp8/int4/fp4 GEMM ops in _xpu_C)" ON)
 # Xe3(p)-only hand-written asm quant lib. Can be turned OFF independently of
 # VLLM_XPU_ENABLE_XE3 to work around IGC versions that miscompile the asm.
 # Build-time env: BUILD_QUANT_ASM_XE3=OFF (forwarded to cmake by setup.py).
@@ -178,6 +180,7 @@ message(STATUS "  MHC_KERNELS_ENABLED          = ${MHC_KERNELS_ENABLED}")
 message(
   STATUS "  XPU_SPECIFIC_KERNELS_ENABLED = ${XPU_SPECIFIC_KERNELS_ENABLED}")
 message(STATUS "  XPUMEM_ALLOCATOR_ENABLED     = ${XPUMEM_ALLOCATOR_ENABLED}")
+message(STATUS "  VLLM_XPU_ENABLE_ONEDNN       = ${VLLM_XPU_ENABLE_ONEDNN}")
 message(STATUS "  VLLM_PAGED_DECODE_CONFIG     = ${VLLM_PAGED_DECODE_CONFIG}")
 message(STATUS "  VLLM_CHUNK_PREFILL_CONFIG    = ${VLLM_CHUNK_PREFILL_CONFIG}")
 message(STATUS "")
@@ -205,7 +208,9 @@ append_cmake_prefix_path("torch" "torch.utils.cmake_prefix_path")
 # Import torch cmake configuration.
 find_package(Torch REQUIRED)
 
-find_package(oneDNN REQUIRED)
+if(VLLM_XPU_ENABLE_ONEDNN)
+  find_package(oneDNN REQUIRED)
+endif()
 
 #
 # Forward the non-CUDA device extensions to external CMake scripts.
@@ -783,14 +788,30 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
   # TODO: check if we need this flags list(APPEND VLLM_GPU_FLAGS
   # "-gline-tables-only")
 
-  if(ONEDNN_FOUND)
-    set(_ONEDNN_SRC)
-    file(GLOB _ONEDNN_SRC csrc/xpu/onednn/*.cpp)
-    list(APPEND VLLM_EXT_XPU_SRC ${_ONEDNN_SRC})
-    include_directories(${ONEDNN_INCLUDE_DIR})
-    link_libraries(${ONEDNN_LIBRARY})
+  # GEMM dispatch layer: public fp8/fp4 entry points that select between the
+  # oneDNN and (WIP) SYCL-TLA backends at runtime via VLLM_XPU_GEMM_BACKEND.
+  list(APPEND VLLM_EXT_XPU_SRC "csrc/xpu/gemm/gemm_interface.cpp"
+       "csrc/xpu/gemm/gemm_backend.cpp"
+       "csrc/xpu/gemm/sycltla/sycltla_matmul.cpp")
+
+  if(VLLM_XPU_ENABLE_ONEDNN)
+    if(ONEDNN_FOUND)
+      set(_ONEDNN_SRC)
+      file(GLOB _ONEDNN_SRC csrc/xpu/gemm/onednn/*.cpp)
+      # The stub only backs the disabled build; drop it here.
+      list(REMOVE_ITEM _ONEDNN_SRC
+           "${CMAKE_CURRENT_SOURCE_DIR}/csrc/xpu/gemm/onednn/onednn_stub.cpp")
+      list(APPEND VLLM_EXT_XPU_SRC ${_ONEDNN_SRC})
+      include_directories(${ONEDNN_INCLUDE_DIR})
+      include_directories(${CMAKE_SOURCE_DIR}/csrc/xpu/gemm/onednn)
+      link_libraries(${ONEDNN_LIBRARY})
+    else()
+      message(FATAL_ERROR "oneDNN not found!")
+    endif()
   else()
-    message(FATAL_ERROR "oneDNN not found!")
+    # oneDNN disabled: build stub ops that raise a runtime error when called so
+    # the torch ops stay registered.
+    list(APPEND VLLM_EXT_XPU_SRC "csrc/xpu/gemm/onednn/onednn_stub.cpp")
   endif()
 
   define_gpu_extension_target(
@@ -810,7 +831,7 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
     INCLUDE_DIRECTORIES
     ${VLLM_XPU_INCLUDE_DIR}
     LIBRARIES
-    ${GROUPED_GEMM_LIB_NAME};${GDN_ATTN_LIB_NAME};${MQA_LOGITS_LIB_NAME};${MHC_LIB_NAME}
+    ${GROUPED_GEMM_LIB_NAME};${GDN_ATTN_LIB_NAME};${MQA_LOGITS_LIB_NAME};${MHC_LIB_NAME};${CMAKE_DL_LIBS}
     USE_SABI
     3
     WITH_SOABI)

@@ -3,7 +3,6 @@
 
 import torch
 from typing import Optional
-import pytest
 
 # Import the C extension modules
 # These may load successfully but not register ops if there's a build issue
@@ -33,7 +32,7 @@ def _has_torch_op(namespace: str, op_name: str) -> bool:
         if ns is None:
             return False
         return hasattr(ns, op_name)
-    except:
+    except Exception:
         return False
 
 
@@ -498,6 +497,24 @@ def fp8_gemm_w8a16(input: torch.Tensor, weight: torch.Tensor,
                    scale_wei: Optional[torch.Tensor],
                    scale_act: Optional[torch.Tensor]):
     return torch.ops._xpu_C.fp8_gemm_w8a16(input, weight, scale_wei, scale_act)
+
+
+def get_onednn_version() -> str:
+    return torch.ops._xpu_C.get_onednn_version()
+
+
+def onednn_available() -> bool:
+    """Return True if the _xpu_C extension was built with oneDNN support.
+
+    When built with VLLM_XPU_ENABLE_ONEDNN=OFF the oneDNN ops are still
+    registered but raise a runtime error when invoked, so we probe the
+    lightweight ``get_onednn_version`` op to decide.
+    """
+    try:
+        get_onednn_version()
+    except Exception:
+        return False
+    return True
 
 
 # moe

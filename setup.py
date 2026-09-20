@@ -198,6 +198,7 @@ class cmake_build_ext(build_ext):
             "MHC_KERNELS_ENABLED",
             "XPU_SPECIFIC_KERNELS_ENABLED",
             "XPUMEM_ALLOCATOR_ENABLED",
+            "VLLM_XPU_ENABLE_ONEDNN",
             "BUILD_QUANT_ASM_XE3",
         ]
         for opt in _kernel_options:
@@ -470,7 +471,10 @@ class precompiled_wheel_utils:
 package_data = {
     "vllm-xpu-kernels": [
         "py.typed",
-    ]
+    ],
+    "vllm_xpu_kernels": [
+        "gemm_shapes.conf",
+    ],
 }
 
 _SCM_TAG_REGEX = (r'^(?:[\w-]+-)?'

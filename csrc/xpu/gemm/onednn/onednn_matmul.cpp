@@ -1,4 +1,5 @@
 #include <vector>
+#include "xpu/gemm/gemm_backend.h"
 #include "fp4_gemm_w4a4.h"
 #include "fp8_gemm_w8a8.h"
 #include "fp8_gemm_w8a16.h"
@@ -66,7 +67,7 @@ torch::Tensor check_and_create_output_tensor(
   return at::empty_strided(result_shape, res_stride, options);
 }
 
-torch::Tensor fp8_gemm(
+torch::Tensor fp8_gemm_onednn(
     const torch::Tensor& A,  // [b, m ,k]
     const torch::Tensor& B,  // [k, n]
     std::optional<c10::ScalarType> out_dtype,
@@ -104,7 +105,7 @@ torch::Tensor fp8_gemm(
   return result;
 }
 
-torch::Tensor fp8_bmm(
+torch::Tensor fp8_bmm_onednn(
     const torch::Tensor& A,  // [b, m ,k]
     const torch::Tensor& B,  // [b, k, n]
     std::optional<c10::ScalarType> out_dtype,
@@ -168,7 +169,7 @@ torch::Tensor fp8_gemm_w8a16(
   return result;
 }
 
-torch::Tensor fp4_gemm(
+torch::Tensor fp4_gemm_onednn(
     const torch::Tensor& A,
     const torch::Tensor& B,
     const torch::Tensor& A_scale,
