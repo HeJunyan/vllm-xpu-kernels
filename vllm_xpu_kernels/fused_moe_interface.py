@@ -14,7 +14,8 @@ except ImportError as e:
     FUSEDMOE_UNAVAILABLE_REASON = str(e)
     FUSEDMOE_AVAILABLE = False
 
-from .moe_utils import mxfp_scale_padded_rows, quant_act_xpu, ref_fused_moe
+from .moe_utils import (fused_act_quant_xpu, moe_activation_op,
+                        mxfp_scale_padded_rows, quant_act_xpu, ref_fused_moe)
 
 REF_FUSED_MOE_ENV = "VLLM_XPU_FUSED_MOE_USE_REF"
 USE_MXFP4_FP8_ENV = "VLLM_XPU_FUSED_MOE_USE_MXFP4_FP8"
@@ -175,20 +176,7 @@ def compute_num_tokens_per_block(num_tokens, num_experts_per_node):
 
 
 def fused_moe_activation(act_output, gemm1_output, activation):
-    if activation == "silu":
-        torch.ops._C.silu_and_mul(act_output, gemm1_output)
-    elif activation == "gelu":
-        torch.ops._C.gelu_and_mul(act_output, gemm1_output)
-    elif activation == "gelu_tanh":
-        torch.ops._C.gelu_tanh_and_mul(act_output, gemm1_output)
-    elif activation == "swigluoai" or ("SWIGLUOAI" in str(activation)):
-        torch.ops._C.swigluoai_and_mul(act_output, gemm1_output, 1.702, 7.0)
-    elif activation == "relu2_no_mul":
-        torch.ops._C.relu2_no_mul(act_output, gemm1_output)
-    elif activation == "swiglustep":
-        torch.ops._C.swiglustep_and_mul(act_output, gemm1_output, 7.0)
-    else:
-        raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
+    moe_activation_op(activation)(act_output, gemm1_output)
 
 def implement_zp(qweight):
     # change u4 to s4 to avoid zero point in gemm kernel
@@ -327,22 +315,7 @@ class XpuFusedMoe:
         self.gemm1_clamp_limit = gemm1_clamp_limit
         self.recipe = _get_recipe(is_fp8, is_mxfp8, is_mxfp4, is_int4,
                                    is_block_fp8)
-        if self.activation == "silu":
-            self.act_func = torch.ops._C.silu_and_mul
-        elif self.activation == "gelu":
-            self.act_func = torch.ops._C.gelu_and_mul
-        elif self.activation == "gelu_tanh":
-            self.act_func = torch.ops._C.gelu_tanh_and_mul
-        elif self.activation == "swigluoai" \
-            or ("SWIGLUOAI" in str(self.activation)):
-            self.act_func = torch.ops._C.swigluoai_and_mul
-        elif self.activation == "relu2_no_mul":
-            self.act_func = torch.ops._C.relu2_no_mul
-        elif self.activation == "swiglustep":
-            self.act_func = torch.ops._C.swiglustep_and_mul
-        else:
-            raise ValueError(
-                f"Unsupported FusedMoe activation: {self.activation}.")
+        self.act_func = moe_activation_op(self.activation)
 
         self.expert_map = expert_map
         if self.expert_map is None and self.ep_size > 1:
@@ -530,12 +503,21 @@ class XpuFusedMoe:
             gate.clamp_(max=self.gemm1_clamp_limit)
             up.clamp_(min=-self.gemm1_clamp_limit, max=self.gemm1_clamp_limit)
 
-        # act
-        act_output = torch.empty(
-            (num_moe_inputs, self.inter_size * self.inter_size_scale),
-            dtype=gemm1_output.dtype,
-            device=gemm1_output.device)
-        self.act_func(act_output, gemm1_output)
+        # act. When the recipe has a fused SiLU+quant kernel the bf16
+        # intermediate is never materialized, so the activation and the gemm2
+        # input quantization cost a single pass instead of two.
+        fused_act = None
+        if act_quant:
+            fused_act = fused_act_quant_xpu(self.activation, gemm1_output,
+                                            self.recipe, expert_scale_desc,
+                                            padded_scale_rows,
+                                            static_scale=a2_scale)
+        if fused_act is None:
+            act_output = torch.empty(
+                (num_moe_inputs, self.inter_size * self.inter_size_scale),
+                dtype=gemm1_output.dtype,
+                device=gemm1_output.device)
+            self.act_func(act_output, gemm1_output)
 
         ########### gemm2 ##################
         gemm2_output = torch.empty((num_moe_inputs, gemm_hidden_size),
@@ -545,9 +527,12 @@ class XpuFusedMoe:
             # mx recipes get the padded MN-major surface straight out of the
             # quant kernel: the rows are already grouped per expert here, so
             # the descriptor tells it where each scale belongs.
-            act_output, gemm2_act_scale = quant_act_xpu(
-                act_output, self.recipe, expert_scale_desc, padded_scale_rows,
-                static_scale=a2_scale)
+            if fused_act is not None:
+                act_output, gemm2_act_scale = fused_act
+            else:
+                act_output, gemm2_act_scale = quant_act_xpu(
+                    act_output, self.recipe, expert_scale_desc,
+                    padded_scale_rows, static_scale=a2_scale)
             assert (expert_scale_desc is not None
                     or gemm2_act_scale.dtype != torch.float8_e8m0fnu), \
                 "mx activation scales must come from the fused layout path"
