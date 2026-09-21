@@ -41,3 +41,33 @@ void chunk_gated_delta_rule_xe2(
       num_decodes,
       token_indx);
 }
+
+void gdn_decode_xe2(
+    sycl::queue& queue,
+    torch::Tensor& core_attn_out,
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& b,
+    const torch::Tensor& a,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    torch::Tensor& ssm_state,
+    const torch::Tensor& cache_indices,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const int num_decodes) {
+  gdn::recurrent_gated_delta_rule_impl_xe2(
+      queue,
+      core_attn_out,
+      q,
+      k,
+      v,
+      b,
+      a,
+      A_log,
+      dt_bias,
+      ssm_state,
+      cache_indices,
+      has_initial_state,
+      num_decodes);
+}

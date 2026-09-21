@@ -374,10 +374,18 @@ def test_gated_delta_rule(num_actual_tokens, batch_size, num_k_heads,
     if batch_size > num_actual_tokens:
         batch_size = num_actual_tokens
 
-    # The cutlass xe35 delta kernel requires every prefill sequence length to be
-    # a multiple of chunk_size (64), so cap the sequence count to what an aligned
-    # distribution of num_actual_tokens can support.
-    if _GDN_USES_CUTLASS:
+    # Mixed prefill+decode batches route through the chunked prefill kernel,
+    # which on the cutlass build has no partial-chunk path and cannot serve the
+    # 1-token decode rows of a mixed batch. The cutlass build covers the pure
+    # prefill and pure decode modes only.
+    if _GDN_USES_CUTLASS and mode == "mix_mode":
+        pytest.skip("cutlass GDN build handles only pure prefill or pure decode")
+
+    # The cutlass xe35 prefill kernel requires every prefill sequence length to
+    # be a multiple of chunk_size (64), so cap the sequence count to what an
+    # aligned distribution of num_actual_tokens can support. Pure decode uses
+    # the recurrent kernel (one token per sequence) and needs no alignment.
+    if _GDN_USES_CUTLASS and mode == "prefill":
         _max_aligned_seqs = max(1, num_actual_tokens // 64)
         if batch_size > _max_aligned_seqs:
             batch_size = _max_aligned_seqs
@@ -435,10 +443,10 @@ def test_gated_delta_rule(num_actual_tokens, batch_size, num_k_heads,
         conv_bias = torch.randn((mixed_qkv_size), dtype=dtype, device=device)
 
     if _GDN_USES_CUTLASS:
-        # The cutlass xe35 delta kernel clamps the decay gate through a pivot
-        # that is only accurate for gentle (near-1) decay. Large positive A_log
-        # (exp(A_log) >> 1) drives it out of that domain, so match the cutlass
-        # reference testbed's realistic A_log range instead of full randn.
+        # Keep A_log in a realistic (gentle-decay) range for the cutlass path.
+        # The prefill kernel clamps the decay gate through a pivot that is only
+        # accurate near 1, so large positive A_log (exp(A_log) >> 1) mismatches;
+        # the decode kernel tolerates a wider range but this stays within it.
         A_log = torch.empty((num_v_heads // tp_size),
                             dtype=torch.float32,
                             device=device).uniform_(-4.0, 0.0)

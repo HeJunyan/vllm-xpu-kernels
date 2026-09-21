@@ -15,6 +15,7 @@
 // macro only selects which one the op calls.
 #ifdef VLLM_GDN_USE_CUTLASS
 #include "gdn_attention/xe35_chunk_gated_delta_rule_launch.hpp"
+#include "gdn_decode/xe35_recurrent_gated_delta_rule_kernels.hpp"
 #endif
 
 namespace gdn {
@@ -2252,6 +2253,123 @@ void chunk_gated_delta_rule_impl_xe2(
 
 #undef DISPATCH_STATE_DTYPE
 #undef KERNEL_LAUNCHER
+}
+
+// Decode path (exactly one token per sequence). Dual-path sibling of
+// chunk_gated_delta_rule_impl_xe2: when VLLM_GDN_USE_CUTLASS is defined the op
+// dispatches decode to the cutlass xe35 recurrent kernel. The in-tree build
+// keeps routing decode through the native gated_delta_rule in the interface, so
+// this impl is only reached on the cutlass path.
+void recurrent_gated_delta_rule_impl_xe2(
+    sycl::queue& queue,
+    torch::Tensor& core_attn_out,  // [num_decodes, num_v_heads, head_v_dim]
+    const torch::Tensor& q,        // [num_decodes, num_k_heads, head_k_dim]
+    const torch::Tensor& k,        // [num_decodes, num_k_heads, head_k_dim]
+    const torch::Tensor& v,        // [num_decodes, num_v_heads, head_v_dim]
+    const torch::Tensor& b,        // [num_decodes, num_v_heads]
+    const torch::Tensor& a,        // [num_decodes, num_v_heads]
+    const torch::Tensor& A_log,    // [num_v_heads]
+    const torch::Tensor& dt_bias,  // [num_v_heads]
+    torch::Tensor&
+        ssm_state,  // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
+    const torch::Tensor& cache_indices,  // [num_decodes]
+    const std::optional<torch::Tensor>& has_initial_state,  // [num_decodes]
+    const int num_decodes) {
+#ifdef VLLM_GDN_USE_CUTLASS
+  const int batch_size = num_decodes;
+  const int num_k_heads = q.size(1);
+  const int head_k_dim = q.size(2);
+  const int num_v_heads = v.size(1);
+  const int head_v_dim = v.size(2);
+
+  // The cutlass xe35 decode kernel L2-normalizes q/k and applies sigmoid(b) /
+  // softplus(a) in-kernel, so it consumes the raw conv outputs, exactly like
+  // the native decode kernel. Only bf16 activations are wired up here.
+  TORCH_CHECK(
+      core_attn_out.scalar_type() == at::kBFloat16 &&
+          q.scalar_type() == at::kBFloat16 &&
+          k.scalar_type() == at::kBFloat16 &&
+          v.scalar_type() == at::kBFloat16 &&
+          dt_bias.scalar_type() == at::kBFloat16,
+      "cutlass GDN decode requires bfloat16 q/k/v/dt_bias/core_attn_out");
+  TORCH_CHECK(A_log.scalar_type() == at::kFloat, "A_log must be float32");
+  TORCH_CHECK(
+      cache_indices.scalar_type() == at::kInt && cache_indices.is_contiguous(),
+      "cache_indices must be a contiguous int32 tensor");
+
+  // Gates arrive token-major [num_decodes, num_v_heads] in the activation
+  // dtype. The kernel wants head-major fp32 [num_v_heads, num_decodes]; convert
+  // with a real dtype cast + physical relayout (no activation applied here).
+  auto to_head_major_fp32 = [](const torch::Tensor& t) {
+    return t.to(at::kFloat).transpose(0, 1).contiguous();
+  };
+  const torch::Tensor beta_logits_hm = to_head_major_fp32(b);
+  const torch::Tensor a_hm = to_head_major_fp32(a);
+
+#define DECODE_LAUNCHER(state_scalar_t)                                        \
+  {                                                                            \
+    cutlass::gdn::GDNDecodeArguments args{};                                   \
+    args.batch_size = batch_size;                                              \
+    args.total_seqlen = batch_size;                                            \
+    args.num_k_heads = num_k_heads;                                            \
+    args.num_v_heads = num_v_heads;                                            \
+    args.head_k_dim = head_k_dim;                                              \
+    args.head_v_dim = head_v_dim;                                              \
+    args.ssm_state_stride_0 = static_cast<int>(ssm_state.stride(0));           \
+    args.q = q.data_ptr();                                                     \
+    args.k = k.data_ptr();                                                     \
+    args.v = v.data_ptr();                                                     \
+    args.beta_logits = beta_logits_hm.data_ptr<float>();                       \
+    args.a = a_hm.data_ptr<float>();                                           \
+    args.A_log = A_log.data_ptr<float>();                                      \
+    args.dt_bias = dt_bias.data_ptr();                                         \
+    args.query_start_loc = nullptr;                                            \
+    args.cache_indices = cache_indices.data_ptr<int32_t>();                    \
+    args.has_initial_state =                                                   \
+        has_initial_state.has_value()                                          \
+            ? has_initial_state->data_ptr<bool>()                             \
+            : nullptr;                                                         \
+    args.core_attn_out = core_attn_out.data_ptr();                            \
+    args.ssm_state = ssm_state.data_ptr();                                    \
+    cutlass::Status st_ =                                                      \
+        cutlass::gdn::recurrent_gated_delta_rule_launch<bfloat16_t,           \
+                                                        state_scalar_t>(       \
+            queue, args);                                                     \
+    TORCH_CHECK(                                                               \
+        st_ == cutlass::Status::kSuccess,                                      \
+        "cutlass GDN decode launch rejected, status=", int(st_));             \
+  }
+
+  if (ssm_state.scalar_type() == at::kFloat) {
+    DECODE_LAUNCHER(float)
+  } else if (ssm_state.scalar_type() == at::kBFloat16) {
+    DECODE_LAUNCHER(bfloat16_t)
+  } else {
+    TORCH_CHECK(
+        false,
+        "cutlass GDN decode ssm_state dtype must be float32/bfloat16, but got ",
+        ssm_state.scalar_type());
+  }
+#undef DECODE_LAUNCHER
+#else
+  (void)queue;
+  (void)core_attn_out;
+  (void)q;
+  (void)k;
+  (void)v;
+  (void)b;
+  (void)a;
+  (void)A_log;
+  (void)dt_bias;
+  (void)ssm_state;
+  (void)cache_indices;
+  (void)has_initial_state;
+  (void)num_decodes;
+  TORCH_CHECK(
+      false,
+      "recurrent_gated_delta_rule_impl_xe2 requires a VLLM_GDN_USE_CUTLASS "
+      "build");
+#endif  // VLLM_GDN_USE_CUTLASS
 }
 
 }  // namespace gdn

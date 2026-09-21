@@ -636,6 +636,26 @@ void gated_delta_rule(
           num_decodes,
           token_indx_ptr);
     } else {
+#ifdef VLLM_GDN_USE_CUTLASS
+      // Dual-path decode: dispatch the pure-decode batch to the cutlass xe35
+      // recurrent kernel, mirroring the prefill cutlass path above. Spec decode
+      // (handled earlier) and mixed prefill+decode (the num_prefills>0 branch)
+      // stay on their existing kernels.
+      gdn_decode_xe2(
+          queue,
+          core_attn_out_active,
+          q,
+          k,
+          v,
+          b,
+          a,
+          A_log,
+          dt_bias,
+          ssm_state,
+          *non_spec_state_indices_tensor,
+          has_initial_state,
+          num_decodes);
+#else
       gdn::gated_delta_rule(
           queue,
           core_attn_out_active,
@@ -655,6 +675,7 @@ void gated_delta_rule(
           num_prefills,
           num_decodes,
           num_spec_decodes);
+#endif  // VLLM_GDN_USE_CUTLASS
     }
 #else
     gdn::gated_delta_rule(
