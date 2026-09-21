@@ -16,6 +16,13 @@ add_xe2_kernel_library(gdn_attn_kernels_xe_2 INCLUDE_CMAKE_SOURCE_DIR)
 get_target_property(_gdn_defs gdn_attn_kernels_xe_2 COMPILE_DEFINITIONS)
 list(REMOVE_ITEM _gdn_defs "VLLM_GRF_SIZE=256")
 list(APPEND _gdn_defs "__SYCL_TARGET_INTEL_GPU_CRI__" "VLLM_GRF_SIZE=512")
+# Dual GDN path: default to the cutlass xe35 2-kernel reference. Set
+# -DGDN_USE_CUTLASS=OFF at configure time to fall back to our in-tree kernels.
+option(GDN_USE_CUTLASS "Dispatch the GDN op to the cutlass xe35 reference kernel"
+       ON)
+if(GDN_USE_CUTLASS)
+  list(APPEND _gdn_defs "VLLM_GDN_USE_CUTLASS")
+endif()
 set_target_properties(gdn_attn_kernels_xe_2
                       PROPERTIES COMPILE_DEFINITIONS "${_gdn_defs}")
 

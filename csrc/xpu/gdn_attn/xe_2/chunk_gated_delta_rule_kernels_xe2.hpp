@@ -8,6 +8,15 @@
 #include "gdn_attn_utils.h"
 #include "csrc/utils.h"
 
+// Dual path: when VLLM_GDN_USE_CUTLASS is defined (default, set by the gdn
+// CMakeLists), chunk_gated_delta_rule_impl_xe2 dispatches to the cutlass-sycl
+// xe35 2-kernel reference (compute_A_o2 + fwd_o, W/U kept in SLM). Otherwise it
+// runs our own in-tree kernels via kernel_launcher(). Both are compiled; the
+// macro only selects which one the op calls.
+#ifdef VLLM_GDN_USE_CUTLASS
+#include "gdn_attention/xe35_chunk_gated_delta_rule_launch.hpp"
+#endif
+
 namespace gdn {
 using namespace cute;
 static constexpr int MaxThreadsPerSM = 512;
@@ -2109,7 +2118,59 @@ void chunk_gated_delta_rule_impl_xe2(
   auto device = core_attn_out.device();
 
   int padding_size = batch_size * (chunk_size - 1);
+  (void)padding_size;
 
+#ifdef VLLM_GDN_USE_CUTLASS
+  // ---- cutlass xe35 reference path (default) ----
+  (void)total_seqlen;
+  // Only two gmem intermediates cross the launch boundary: A and o2 (W/U stay
+  // in SLM). Sizes match cutlass::gdn::get_workspace_sizes exactly.
+  torch::Tensor A = torch::empty(
+      {num_v_heads, total_virtual_seqlen, chunk_size},
+      torch::dtype(dtype).device(device).requires_grad(false));
+  torch::Tensor o2 = torch::empty(
+      {num_k_heads, total_virtual_seqlen, chunk_size},
+      torch::dtype(dtype).device(device).requires_grad(false));
+
+#define KERNEL_LAUNCHER(scalar_t, state_scalar_t)                              \
+  {                                                                            \
+    cutlass::gdn::GDNArguments args{};                                         \
+    args.batch_size = batch_size;                                             \
+    args.total_seqlen = total_virtual_seqlen;                                \
+    args.total_virtual_seqlen = total_virtual_seqlen;                        \
+    args.num_k_heads = num_k_heads;                                           \
+    args.num_v_heads = num_v_heads;                                           \
+    args.head_k_dim = head_k_dim;                                             \
+    args.head_v_dim = head_v_dim;                                             \
+    args.ssm_state_stride_0 = ssm_state_stride_0;                            \
+    args.q = q.data_ptr();                                                    \
+    args.k = k.data_ptr();                                                    \
+    args.v = v.data_ptr();                                                    \
+    args.b = reinterpret_cast<const float*>(b.data_ptr());                   \
+    args.a = reinterpret_cast<float*>(a.data_ptr());                         \
+    args.A_log = reinterpret_cast<const float*>(A_log.data_ptr());           \
+    args.dt_bias = dt_bias.data_ptr();                                        \
+    args.query_start_loc =                                                    \
+        reinterpret_cast<const int*>(query_start_loc.data_ptr());            \
+    args.cache_indices =                                                      \
+        reinterpret_cast<const int*>(cache_indices.data_ptr());              \
+    args.has_initial_state =                                                  \
+        has_initial_state.has_value()                                        \
+            ? reinterpret_cast<const bool*>(has_initial_state->data_ptr())   \
+            : nullptr;                                                        \
+    args.core_attn_out = core_attn_out.data_ptr();                           \
+    args.ssm_state = ssm_state.data_ptr();                                    \
+    args.A_workspace = A.data_ptr();                                          \
+    args.o2_workspace = o2.data_ptr();                                        \
+    cutlass::Status st_ =                                                     \
+        cutlass::gdn::chunk_gated_delta_rule_launch<scalar_t, state_scalar_t>(\
+            queue, args);                                                    \
+    TORCH_CHECK(st_ == cutlass::Status::kSuccess,                            \
+                "gdn ref launch rejected, status=", int(st_),               \
+                " tvs=", total_virtual_seqlen);                              \
+  }
+#else
+  // ---- our in-tree kernel path ----
   torch::Tensor A = torch::empty(
       {num_v_heads, total_seqlen + padding_size, chunk_size},
       torch::dtype(dtype).device(device).requires_grad(false));
@@ -2155,6 +2216,7 @@ void chunk_gated_delta_rule_impl_xe2(
       head_k_dim,                                                  \
       num_v_heads,                                                 \
       head_v_dim);
+#endif  // VLLM_GDN_USE_CUTLASS
 
 #define DISPATCH_STATE_DTYPE(scalar_t)                                  \
   do {                                                                  \
