@@ -227,6 +227,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "num_accepted_tokens, int num_actual_tokens, int "
       "tp_size, bool reorder_input) -> ()");
   xpu_ops.impl("gdn_attention", torch::kXPU, &gdn_attention);
+
+  xpu_ops.def("gdn_uses_cutlass() -> bool");
+  xpu_ops.impl("gdn_uses_cutlass", &gdn_uses_cutlass);
 #endif
 
   // for empty tensor functions, we don't need dispatch key like torch::kXPU

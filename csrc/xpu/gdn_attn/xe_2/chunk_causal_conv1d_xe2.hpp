@@ -513,7 +513,10 @@ struct chunk_reorder_zba_kernel {
           float b_value = mixed_ba[step + k_head_id * kv_ratio + e];
           float a_value =
               mixed_ba[step + num_v_heads + k_head_id * kv_ratio + e];
+#ifndef VLLM_GDN_USE_CUTLASS
+          // cutlass xe35 delta kernel sigmoids b itself; emit raw b here.
           b_value = act_sigmoid(b_value);
+#endif
           b_out
               [(k_head_id * kv_ratio + e) * num_virtual_tokens + out_token_id] =
                   b_value;
@@ -529,7 +532,10 @@ struct chunk_reorder_zba_kernel {
         for (int e = 0; e < kv_ratio; ++e) {
           float b_value = mixed_ba[step + e];
           float a_value = mixed_ba[step + kv_ratio + e];
+#ifndef VLLM_GDN_USE_CUTLASS
+          // cutlass xe35 delta kernel sigmoids b itself; emit raw b here.
           b_value = act_sigmoid(b_value);
+#endif
           b_out
               [(k_head_id * kv_ratio + e) * num_virtual_tokens + out_token_id] =
                   b_value;

@@ -13,6 +13,17 @@
   #include "xe_2/chunk_gated_delta_rule_xe2.h"
 #endif
 
+// Returns whether this build dispatches the XE2 prefill delta stage to the
+// cutlass xe35 reference kernel. Kept in sync with the VLLM_GDN_USE_CUTLASS
+// define forwarded from CMake (see CMakeLists.txt / xe_2/CMakeLists.txt).
+bool gdn_uses_cutlass() {
+#ifdef VLLM_GDN_USE_CUTLASS
+  return true;
+#else
+  return false;
+#endif
+}
+
 // Conv stage of GatedDeltaNet linear attention. Runs the causal conv1d (plus
 // activation), writes z, updates conv_state, and returns the intermediate
 // {q, k, v, b, a} tensors consumed by gated_delta_rule. A single invocation
@@ -397,8 +408,17 @@ std::vector<torch::Tensor> causal_conv1d(
       constexpr int tiled_feats_per_wg =
           256;  // wg_size(64) * elems_per_item(4)
       const bool use_tiled = (non_spec_token >= gdn::conv1d_tile_size);
+#ifdef VLLM_GDN_USE_CUTLASS
+      // The cutlass xe35 delta kernel L2-normalizes q/k (and sigmoids b) itself,
+      // so the conv stage must feed it raw q/k/b. Disable both the fused and the
+      // standalone l2norm here; b's sigmoid is likewise skipped in the conv
+      // kernels under VLLM_GDN_USE_CUTLASS.
+      const bool fuse_l2norm = false;
+      (void)tiled_feats_per_wg;
+#else
       const bool fuse_l2norm =
           use_tiled ? (2 * head_k_dim <= tiled_feats_per_wg) : true;
+#endif
 
       if (use_tiled) {
         gdn::chunk_causal_conv1d_tiled_xe2(
@@ -454,7 +474,9 @@ std::vector<torch::Tensor> causal_conv1d(
 
       // Run standalone l2norm kernel when not fused into conv1d
       if (!fuse_l2norm) {
+#ifndef VLLM_GDN_USE_CUTLASS
         l2norm(queue, q, k);
+#endif
       }
 
       intermediates.push_back(q);

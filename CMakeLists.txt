@@ -585,6 +585,15 @@ if(MOE_KERNELS_ENABLED)
 endif()
 if(GDN_KERNELS_ENABLED)
   list(APPEND VLLM_GPU_COMPILE_FLAGS -DVLLM_GDN_ENABLED)
+  # The GDN op dual-path switch (GDN_USE_CUTLASS) is defined in the
+  # csrc/xpu/gdn_attn/xe_2 subdirectory and only sets VLLM_GDN_USE_CUTLASS on the
+  # gdn_attn_kernels_xe_2 library. The conv stage in gdn_attn_interface.cpp lives
+  # in the _xpu_C extension and must skip the duplicate q/k L2-norm + b sigmoid
+  # when the cutlass xe35 delta kernel (which does them itself) is the active
+  # path, so forward the same define here.
+  if(GDN_USE_CUTLASS)
+    list(APPEND VLLM_GPU_COMPILE_FLAGS -DVLLM_GDN_USE_CUTLASS)
+  endif()
 endif()
 if(MQA_LOGITS_KERNELS_ENABLED)
   list(APPEND VLLM_GPU_COMPILE_FLAGS -DVLLM_MQA_LOGITS_ENABLED)

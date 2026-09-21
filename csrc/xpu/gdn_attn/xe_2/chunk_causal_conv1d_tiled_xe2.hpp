@@ -552,7 +552,11 @@ struct chunk_causal_conv1d_tiled_kernel {
           b_val = static_cast<float>(mixed_ba[step + e]);
           a_val = static_cast<float>(mixed_ba[step + kv_ratio + e]);
         }
+#ifndef VLLM_GDN_USE_CUTLASS
+        // On the cutlass xe35 path the delta kernel applies sigmoid(b) itself;
+        // emit raw b here to avoid double activation.
         b_val = 1.0f / (1.0f + sycl::exp(-b_val));
+#endif
         b_out[(k_head_id * kv_ratio + e) * num_virtual_tokens + out_token_id] =
             b_val;
         a_out[(k_head_id * kv_ratio + e) * num_virtual_tokens + out_token_id] =

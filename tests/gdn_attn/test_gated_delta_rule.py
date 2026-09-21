@@ -19,6 +19,31 @@ from test_gdn_attn import simple_random_distribute  # noqa: E402
 import vllm_xpu_kernels._xpu_C  # noqa: F401
 from tests.utils import format_tc
 
+# When built with VLLM_GDN_USE_CUTLASS, the XE2 prefill delta kernel is the
+# cutlass xe35 reference, which L2-normalizes q/k and sigmoids b itself. On such
+# builds the conv stage emits raw q/k/b, so the reference below must fold the
+# sigmoid back into beta for the XE2-layout intermediates.
+try:
+    _GDN_USES_CUTLASS = bool(torch.ops._xpu_C.gdn_uses_cutlass())
+except Exception:
+    _GDN_USES_CUTLASS = False
+
+
+def _chunk_aligned_distribute(num_tokens, num_seqs, chunk=64):
+    """Distribute num_tokens (a multiple of chunk) into num_seqs sequences whose
+    lengths are each a positive multiple of chunk.
+
+    The cutlass xe35 delta kernel has no partial-chunk path -- every prefill
+    sequence must be chunk-aligned or the kernel runs on unnormalized padded
+    rows and produces NaNs. Mirrors simple_random_distribute but in chunk units.
+    """
+    total_chunks = num_tokens // chunk
+    assert num_tokens % chunk == 0 and total_chunks >= num_seqs
+    lengths = torch.ones([num_seqs])
+    for _ in range(total_chunks - num_seqs):
+        lengths[random.randint(0, num_seqs - 1)] += 1
+    return lengths * chunk
+
 # QWEN NEXT shape
 NUM_TOKENS = [1, 32, 1024, 8192]
 BATCH_SIZE = [32]
@@ -111,9 +136,13 @@ def unpad_intermediates(intermediates, query_start_loc, num_actual_tokens):
         q_n[s:e] = q[base:base + seq_len]
         k_n[s:e] = k[base:base + seq_len]
         v_n[s:e] = v[base:base + seq_len]
-        # b is already sigmoid'd (beta) in the XE2 conv kernel; a is raw.
-        beta_slice = b[:, base:base + seq_len].transpose(0, 1)
-        beta_n[s:e] = beta_slice.to(torch.float32)
+        # b is the beta gate. On non-cutlass builds the XE2 conv kernel already
+        # folded in the sigmoid; on cutlass builds conv emits raw b (the delta
+        # kernel sigmoids it), so apply it here to match. a is raw.
+        beta_slice = b[:, base:base + seq_len].transpose(0, 1).to(torch.float32)
+        if _GDN_USES_CUTLASS:
+            beta_slice = torch.sigmoid(beta_slice)
+        beta_n[s:e] = beta_slice
         a_n[s:e] = a[:, base:base + seq_len].transpose(0, 1).to(torch.float32)
         pre_chunks += (seq_len + chunk - 1) // chunk
 
@@ -335,8 +364,23 @@ def test_gated_delta_rule(num_actual_tokens, batch_size, num_k_heads,
 
     assert head_k_dim == head_v_dim
 
+    # The cutlass xe35 delta kernel is validated only for bf16 (its own unit
+    # tests instantiate bfloat16_t, and the target workload is bf16). With raw
+    # (un-normalized) q/k fed per its contract, float16 intermediates overflow
+    # half's 65504 range and produce NaNs, so restrict the cutlass path to bf16.
+    if _GDN_USES_CUTLASS and dtype == torch.float16:
+        pytest.skip("cutlass xe35 GDN kernel is validated for bf16 only")
+
     if batch_size > num_actual_tokens:
         batch_size = num_actual_tokens
+
+    # The cutlass xe35 delta kernel requires every prefill sequence length to be
+    # a multiple of chunk_size (64), so cap the sequence count to what an aligned
+    # distribution of num_actual_tokens can support.
+    if _GDN_USES_CUTLASS:
+        _max_aligned_seqs = max(1, num_actual_tokens // 64)
+        if batch_size > _max_aligned_seqs:
+            batch_size = _max_aligned_seqs
 
     if mode == "prefill":
         num_prefills = batch_size
@@ -350,6 +394,16 @@ def test_gated_delta_rule(num_actual_tokens, batch_size, num_k_heads,
 
     num_decodes = batch_size - num_prefills
     cache_batch_size = 200
+
+    # cutlass GDN needs chunk(64)-aligned prefill sequences; skip configs where
+    # an aligned distribution of the prefill tokens is impossible (too few
+    # tokens, or a non-multiple-of-64 prefill token count).
+    if _GDN_USES_CUTLASS and num_prefills > 0:
+        _prefill_tokens = num_actual_tokens - num_decodes
+        if (_prefill_tokens % 64 != 0
+                or (batch_size - num_decodes) > _prefill_tokens // 64):
+            pytest.skip(
+                "cutlass GDN requires chunk(64)-aligned prefill sequences")
 
     mixed_qkvz_size = num_k_heads // tp_size * (
         2 * head_k_dim + 2 * head_v_dim * num_v_heads // num_k_heads)
@@ -380,13 +434,26 @@ def test_gated_delta_rule(num_actual_tokens, batch_size, num_k_heads,
     if has_bias:
         conv_bias = torch.randn((mixed_qkv_size), dtype=dtype, device=device)
 
-    A_log = torch.randn((num_v_heads // tp_size),
-                        dtype=torch.float32,
-                        device=device)
+    if _GDN_USES_CUTLASS:
+        # The cutlass xe35 delta kernel clamps the decay gate through a pivot
+        # that is only accurate for gentle (near-1) decay. Large positive A_log
+        # (exp(A_log) >> 1) drives it out of that domain, so match the cutlass
+        # reference testbed's realistic A_log range instead of full randn.
+        A_log = torch.empty((num_v_heads // tp_size),
+                            dtype=torch.float32,
+                            device=device).uniform_(-4.0, 0.0)
+    else:
+        A_log = torch.randn((num_v_heads // tp_size),
+                            dtype=torch.float32,
+                            device=device)
     dt_bias = torch.randn((num_v_heads // tp_size), dtype=dtype, device=device)
 
-    prefill_batches = simple_random_distribute(num_actual_tokens - num_decodes,
-                                               batch_size - num_decodes)
+    if _GDN_USES_CUTLASS:
+        prefill_batches = _chunk_aligned_distribute(
+            num_actual_tokens - num_decodes, batch_size - num_decodes)
+    else:
+        prefill_batches = simple_random_distribute(
+            num_actual_tokens - num_decodes, batch_size - num_decodes)
     token_batches = torch.cat([torch.ones([num_decodes]),
                                prefill_batches]).to(device)
     perm = torch.randperm(token_batches.size(0)).to(device)
