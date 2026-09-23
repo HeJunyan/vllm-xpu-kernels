@@ -8,15 +8,13 @@
 #include "gdn_attn_utils.h"
 #include "csrc/utils.h"
 
-// Dual path: when VLLM_GDN_USE_CUTLASS is defined (default, set by the gdn
-// CMakeLists), chunk_gated_delta_rule_impl_xe2 dispatches to the cutlass-sycl
-// xe35 2-kernel reference (compute_A_o2 + fwd_o, W/U kept in SLM). Otherwise it
-// runs our own in-tree kernels via kernel_launcher(). Both are compiled; the
-// macro only selects which one the op calls.
-#ifdef VLLM_GDN_USE_CUTLASS
+// Dual path: both the cutlass xe35 kernels and the in-tree kernels are compiled
+// in. chunk_gated_delta_rule_impl_xe2 (prefill) and
+// recurrent_gated_delta_rule_impl_xe2 (decode) pick between them at runtime via
+// gdn_use_cutlass() (VLLM_GDN_USE_CUTLASS env var, default on). The cutlass
+// headers are only pulled into this xe2-library TU, never into _xpu_C.
 #include "gdn_attention/xe35_chunk_gated_delta_rule_launch.hpp"
 #include "gdn_decode/xe35_recurrent_gated_delta_rule_kernels.hpp"
-#endif
 
 namespace gdn {
 using namespace cute;
@@ -2120,20 +2118,58 @@ void chunk_gated_delta_rule_impl_xe2(
 
   int padding_size = batch_size * (chunk_size - 1);
   (void)padding_size;
+  const bool use_cutlass = gdn_use_cutlass();
 
-#ifdef VLLM_GDN_USE_CUTLASS
-  // ---- cutlass xe35 reference path (default) ----
-  (void)total_seqlen;
-  // Only two gmem intermediates cross the launch boundary: A and o2 (W/U stay
-  // in SLM). Sizes match cutlass::gdn::get_workspace_sizes exactly.
-  torch::Tensor A = torch::empty(
-      {num_v_heads, total_virtual_seqlen, chunk_size},
-      torch::dtype(dtype).device(device).requires_grad(false));
-  torch::Tensor o2 = torch::empty(
-      {num_k_heads, total_virtual_seqlen, chunk_size},
-      torch::dtype(dtype).device(device).requires_grad(false));
+  // Activation/state dtype dispatch, parameterized by a per-path launch macro so
+  // both backends share it without duplicating the type ladder.
+#define GDN_DISPATCH_STATE(LAUNCH, scalar_t)                              \
+  do {                                                                    \
+    if (ssm_state.scalar_type() == at::kFloat) {                          \
+      using state_scalar_t = float;                                       \
+      LAUNCH(scalar_t, state_scalar_t)                                    \
+    } else if (ssm_state.scalar_type() == at::kBFloat16) {                \
+      using state_scalar_t = bfloat16_t;                                  \
+      LAUNCH(scalar_t, state_scalar_t)                                    \
+    } else if (ssm_state.scalar_type() == at::kHalf) {                    \
+      using state_scalar_t = half_t;                                      \
+      LAUNCH(scalar_t, state_scalar_t)                                    \
+    } else {                                                              \
+      TORCH_CHECK(                                                        \
+          false,                                                          \
+          "ssm_state dtype must be float32/float16/bfloat16, but got ",   \
+          ssm_state.scalar_type());                                       \
+    }                                                                     \
+  } while (0)
 
-#define KERNEL_LAUNCHER(scalar_t, state_scalar_t)                              \
+#define GDN_DISPATCH_ACT(LAUNCH)                                          \
+  do {                                                                    \
+    if (core_attn_out.scalar_type() == at::kBFloat16) {                   \
+      using scalar_t = bfloat16_t;                                        \
+      GDN_DISPATCH_STATE(LAUNCH, scalar_t);                               \
+    } else if (core_attn_out.scalar_type() == at::kHalf) {                \
+      using scalar_t = half_t;                                            \
+      GDN_DISPATCH_STATE(LAUNCH, scalar_t);                               \
+    } else {                                                              \
+      TORCH_CHECK(                                                        \
+          false,                                                          \
+          "core_attn_out dtype must be float16/bfloat16, but got ",       \
+          core_attn_out.scalar_type());                                   \
+    }                                                                     \
+  } while (0)
+
+  if (use_cutlass) {
+    // ---- cutlass xe35 reference path (default) ----
+    (void)total_seqlen;
+    // Only two gmem intermediates cross the launch boundary: A and o2 (W/U stay
+    // in SLM). Sizes match cutlass::gdn::get_workspace_sizes exactly.
+    torch::Tensor A = torch::empty(
+        {num_v_heads, total_virtual_seqlen, chunk_size},
+        torch::dtype(dtype).device(device).requires_grad(false));
+    torch::Tensor o2 = torch::empty(
+        {num_k_heads, total_virtual_seqlen, chunk_size},
+        torch::dtype(dtype).device(device).requires_grad(false));
+
+#define LAUNCH_CUTLASS(scalar_t, state_scalar_t)                               \
   {                                                                            \
     cutlass::gdn::GDNArguments args{};                                         \
     args.batch_size = batch_size;                                             \
@@ -2170,25 +2206,27 @@ void chunk_gated_delta_rule_impl_xe2(
                 "gdn ref launch rejected, status=", int(st_),               \
                 " tvs=", total_virtual_seqlen);                              \
   }
-#else
-  // ---- our in-tree kernel path ----
-  torch::Tensor A = torch::empty(
-      {num_v_heads, total_seqlen + padding_size, chunk_size},
-      torch::dtype(dtype).device(device).requires_grad(false));
-  torch::Tensor w = torch::empty(
-      {num_v_heads, total_seqlen + padding_size, head_k_dim},
-      torch::dtype(dtype).device(device).requires_grad(false));
-  torch::Tensor u = torch::empty(
-      {num_v_heads, total_seqlen + padding_size, head_v_dim},
-      torch::dtype(dtype).device(device).requires_grad(false));
-  // Dedicated O2 scratch for the fused fwd_o+wu kernel. The standalone fwd_o
-  // reused A as O2 scratch, but the fused kernel still reads the inverted A in
-  // its inlined compute_wu, so O2 must not alias A.
-  torch::Tensor O2 = torch::empty(
-      {num_v_heads, total_seqlen + padding_size, chunk_size},
-      torch::dtype(dtype).device(device).requires_grad(false));
+    GDN_DISPATCH_ACT(LAUNCH_CUTLASS);
+#undef LAUNCH_CUTLASS
+  } else {
+    // ---- our in-tree kernel path ----
+    torch::Tensor A = torch::empty(
+        {num_v_heads, total_seqlen + padding_size, chunk_size},
+        torch::dtype(dtype).device(device).requires_grad(false));
+    torch::Tensor w = torch::empty(
+        {num_v_heads, total_seqlen + padding_size, head_k_dim},
+        torch::dtype(dtype).device(device).requires_grad(false));
+    torch::Tensor u = torch::empty(
+        {num_v_heads, total_seqlen + padding_size, head_v_dim},
+        torch::dtype(dtype).device(device).requires_grad(false));
+    // Dedicated O2 scratch for the fused fwd_o+wu kernel. The standalone fwd_o
+    // reused A as O2 scratch, but the fused kernel still reads the inverted A
+    // in its inlined compute_wu, so O2 must not alias A.
+    torch::Tensor O2 = torch::empty(
+        {num_v_heads, total_seqlen + padding_size, chunk_size},
+        torch::dtype(dtype).device(device).requires_grad(false));
 
-#define KERNEL_LAUNCHER(scalar_t, state_scalar_t)                  \
+#define LAUNCH_NATIVE(scalar_t, state_scalar_t)                    \
   kernel_launcher<scalar_t, state_scalar_t>(                       \
       queue,                                                       \
       reinterpret_cast<scalar_t*>(core_attn_out.data_ptr()),       \
@@ -2217,49 +2255,18 @@ void chunk_gated_delta_rule_impl_xe2(
       head_k_dim,                                                  \
       num_v_heads,                                                 \
       head_v_dim);
-#endif  // VLLM_GDN_USE_CUTLASS
-
-#define DISPATCH_STATE_DTYPE(scalar_t)                                  \
-  do {                                                                  \
-    if (ssm_state.scalar_type() == at::kFloat) {                        \
-      using state_scalar_t = float;                                     \
-      KERNEL_LAUNCHER(scalar_t, state_scalar_t)                         \
-    } else if (ssm_state.scalar_type() == at::kBFloat16) {              \
-      using state_scalar_t = bfloat16_t;                                \
-      KERNEL_LAUNCHER(scalar_t, state_scalar_t)                         \
-    } else if (ssm_state.scalar_type() == at::kHalf) {                  \
-      using state_scalar_t = half_t;                                    \
-      KERNEL_LAUNCHER(scalar_t, state_scalar_t)                         \
-    } else {                                                            \
-      TORCH_CHECK(                                                      \
-          false,                                                        \
-          "ssm_state dtype must be float32/float16/bfloat16, but got ", \
-          ssm_state.scalar_type());                                     \
-    }                                                                   \
-  } while (0)
-
-  if (core_attn_out.scalar_type() == at::kBFloat16) {
-    using scalar_t = bfloat16_t;
-    DISPATCH_STATE_DTYPE(scalar_t);
-  } else if (core_attn_out.scalar_type() == at::kHalf) {
-    using scalar_t = half_t;
-    DISPATCH_STATE_DTYPE(scalar_t);
-  } else {
-    TORCH_CHECK(
-        false,
-        "core_attn_out dtype must be float16/bfloat16, but got ",
-        core_attn_out.scalar_type());
+    GDN_DISPATCH_ACT(LAUNCH_NATIVE);
+#undef LAUNCH_NATIVE
   }
 
-#undef DISPATCH_STATE_DTYPE
-#undef KERNEL_LAUNCHER
+#undef GDN_DISPATCH_ACT
+#undef GDN_DISPATCH_STATE
 }
 
 // Decode path (exactly one token per sequence). Dual-path sibling of
-// chunk_gated_delta_rule_impl_xe2: when VLLM_GDN_USE_CUTLASS is defined the op
-// dispatches decode to the cutlass xe35 recurrent kernel. The in-tree build
-// keeps routing decode through the native gated_delta_rule in the interface, so
-// this impl is only reached on the cutlass path.
+// chunk_gated_delta_rule_impl_xe2: dispatches decode to the cutlass xe35
+// recurrent kernel. The interface only routes here when gdn_use_cutlass() is
+// true at runtime; otherwise decode stays on the native gated_delta_rule.
 void recurrent_gated_delta_rule_impl_xe2(
     sycl::queue& queue,
     torch::Tensor& core_attn_out,  // [num_decodes, num_v_heads, head_v_dim]
@@ -2275,7 +2282,6 @@ void recurrent_gated_delta_rule_impl_xe2(
     const torch::Tensor& cache_indices,  // [num_decodes]
     const std::optional<torch::Tensor>& has_initial_state,  // [num_decodes]
     const int num_decodes) {
-#ifdef VLLM_GDN_USE_CUTLASS
   const int batch_size = num_decodes;
   const int num_k_heads = q.size(1);
   const int head_k_dim = q.size(2);
@@ -2351,25 +2357,6 @@ void recurrent_gated_delta_rule_impl_xe2(
         ssm_state.scalar_type());
   }
 #undef DECODE_LAUNCHER
-#else
-  (void)queue;
-  (void)core_attn_out;
-  (void)q;
-  (void)k;
-  (void)v;
-  (void)b;
-  (void)a;
-  (void)A_log;
-  (void)dt_bias;
-  (void)ssm_state;
-  (void)cache_indices;
-  (void)has_initial_state;
-  (void)num_decodes;
-  TORCH_CHECK(
-      false,
-      "recurrent_gated_delta_rule_impl_xe2 requires a VLLM_GDN_USE_CUTLASS "
-      "build");
-#endif  // VLLM_GDN_USE_CUTLASS
 }
 
 }  // namespace gdn

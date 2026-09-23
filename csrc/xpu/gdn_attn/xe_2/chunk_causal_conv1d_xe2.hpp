@@ -451,7 +451,8 @@ struct chunk_reorder_zba_kernel {
       const int& num_k_heads,
       const int& head_k_dim,
       const int& num_v_heads,
-      const int& head_v_dim)
+      const int& head_v_dim,
+      const bool apply_b_sigmoid)
       : z_out(z_out),
         b_out(b_out),
         a_out(a_out),
@@ -464,7 +465,8 @@ struct chunk_reorder_zba_kernel {
         num_k_heads(num_k_heads),
         head_k_dim(head_k_dim),
         num_v_heads(num_v_heads),
-        head_v_dim(head_v_dim) {}
+        head_v_dim(head_v_dim),
+        apply_b_sigmoid(apply_b_sigmoid) {}
 
   inline int lookup(int t) const { return token_indx ? token_indx[t] : t; }
 
@@ -513,10 +515,11 @@ struct chunk_reorder_zba_kernel {
           float b_value = mixed_ba[step + k_head_id * kv_ratio + e];
           float a_value =
               mixed_ba[step + num_v_heads + k_head_id * kv_ratio + e];
-#ifndef VLLM_GDN_USE_CUTLASS
-          // cutlass xe35 delta kernel sigmoids b itself; emit raw b here.
-          b_value = act_sigmoid(b_value);
-#endif
+          // cutlass xe35 delta kernel sigmoids b itself; emit raw b when it is
+          // the active backend (apply_b_sigmoid == false).
+          if (apply_b_sigmoid) {
+            b_value = act_sigmoid(b_value);
+          }
           b_out
               [(k_head_id * kv_ratio + e) * num_virtual_tokens + out_token_id] =
                   b_value;
@@ -532,10 +535,11 @@ struct chunk_reorder_zba_kernel {
         for (int e = 0; e < kv_ratio; ++e) {
           float b_value = mixed_ba[step + e];
           float a_value = mixed_ba[step + kv_ratio + e];
-#ifndef VLLM_GDN_USE_CUTLASS
-          // cutlass xe35 delta kernel sigmoids b itself; emit raw b here.
-          b_value = act_sigmoid(b_value);
-#endif
+          // cutlass xe35 delta kernel sigmoids b itself; emit raw b when it is
+          // the active backend (apply_b_sigmoid == false).
+          if (apply_b_sigmoid) {
+            b_value = act_sigmoid(b_value);
+          }
           b_out
               [(k_head_id * kv_ratio + e) * num_virtual_tokens + out_token_id] =
                   b_value;
@@ -577,6 +581,7 @@ struct chunk_reorder_zba_kernel {
   const int head_k_dim;
   const int num_v_heads;
   const int head_v_dim;
+  const bool apply_b_sigmoid;
 };
 
 template <typename T>
@@ -687,7 +692,8 @@ void kernel_launcher(
     const int& conv_elems,
     const int& num_prefills,
     const int& num_decodes,
-    const bool fuse_l2norm) {
+    const bool fuse_l2norm,
+    const bool apply_b_sigmoid) {
   using KERNEL_MAIN = chunk_causal_conv1d_kernel<T, Width, ReorderInput>;
   auto range_main = KERNEL_MAIN::get_nd_range(
       num_actual_tokens, num_k_heads, head_k_dim, num_v_heads, head_v_dim);
@@ -757,7 +763,8 @@ void kernel_launcher(
         num_k_heads,
         head_k_dim,
         num_v_heads,
-        head_v_dim);
+        head_v_dim,
+        apply_b_sigmoid);
     cgh.parallel_for(range_zba, task);
   });
 
@@ -813,7 +820,8 @@ void chunk_causal_conv1d_xe2(
     const bool reorder_input,
     const int* token_indx = nullptr,
     int num_actual_tokens_override = -1,
-    const bool fuse_l2norm = false) {
+    const bool fuse_l2norm = false,
+    const bool apply_b_sigmoid = true) {
   if (num_prefills == 0 && num_decodes == 0) {
     return;
   }
@@ -875,7 +883,8 @@ void chunk_causal_conv1d_xe2(
       conv_elems,                                                  \
       num_prefills,                                                \
       num_decodes,                                                 \
-      fuse_l2norm);
+      fuse_l2norm,                                                 \
+      apply_b_sigmoid);
 
 #define WIDTH_DISPATCH(scalar_t, width, reorder_input) \
   switch (width) {                                     \

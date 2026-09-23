@@ -20,9 +20,9 @@ void chunk_gated_delta_rule_xe2(
     const int num_decodes,
     const int* token_indx = nullptr);
 
-// Decode entry point (one token per sequence). Only meaningful in a
-// VLLM_GDN_USE_CUTLASS build, where it dispatches to the cutlass xe35 recurrent
-// decode kernel; the interface routes here in place of the native decode path.
+// Decode entry point (one token per sequence). Dispatches to the cutlass xe35
+// recurrent decode kernel; the interface routes here in place of the native
+// decode path when gdn_use_cutlass() is true at runtime.
 void gdn_decode_xe2(
     sycl::queue& queue,
     torch::Tensor& core_attn_out,  // [num_decodes, num_v_heads, head_v_dim]

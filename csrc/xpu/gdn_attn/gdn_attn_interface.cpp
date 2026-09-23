@@ -13,16 +13,12 @@
   #include "xe_2/chunk_gated_delta_rule_xe2.h"
 #endif
 
-// Returns whether this build dispatches the XE2 prefill delta stage to the
-// cutlass xe35 reference kernel. Kept in sync with the VLLM_GDN_USE_CUTLASS
-// define forwarded from CMake (see CMakeLists.txt / xe_2/CMakeLists.txt).
-bool gdn_uses_cutlass() {
-#ifdef VLLM_GDN_USE_CUTLASS
-  return true;
-#else
-  return false;
-#endif
-}
+// Returns whether the GDN op currently dispatches to the cutlass xe35 kernels.
+// Both the cutlass and the in-tree kernels are compiled in; the choice is made
+// at runtime from the VLLM_GDN_USE_CUTLASS environment variable (default on).
+// Tests/callers use this to mirror the active input contract (raw vs
+// l2norm'd q/k, raw vs sigmoid'd b).
+bool gdn_uses_cutlass() { return gdn::gdn_use_cutlass(); }
 
 // Conv stage of GatedDeltaNet linear attention. Runs the causal conv1d (plus
 // activation), writes z, updates conv_state, and returns the intermediate
@@ -408,17 +404,16 @@ std::vector<torch::Tensor> causal_conv1d(
       constexpr int tiled_feats_per_wg =
           256;  // wg_size(64) * elems_per_item(4)
       const bool use_tiled = (non_spec_token >= gdn::conv1d_tile_size);
-#ifdef VLLM_GDN_USE_CUTLASS
-      // The cutlass xe35 delta kernel L2-normalizes q/k (and sigmoids b) itself,
-      // so the conv stage must feed it raw q/k/b. Disable both the fused and the
-      // standalone l2norm here; b's sigmoid is likewise skipped in the conv
-      // kernels under VLLM_GDN_USE_CUTLASS.
-      const bool fuse_l2norm = false;
-      (void)tiled_feats_per_wg;
-#else
+      // Runtime backend switch. The cutlass xe35 delta kernel L2-normalizes q/k
+      // and sigmoids b itself, so on that path the conv stage must feed it raw
+      // q/k/b: disable the fused and standalone l2norm and skip the b sigmoid.
+      // The in-tree path expects l2norm'd q/k and sigmoid'd b.
+      const bool use_cutlass = gdn::gdn_use_cutlass();
       const bool fuse_l2norm =
-          use_tiled ? (2 * head_k_dim <= tiled_feats_per_wg) : true;
-#endif
+          use_cutlass
+              ? false
+              : (use_tiled ? (2 * head_k_dim <= tiled_feats_per_wg) : true);
+      const bool apply_b_sigmoid = !use_cutlass;
 
       if (use_tiled) {
         gdn::chunk_causal_conv1d_tiled_xe2(
@@ -444,7 +439,8 @@ std::vector<torch::Tensor> causal_conv1d(
             reorder_input,
             token_indx_ptr,
             non_spec_token,
-            fuse_l2norm);
+            fuse_l2norm,
+            apply_b_sigmoid);
       } else {
         gdn::chunk_causal_conv1d_xe2(
             queue,
@@ -469,14 +465,14 @@ std::vector<torch::Tensor> causal_conv1d(
             reorder_input,
             token_indx_ptr,
             non_spec_token,
-            fuse_l2norm);
+            fuse_l2norm,
+            apply_b_sigmoid);
       }
 
-      // Run standalone l2norm kernel when not fused into conv1d
-      if (!fuse_l2norm) {
-#ifndef VLLM_GDN_USE_CUTLASS
+      // Run the standalone l2norm kernel when it was neither fused into conv1d
+      // nor skipped for the cutlass path (which l2-normalizes q/k in-kernel).
+      if (!use_cutlass && !fuse_l2norm) {
         l2norm(queue, q, k);
-#endif
       }
 
       intermediates.push_back(q);
@@ -635,12 +631,11 @@ void gated_delta_rule(
           num_prefills,
           num_decodes,
           token_indx_ptr);
-    } else {
-#ifdef VLLM_GDN_USE_CUTLASS
-      // Dual-path decode: dispatch the pure-decode batch to the cutlass xe35
-      // recurrent kernel, mirroring the prefill cutlass path above. Spec decode
-      // (handled earlier) and mixed prefill+decode (the num_prefills>0 branch)
-      // stay on their existing kernels.
+    } else if (gdn::gdn_use_cutlass()) {
+      // Runtime dual-path decode: dispatch the pure-decode batch to the cutlass
+      // xe35 recurrent kernel, mirroring the prefill cutlass path above. Spec
+      // decode (handled earlier) and mixed prefill+decode (the num_prefills>0
+      // branch) stay on their existing kernels.
       gdn_decode_xe2(
           queue,
           core_attn_out_active,
@@ -655,7 +650,7 @@ void gated_delta_rule(
           *non_spec_state_indices_tensor,
           has_initial_state,
           num_decodes);
-#else
+    } else {
       gdn::gated_delta_rule(
           queue,
           core_attn_out_active,
@@ -675,7 +670,6 @@ void gated_delta_rule(
           num_prefills,
           num_decodes,
           num_spec_decodes);
-#endif  // VLLM_GDN_USE_CUTLASS
     }
 #else
     gdn::gated_delta_rule(

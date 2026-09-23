@@ -200,7 +200,6 @@ class cmake_build_ext(build_ext):
             "XPUMEM_ALLOCATOR_ENABLED",
             "VLLM_XPU_ENABLE_ONEDNN",
             "BUILD_QUANT_ASM_XE3",
-            "GDN_USE_CUTLASS",
         ]
         for opt in _kernel_options:
             cmake_args.append('-D{}={}'.format(

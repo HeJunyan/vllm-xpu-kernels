@@ -242,10 +242,10 @@ void gated_delta_rule(
     const int64_t num_actual_tokens,
     const int64_t tp_size);
 
-// Returns true when the GDN op was built to dispatch the XE2 prefill delta
-// stage to the cutlass xe35 reference kernel (VLLM_GDN_USE_CUTLASS). That kernel
-// L2-normalizes q/k and sigmoids b internally, so on such builds the conv stage
-// feeds raw q/k/b. Tests use this to mirror the active input contract.
+// Returns true when the GDN op currently dispatches to the cutlass xe35 kernels
+// (runtime VLLM_GDN_USE_CUTLASS env var, default on). Those kernels L2-normalize
+// q/k and sigmoid b internally, so on that path the conv stage feeds raw q/k/b.
+// Tests use this to mirror the active input contract.
 bool gdn_uses_cutlass();
 
 // Legacy fused entry point kept for API backward compatibility. Internally

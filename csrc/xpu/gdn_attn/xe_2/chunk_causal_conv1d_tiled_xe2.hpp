@@ -60,7 +60,8 @@ struct chunk_causal_conv1d_tiled_kernel {
       const int& conv_elems,
       const int& num_virtual_tokens,
       char* slm_data,
-      const bool fuse_l2norm)
+      const bool fuse_l2norm,
+      const bool apply_b_sigmoid)
       : q_out(q_out),
         k_out(k_out),
         v_out(v_out),
@@ -89,7 +90,8 @@ struct chunk_causal_conv1d_tiled_kernel {
         conv_elems(conv_elems),
         num_virtual_tokens(num_virtual_tokens),
         slm_data(slm_data),
-        fuse_l2norm(fuse_l2norm) {}
+        fuse_l2norm(fuse_l2norm),
+        apply_b_sigmoid(apply_b_sigmoid) {}
 
   inline int lookup(int t) const { return token_indx ? token_indx[t] : t; }
 
@@ -552,11 +554,11 @@ struct chunk_causal_conv1d_tiled_kernel {
           b_val = static_cast<float>(mixed_ba[step + e]);
           a_val = static_cast<float>(mixed_ba[step + kv_ratio + e]);
         }
-#ifndef VLLM_GDN_USE_CUTLASS
-        // On the cutlass xe35 path the delta kernel applies sigmoid(b) itself;
-        // emit raw b here to avoid double activation.
-        b_val = 1.0f / (1.0f + sycl::exp(-b_val));
-#endif
+        // cutlass xe35 delta kernel applies sigmoid(b) itself; emit raw b when
+        // it is the active backend (apply_b_sigmoid == false).
+        if (apply_b_sigmoid) {
+          b_val = 1.0f / (1.0f + sycl::exp(-b_val));
+        }
         b_out[(k_head_id * kv_ratio + e) * num_virtual_tokens + out_token_id] =
             b_val;
         a_out[(k_head_id * kv_ratio + e) * num_virtual_tokens + out_token_id] =
@@ -624,6 +626,7 @@ struct chunk_causal_conv1d_tiled_kernel {
   const int num_virtual_tokens;
   char* slm_data;
   const bool fuse_l2norm;
+  const bool apply_b_sigmoid;
 };
 
 template <typename T, int Width, int TileT, bool ReorderInput>
@@ -660,7 +663,8 @@ void tiled_kernel_launcher(
     const int& conv_elems,
     const int& num_prefills,
     const int& num_decodes,
-    const bool fuse_l2norm) {
+    const bool fuse_l2norm,
+    const bool apply_b_sigmoid) {
   // Note: z_out, b_out, a_out, mixed_ba are passed through to the
   // ZBA reorder kernel below, not to the tiled conv1d kernel itself.
   using KERNEL_MAIN =
@@ -706,7 +710,8 @@ void tiled_kernel_launcher(
           conv_elems,
           num_virtual_tokens,
           slm_ptr,
-          fuse_l2norm);
+          fuse_l2norm,
+          apply_b_sigmoid);
       task(item);
     });
   });
@@ -754,7 +759,8 @@ void chunk_causal_conv1d_tiled_xe2(
     const bool reorder_input,
     const int* token_indx = nullptr,
     int num_actual_tokens_override = -1,
-    const bool fuse_l2norm = false) {
+    const bool fuse_l2norm = false,
+    const bool apply_b_sigmoid = true) {
   if (num_prefills == 0 && num_decodes == 0) {
     return;
   }
@@ -828,7 +834,8 @@ void chunk_causal_conv1d_tiled_xe2(
       conv_elems,                                                  \
       num_prefills,                                                \
       num_decodes,                                                 \
-      fuse_l2norm);
+      fuse_l2norm,                                                 \
+      apply_b_sigmoid);
 
 #define TILED_WIDTH_DISPATCH(scalar_t, width, reorder_input) \
   switch (width) {                                           \
