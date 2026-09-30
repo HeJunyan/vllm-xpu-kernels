@@ -168,8 +168,6 @@ template <typename T, class TiledMMA>
 CUTE_DEVICE void chunk_compute_A_kernel(
     const sycl::local_accessor<float, 1>& slm_mem_const,
     T* A,
-    T* o2,
-    const T* q,
     const T* k,
     const T* v,
     const float* b,
@@ -269,26 +267,6 @@ CUTE_DEVICE void chunk_compute_A_kernel(
           make_gmem_ptr(A_ptr),
           make_layout(A_tensor_shape, make_stride(chunk_size, _1{})));
 
-      // Q shares K's (chunk, k_head) layout; O2 = mask(Q·K^T) is produced here
-      // (fused with A = mask(K·K^T), sharing the K load) so the downstream
-      // fwd_o kernels just read o2 instead of recomputing Q·K^T.
-      auto q_ptr = q +
-                   static_cast<int64_t>(chunk_start_offset) * num_k_heads *
-                       head_k_dim +
-                   (v_head_id / kv_ratio) * head_k_dim;
-      auto Q_tensor = make_tensor(
-          make_gmem_ptr(q_ptr),
-          make_layout(
-              K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
-
-      auto o2_ptr = o2 +
-                    static_cast<int64_t>(v_head_id) * total_virtual_seqlen *
-                        chunk_size +
-                    chunk_start_offset * chunk_size;
-      auto O2_tensor = make_tensor(
-          make_gmem_ptr(o2_ptr),
-          make_layout(A_tensor_shape, make_stride(chunk_size, _1{})));
-
       Tensor cA = make_identity_tensor(A_tensor.shape());
       Tensor gA_C =
           local_tile(cA, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
@@ -299,17 +277,8 @@ CUTE_DEVICE void chunk_compute_A_kernel(
       auto tCgA_c = thr_copy_A_c.partition_D(gA_C);
       auto tSrA_c = thr_mma.partition_sg_fragment_C(gA_C);
 
-      auto copy_O2_c = get_block_2d_copy_D<void>(mma, O2_tensor);
-      auto thr_copy_O2_c = copy_O2_c.get_slice(local_id);
-      auto tCrO2_c = thr_copy_O2_c.partition_sg_fragment_S(gA_C);
-      auto tCgO2_c = thr_copy_O2_c.partition_D(gA_C);
-      auto tSrO2_c = thr_mma.partition_sg_fragment_C(gA_C);
-
       clear(tSrA_c);
-      clear(tSrO2_c);
-      // Shared-B dual-A: A_acc = K·K^T, O2_acc = Q·K^T (one shared K load).
-      gemm_TTS_fused_2A(
-          K_tensor, Q_tensor, K_tensor, tSrA_c, tSrO2_c, 0, 0, 0, mma);
+      gemm_TTS(K_tensor, K_tensor, tSrA_c, 0, 0, mma);
 
       CUTE_UNROLL
       for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
@@ -321,29 +290,21 @@ CUTE_DEVICE void chunk_compute_A_kernel(
           float beta_value =
               b[(chunk_start_offset + m_idx) +
                 v_head_id * total_virtual_seqlen];
-          float decay = sycl::native::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]);
 
-          // A mask: m>n -> *= decay*beta; m==n -> 1; m<n -> 0.
-          tSrA_c(sn * SG_M + sm) *= decay * beta_value;
+          tSrA_c(sn * SG_M + sm) *=
+              sycl::native::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]) *
+              beta_value;
           if (m_idx == n_idx) {
             tSrA_c(sn * SG_M + sm) = 1.0f;
           }
           if (m_idx < n_idx) {
             tSrA_c(sn * SG_M + sm) = 0.0f;
           }
-
-          // O2 mask: m>=n -> *= decay; m<n -> 0.
-          tSrO2_c(sn * SG_M + sm) *= decay;
-          if (m_idx < n_idx) {
-            tSrO2_c(sn * SG_M + sm) = 0.0f;
-          }
         }
       }
 
       reorder(tSrA_c, tCrA_c);
       copy(copy_A_c, tCrA_c, tCgA_c);
-      reorder(tSrO2_c, tCrO2_c);
-      copy(copy_O2_c, tCrO2_c, tCgO2_c);
       chunk_id += global_chunk_range;
     }
     pre_chunks = cumsum_chunks;
@@ -946,7 +907,7 @@ template <typename T, typename StateT, class TiledMMA>
 CUTE_DEVICE void chunk_fwd_o_kernel(
     const sycl::local_accessor<float, 1>& slm_mem_const,  // [3 * chunk_size]
     T* core_attn_out,  // [total_seqlen, num_v_heads, head_v_dim]
-    T* o2,  // [num_v_heads, total_virtual_seqlen, chunk_size], precomputed O2
+    T* A,  // [num_v_heads, total_virtual_seqlen, chunk_size], temp O2 buffer
     T* w,  // [num_v_heads, total_virtual_seqlen, head_k_dim]
     T* u,  // [num_v_heads, total_virtual_seqlen, head_v_dim]
     const T* q,  // [total_virtual_seqlen, num_k_heads, head_k_dim]
@@ -1108,17 +1069,50 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
 
       auto k_ptr =
           k + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
+      auto K_tensor_shape = make_shape(chunk_size, head_k_dim);
+      auto K_tensor = make_tensor(
+          make_gmem_ptr(k_ptr),
+          make_layout(
+              K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
 
-      // O2 = mask(Q·K^T) is precomputed in chunk_compute_A_kernel and read
-      // here from the o2 buffer (no QK recompute on the fwd_o path).
       auto O2_ptr =
-          o2 +
+          A +
           static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
           chunk_offset * chunk_size;
       auto O2_tensor_shape = make_shape(current_chunk_size, chunk_size);
       auto O2_tensor = make_tensor(
           make_gmem_ptr(O2_ptr),
           make_layout(O2_tensor_shape, make_stride(chunk_size, _1{})));
+      Tensor cO2 = make_identity_tensor(O2_tensor_shape);
+      auto copy_O2_c = get_block_2d_copy_D<void>(mma, O2_tensor);
+      auto thr_copy_O2_c = copy_O2_c.get_slice(local_id);
+
+      Tensor gO2_C =
+          local_tile(cO2, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
+      auto tCrO2_c = thr_copy_O2_c.partition_sg_fragment_S(gO2_C);
+      auto tCgO2_c = thr_copy_O2_c.partition_D(gO2_C);
+      auto tSrO2_c = thr_mma.partition_sg_fragment_C(gO2_C);
+
+      // QK MMA: compute O2 = mask(Q × K^T) first (no dependency on WS)
+      clear(tSrO2_c);
+      gemm_TTS(Q_tensor, K_tensor, tSrO2_c, 0, 0, mma);
+
+      CUTE_UNROLL
+      for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
+        int n_idx =
+            n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
+        CUTE_UNROLL
+        for (int sm = 0; sm < SG_M; ++sm) {
+          int m_idx = m_tile_start + m_sg_start + sm;
+          tSrO2_c(sn * SG_M + sm) *=
+              sycl::native::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]);
+          if (m_idx < n_idx) {
+            tSrO2_c(sn * SG_M + sm) = 0.0f;
+          }
+        }
+      }
+      reorder(tSrO2_c, tCrO2_c);
+      copy(copy_O2_c, tCrO2_c, tCgO2_c);
 
       auto U_tensor_T_shape = make_shape(head_v_dim, chunk_size);
       auto U_tensor_T = make_tensor(
@@ -1528,8 +1522,12 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
             make_layout(
                 Q_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
 
-        // O2 = mask(Q·K^T) is precomputed in chunk_compute_A_kernel and read
-        // here from the o2 buffer (no QK recompute on the fwd_o path).
+        auto K_tensor_shape = make_shape(chunk_size, head_k_dim);
+        auto K_tensor = make_tensor(
+            make_gmem_ptr(k_ptr),
+            make_layout(
+                K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
+
         auto O2_ptr =
             O2 +
             static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
@@ -1538,6 +1536,40 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
         auto O2_tensor = make_tensor(
             make_gmem_ptr(O2_ptr),
             make_layout(O2_tensor_shape, make_stride(chunk_size, _1{})));
+        Tensor cO2 = make_identity_tensor(O2_tensor_shape);
+        auto copy_O2_c = get_block_2d_copy_D<void>(mma, O2_tensor);
+        auto thr_copy_O2_c = copy_O2_c.get_slice(local_id);
+
+        Tensor gO2_C =
+            local_tile(cO2, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
+        auto tCrO2_c = thr_copy_O2_c.partition_sg_fragment_S(gO2_C);
+        auto tCgO2_c = thr_copy_O2_c.partition_D(gO2_C);
+        auto tSrO2_c = thr_mma.partition_sg_fragment_C(gO2_C);
+
+        // QK MMA: compute O2 = mask(Q × K^T). O2 and its HBM destination are
+        // dv-independent, so compute and store it once (dv==0); later dv
+        // iterations read it back from HBM via O2_tensor in the O2U step.
+        if (dv == 0) {
+        clear(tSrO2_c);
+        gemm_TTS(Q_tensor, K_tensor, tSrO2_c, 0, 0, mma);
+
+        CUTE_UNROLL
+        for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
+          int n_idx =
+              n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
+          CUTE_UNROLL
+          for (int sm = 0; sm < SG_M; ++sm) {
+            int m_idx = m_tile_start + m_sg_start + sm;
+            tSrO2_c(sn * SG_M + sm) *=
+                sycl::native::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]);
+            if (m_idx < n_idx) {
+              tSrO2_c(sn * SG_M + sm) = 0.0f;
+            }
+          }
+        }
+        reorder(tSrO2_c, tCrO2_c);
+        copy(copy_O2_c, tCrO2_c, tCgO2_c);
+        }  // end if (dv == 0): compute O2 once
 
         auto U_tensor_T_shape = make_shape(head_v_dim, chunk_size);
         auto U_tensor_T = make_tensor(
@@ -1788,8 +1820,6 @@ void kernel_launcher(
           chunk_compute_A_kernel<T, MMAComputeA>(
               local_mem,
               A,
-              O2,
-              q,
               k,
               v,
               b,
@@ -2034,7 +2064,7 @@ void kernel_launcher(
               chunk_fwd_o_kernel<T, StateT, MMAFwdO>(
                   local_mem,
                   core_attn_out,
-                  O2,
+                  A,
                   w,
                   u,
                   q,
