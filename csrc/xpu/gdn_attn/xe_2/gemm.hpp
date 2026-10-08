@@ -230,23 +230,6 @@ CUTE_DEVICE void load_A_frag_slm_T(
   }
 }
 
-/* gemm_SQS: C += A * B^T with A already an MMA fragment and B gathered from a
- * lane-blocked SLM B tile as its raw dword image. Neither operand touches gmem
- * and neither needs a reorder. B spans one BLK_K, so there is no k-loop. */
-template <class T, class ASGCTensor, class CSGCTensor, class TiledMMA>
-CUTE_DEVICE void gemm_SQS(
-    ASGCTensor const& tCrA,  // (M,K) resident MMA fragment
-    SlmCPtr sB,              // staged result read as B
-    int b_nblocks,
-    CSGCTensor& tCrC,        // (M,N)
-    int sg_n,
-    int lane,
-    TiledMMA const& mma) {
-  PackedBFrag B_op;
-  load_B_raw_slm<T>(B_op, sB, b_nblocks, sg_n, lane);
-  cute::gemm(mma, tCrA, B_op, tCrC);
-}
-
 template <
     class ATensor,
     class BTensor,

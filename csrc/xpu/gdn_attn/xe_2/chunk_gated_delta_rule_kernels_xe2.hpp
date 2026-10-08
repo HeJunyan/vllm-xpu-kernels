@@ -1690,9 +1690,10 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
 
           // --- O2U MMA: O[dv] += O1[dv] + O2 × U_T[dv] ---
           // O2 is GRF-resident as tCrO2_A, u comes from its SLM B tile.
-            gemm_SQS<T>(
-              tCrO2_A, u_slm_tile, u_nblocks, tSrO_c, sg_local_n_coord,
-              sg_local_id, mma);
+          PackedBFrag u_op;
+          load_B_raw_slm<T>(
+              u_op, u_slm_tile, u_nblocks, sg_local_n_coord, sg_local_id);
+          cute::gemm(mma, tCrO2_A, u_op, tSrO_c);
           auto tCrO_c = thr_copy_O_c.partition_sg_fragment_S(gO_C);
           auto tCgO_c = thr_copy_O_c.partition_D(gO_C);
           reorder(tSrO_c, tCrO_c);
@@ -1768,9 +1769,10 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
           auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
 
           clear(tSrO_c);
-          gemm_SQS<T>(
-              tCrO2_A, u_slm_tile, u_nblocks, tSrO_c, sg_local_n_coord,
-              sg_local_id, mma);
+          PackedBFrag u_op;
+          load_B_raw_slm<T>(
+              u_op, u_slm_tile, u_nblocks, sg_local_n_coord, sg_local_id);
+          cute::gemm(mma, tCrO2_A, u_op, tSrO_c);
           reorder(tSrO_c, tCrO_c);
           copy(copy_O_c, tCrO_c, tCgO_c);
         }
