@@ -1318,6 +1318,14 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
   // Extra SLM used only by the inlined compute_wu prologue.
   float* wu_beta_slm_ptr = g_exp_slm_ptr + chunk_size;
   float* wu_g_slm_ptr = wu_beta_slm_ptr + chunk_size;
+  // Lane-blocked O2 staging tile, past the 5 * chunk_size float scalars. It
+  // carries mask(Q*K^T) from the QK accumulators into every sub-group's O2U
+  // A operand once per chunk; see store_C_frag_slm_A / load_A_frag_slm.
+  SlmPtr o2_slm_tile =
+      reinterpret_cast<SlmPtr>(
+          slm_mem_const.template get_multi_ptr<sycl::access::decorated::yes>()
+              .get()) +
+      5 * chunk_size * static_cast<int>(sizeof(float));
 
   TiledMMA mma{};
   auto wg_tile = mma.tile_mnk();
@@ -1378,6 +1386,17 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
           a[(chunk_offset + current_chunk_size - 1) +
             v_head_id * total_virtual_seqlen];
       float g_last_value_exp = sycl::native::exp(g_last_value);
+
+      // O2 = mask(Q*K^T) is dv-independent, so it is computed once at dv==0 and
+      // then kept in GRF as this sub-group's O2U A operand for the whole dv
+      // loop. On the 4x2 sub-group layout a QK accumulator only owns part of
+      // the O2U contracted dimension, so the full-K A operand is assembled once
+      // through the lane-blocked SLM tile instead of a register reorder.
+      Tensor cO2A = make_identity_tensor(
+          make_shape(Int<chunk_size>{}, Int<chunk_size>{}));
+      Tensor gO2A = local_tile(cO2A, select<0, 2>(wg_tile), make_coord(0, _));
+      auto tCrO2_A = mma.get_slice(local_id).partition_sg_fragment_A(
+          gO2A(_, _, 0));
 
       for (int dv = 0; dv < dv_split; ++dv) {
         /* W tensor */
@@ -1528,27 +1547,16 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
             make_layout(
                 K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
 
-        auto O2_ptr =
-            O2 +
-            static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
-            chunk_offset * chunk_size;
         auto O2_tensor_shape = make_shape(current_chunk_size, chunk_size);
-        auto O2_tensor = make_tensor(
-            make_gmem_ptr(O2_ptr),
-            make_layout(O2_tensor_shape, make_stride(chunk_size, _1{})));
         Tensor cO2 = make_identity_tensor(O2_tensor_shape);
-        auto copy_O2_c = get_block_2d_copy_D<void>(mma, O2_tensor);
-        auto thr_copy_O2_c = copy_O2_c.get_slice(local_id);
 
         Tensor gO2_C =
             local_tile(cO2, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
-        auto tCrO2_c = thr_copy_O2_c.partition_sg_fragment_S(gO2_C);
-        auto tCgO2_c = thr_copy_O2_c.partition_D(gO2_C);
         auto tSrO2_c = thr_mma.partition_sg_fragment_C(gO2_C);
 
-        // QK MMA: compute O2 = mask(Q × K^T). O2 and its HBM destination are
-        // dv-independent, so compute and store it once (dv==0); later dv
-        // iterations read it back from HBM via O2_tensor in the O2U step.
+        // QK MMA: compute O2 = mask(Q × K^T) once (dv==0), hand the masked
+        // accumulator to every sub-group through the lane-blocked SLM tile and
+        // keep the resulting A operand resident in GRF for every dv.
         if (dv == 0) {
         clear(tSrO2_c);
         gemm_TTS(Q_tensor, K_tensor, tSrO2_c, 0, 0, mma);
@@ -1567,8 +1575,20 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
             }
           }
         }
-        reorder(tSrO2_c, tCrO2_c);
-        copy(copy_O2_c, tCrO2_c, tCgO2_c);
+
+        store_C_frag_slm_A<chunk_size / sub_group_size, T>(
+            tSrO2_c,
+            o2_slm_tile,
+            sg_local_m_coord,
+            sg_local_n_coord,
+            sg_local_id);
+
+        // The whole O2 tile must be in SLM before any sub-group gathers the
+        // n-blocks the other n sub-groups produced.
+        item.barrier(sycl::access::fence_space::local_space);
+
+        load_A_frag_slm<T>(
+            tCrO2_A, o2_slm_tile, sg_local_m_coord, sg_local_id);
         }  // end if (dv == 0): compute O2 once
 
         auto U_tensor_T_shape = make_shape(head_v_dim, chunk_size);
@@ -1644,7 +1664,8 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
           item.barrier(sycl::access::fence_space::local_space);
 
           // --- O2U MMA: O[dv] += O1[dv] + O2 × U_T[dv] ---
-            gemm_TTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
+          // O2 is GRF-resident as tCrO2_A, assembled once at dv==0.
+            gemm_STS(tCrO2_A, U_tensor_T, tSrO_c, 0, dv, mma);
           auto tCrO_c = thr_copy_O_c.partition_sg_fragment_S(gO_C);
           auto tCgO_c = thr_copy_O_c.partition_D(gO_C);
           reorder(tSrO_c, tCrO_c);
@@ -1694,7 +1715,7 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
           auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
 
           clear(tSrO_c);
-          gemm_TTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
+          gemm_STS(tCrO2_A, U_tensor_T, tSrO_c, 0, dv, mma);
           reorder(tSrO_c, tCrO_c);
           copy(copy_O_c, tCrO_c, tCgO_c);
         }
@@ -1949,8 +1970,13 @@ void kernel_launcher(
     // sub-group layout (the fused kernel is register-heavier; the wider 4x4
     // layout regresses here).
     // 3 * chunk_size for fwd_o (g / g_multi / g_exp) plus 2 * chunk_size for
-    // the inlined compute_wu prologue (beta and exp(a)*beta scaling).
-    int slm_size_fwd_o = 5 * chunk_size;
+    // the inlined compute_wu prologue (beta and exp(a)*beta scaling), plus the
+    // lane-blocked O2 staging tile that hands mask(Q*K^T) to the GRF-resident
+    // O2U A operand.
+    int slm_size_fwd_o =
+        5 * chunk_size +
+        slm_a_tile_bytes<chunk_size, chunk_size>() /
+            static_cast<int>(sizeof(float));
     int threads_fwd_o = size(MMAFwdOSmall{});
     sycl::range<3> local_fwd_o(1, 1, threads_fwd_o);
     sycl::range<3> global_fwd_o(batch_size, num_v_heads, 1);

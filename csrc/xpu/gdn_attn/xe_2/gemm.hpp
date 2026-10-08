@@ -53,6 +53,180 @@ namespace gdn {
 
 using namespace cute;
 
+/* ---- Lane-blocked SLM tiles for DPAS A operands ----------------------------
+ *
+ * A (BLK_M, BLK_K) tile of T stored as the dpas A register image itself. The
+ * TiledMMA splits M across the m sub-groups, so one sub-group's A fragment
+ * covers 16 m-rows by the full BLK_K and is held as BLK_K/16 blocks of 16
+ * values; inside a block lane l owns column k = 16*kb + l and its 16 values are
+ * m = 0..15. Element (m, k) therefore lives at byte
+ *   (m/16)*(BLK_K/16)*512 + (k/16)*512 + (k%16)*32 + (m%16)*2
+ *
+ * A C accumulator has exactly the same per-lane shape -- lane l holds column
+ * n = 16*nb + l for m = 0..15 -- so handing a C fragment to a later A operand
+ * (the consumer contracts over the producer's N) moves no data across lanes:
+ * every lane writes its own columns as 32 B runs and reads back the runs the
+ * other n sub-groups produced. The register re-layout lives entirely in the
+ * address arithmetic, so neither side needs a cute::reorder, and the SLM tile
+ * is the only place the cross-sub-group exchange happens.
+ */
+static constexpr int kSlmALaneElems = 16;  // m-run owned by one lane
+static constexpr int kSlmALaneBytes = kSlmALaneElems * 2;
+static constexpr int kSlmASgSize = 16;
+// One (m-block, k-block) pair across all lanes.
+static constexpr int kSlmABlockBytes = kSlmALaneBytes * kSlmASgSize;
+
+/* Bytes needed for a (BLK_M, BLK_K) lane-blocked A tile. */
+template <int BlkM, int BlkK>
+static constexpr int slm_a_tile_bytes() {
+  static_assert(BlkM % kSlmALaneElems == 0 && BlkK % kSlmASgSize == 0,
+                "a lane-blocked A tile is a whole number of 16x16 blocks");
+  return (BlkM / kSlmALaneElems) * (BlkK / kSlmASgSize) * kSlmABlockBytes;
+}
+
+/* Decorated local-space pointers: SLM address arithmetic stays 32-bit. */
+using SlmPtr = sycl::decorated_local_ptr<char>::pointer;
+using SlmCPtr = sycl::decorated_local_ptr<const char>::pointer;
+
+/* One lane's 32 B run. A plain aggregate copied whole, so it moves as vector
+ * messages and lands straight in the fragment's registers; 16 B alignment is
+ * what a fragment guarantees. */
+struct alignas(16) SlmLaneRun {
+  uint32_t w[8];
+};
+using SlmLaneRunPtr = sycl::decorated_local_ptr<SlmLaneRun>::pointer;
+using SlmLaneRunCPtr = sycl::decorated_local_ptr<const SlmLaneRun>::pointer;
+
+/* Stores this sub-group's (16 m, SG_N n) fp32 C accumulator, narrowed to T,
+ * as columns k = n of a lane-blocked A tile: the producer's N index is the
+ * consumer's contracted index. KBlocks is the tile's BLK_K/16. */
+template <int KBlocks, class T, class CFrag>
+CUTE_DEVICE void store_C_frag_slm_A(
+    CFrag const& tSrC,
+    SlmPtr tile,
+    int sg_m,
+    int sg_n,
+    int lane) {
+  static_assert(sizeof(T) == 2, "lane-blocked SLM tiles are 16-bit");
+  using CLayout = cute::remove_cvref_t<decltype(tSrC.layout())>;
+  constexpr int kNBlk = cute::size<2>(CLayout{});
+  constexpr int kMRun = cute::size<0>(CLayout{}) * cute::size<1>(CLayout{});
+  static_assert(kMRun == kSlmALaneElems,
+                "C fragment must own exactly 16 m-rows per lane");
+  static_assert(kNBlk <= KBlocks, "C n-blocks must fit the tile's k-blocks");
+
+  CUTE_UNROLL
+  for (int nb = 0; nb < kNBlk; ++nb) {
+    // Narrow in registers first so the block leaves as one 32 B run.
+    alignas(16) T run[kSlmALaneElems];
+    CUTE_UNROLL
+    for (int i = 0; i < kSlmALaneElems; ++i) {
+      run[i] = static_cast<T>(tSrC(nb * kSlmALaneElems + i));
+    }
+    *reinterpret_cast<SlmLaneRunPtr>(
+        tile + (sg_m * KBlocks + sg_n * kNBlk + nb) * kSlmABlockBytes +
+        lane * kSlmALaneBytes) = *reinterpret_cast<const SlmLaneRun*>(run);
+  }
+}
+
+/* Gathers this sub-group's A operand -- 16 m-rows by the full BLK_K -- out of a
+ * lane-blocked A tile straight into its MMA fragment, no reorder in front of
+ * the dpas. */
+template <class T, class AFrag>
+CUTE_DEVICE void load_A_frag_slm(AFrag& tCrA, SlmCPtr tile, int sg_m, int lane) {
+  static_assert(sizeof(T) == 2, "lane-blocked SLM tiles are 16-bit");
+  using ALayout = cute::remove_cvref_t<decltype(tCrA.layout())>;
+  constexpr int kKBlk = cute::size<2>(ALayout{});
+  constexpr int kMRun = cute::size<0>(ALayout{}) * cute::size<1>(ALayout{});
+  static_assert(kMRun == kSlmALaneElems,
+                "A fragment must own exactly 16 m-rows per lane");
+
+  CUTE_UNROLL
+  for (int kb = 0; kb < kKBlk; ++kb) {
+    *reinterpret_cast<SlmLaneRun*>(&tCrA(kb * kSlmALaneElems)) =
+        *reinterpret_cast<SlmLaneRunCPtr>(
+            tile + (sg_m * kKBlk + kb) * kSlmABlockBytes +
+            lane * kSlmALaneBytes);
+  }
+}
+
+/* ---- Lane-blocked SLM tiles for DPAS B operands ----------------------------
+ *
+ * The B mirror of the tile above, for a C accumulator whose M index becomes the
+ * consumer's contracted index (C = A*B^T feeding X = Y*C^T). A (64 n, 64 k) T
+ * tile stored as the dpas B register image itself: for each (k-atom, 16-wide
+ * n-block) lane n holds the 32 B run k = 0..15 of column n, dword j covering
+ * k = 2j, 2j+1. Element (n, k) lives at byte
+ *   (k/16)*2048 + (n/16)*512 + (n%16)*32 + (k%16)*2
+ *
+ * A C fragment -- lane t holds column t + 16h, m = 0..15 -- therefore stores
+ * into it as two 32 B runs with no cross-lane traffic, and the B operand loads
+ * back as 8 d32x8 messages per k-tile with 512 contiguous bytes per message.
+ *
+ * Unlike the A side this works on the raw dword image rather than cute's
+ * logical element view: the dpas B source is read as dwords, and a lane-blocked
+ * run *is* that dword image, so cute::gemm hands each atom's 8 dwords to the
+ * dpas untouched with no dword -> bf16 re-layout in front of it.
+ */
+static constexpr int kSlmBTileBytes = 64 * 64 * 2;
+static constexpr int kSlmBAtomBytes = 16 * 64 * 2;    // one k-atom, all 64 n
+static constexpr int kSlmBNBlockBytes = 16 * 16 * 2;  // one k-atom, 16 n
+static constexpr int kSlmBLaneBytes = 32;
+
+/* The sub-group's B tile as packed dwords: (8 dwords, 2 n-atoms, 4 k-atoms). */
+using RawBVec = cute::intel::vector_t<uint32_t, 8>;
+using PackedBFrag = decltype(make_tensor<uint32_t>(Layout<Shape<_8, _2, _4>>{}));
+
+/* Stores a (16 m, 32 n) fp32 C fragment, narrowed to T, as rows k = m of the
+ * B tile: the producer's M index is the consumer's contracted index. */
+template <class T, class CFrag>
+CUTE_DEVICE void store_C_frag_slm_B(
+    CFrag const& tSrC,
+    SlmPtr tile,
+    int sg_m,
+    int sg_n,
+    int lane) {
+  static_assert(sizeof(T) == 2, "lane-blocked SLM tiles are 16-bit");
+  using CLayout = cute::remove_cvref_t<decltype(tSrC.layout())>;
+  static_assert(cute::size(CLayout{}) == 32,
+                "C fragment must be (16 m, 32 n) per sub-group");
+
+  CUTE_UNROLL
+  for (int h = 0; h < 2; ++h) {
+    alignas(16) T run[kSlmALaneElems];
+    CUTE_UNROLL
+    for (int i = 0; i < kSlmALaneElems; ++i) {
+      run[i] = static_cast<T>(tSrC(kSlmALaneElems * h + i));
+    }
+    *reinterpret_cast<SlmLaneRunPtr>(
+        tile + sg_m * kSlmBAtomBytes + (2 * sg_n + h) * kSlmBNBlockBytes +
+        lane * kSlmBLaneBytes) = *reinterpret_cast<const SlmLaneRun*>(run);
+  }
+}
+
+/* Gathers this sub-group's packed dword B operand out of a lane-blocked B
+ * tile, ready to hand straight to cute::gemm. */
+template <class T>
+CUTE_DEVICE void load_B_raw_slm(
+    PackedBFrag& B,
+    SlmCPtr tile,
+    int sg_n,
+    int lane) {
+  static_assert(sizeof(T) == 2, "lane-blocked SLM tiles are 16-bit");
+  static_assert(sizeof(RawBVec) == sizeof(SlmLaneRun));
+  auto rB = recast<RawBVec>(B);  // (k-atom ka, n-block h) at rB(2 * ka + h)
+  CUTE_UNROLL
+  for (int ka = 0; ka < 4; ++ka) {
+    CUTE_UNROLL
+    for (int h = 0; h < 2; ++h) {
+      auto src = reinterpret_cast<SlmLaneRunCPtr>(
+          tile + ka * kSlmBAtomBytes + (2 * sg_n + h) * kSlmBNBlockBytes +
+          lane * kSlmBLaneBytes);
+      rB(2 * ka + h) = sycl::bit_cast<RawBVec>(*src);
+    }
+  }
+}
+
 template <
     class ATensor,
     class BTensor,
