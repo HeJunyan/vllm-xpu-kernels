@@ -691,6 +691,101 @@ CUTE_DEVICE void gemm_TTS_k_multi(
   }
 }
 
+/* gemm_STS_k_multi: gemm_TTS_k_multi with A already in registers, loaded once
+ * by the caller with load_A. B still streams from gmem through its own
+ * prefetch pipeline, so this is the half-way step -- A is paid for once across
+ * every consumer, B is not yet.
+ *
+ * A is scaled per k and consumers of the same matrix scale it differently, so
+ * the held fragment stays unscaled and the scale is folded into the operand
+ * built here -- which is the fragment gemm_TTS_k_multi would have reordered
+ * into anyway. */
+template <
+    class ASGCTensor,
+    class BTensor,
+    class CSGCTensor,
+    class TiledMMA>
+CUTE_DEVICE void gemm_STS_k_multi(
+    ASGCTensor const& tCrA_src,  // (M,K) held, unscaled
+    BTensor const& B,            // (N,K) gmem
+    CSGCTensor& tCrC,            // (M,N)
+    int wg_m,                    // m tile start id
+    int wg_n,                    // n tile start id
+    TiledMMA const& mma,
+    float* K_multi) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+  auto sg = item.get_sub_group();
+  int sg_local_id = sg.get_local_linear_id();
+
+  Tensor cB = make_identity_tensor(B.shape());
+
+  auto wg_tile = mma.tile_mnk();
+
+  Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _));
+
+  auto copy_b = get_block_2d_copy_B<void>(mma, B);
+
+  auto thr_mma = mma.get_slice(local_id);
+  auto thr_copy_b = copy_b.get_slice(local_id);
+
+  auto tCrA = thr_mma.partition_sg_fragment_A(
+      make_identity_tensor(select<0, 2>(wg_tile)));
+  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
+
+  Tensor tBgB = thr_copy_b.partition_S(gB);
+
+  auto prefetch_b = make_block_2d_prefetch(copy_b);
+  auto thr_prefetch_B = prefetch_b.get_slice(local_id);
+  auto pBgB = thr_prefetch_B.partition_S(gB);
+
+  const int prefetch_dist = 3;
+
+  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
+
+  int k_tile_count = ceil_div(shape<1>(B), get<2>(wg_tile));
+  int k_tile_prefetch = 0;
+
+  CUTE_UNROLL
+  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+    prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+  }
+
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+    barrier_arrive(barrier_scope);
+
+    copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
+
+    if (k_tile_prefetch < k_tile_count) {
+      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+    }
+
+    reorder(tBrB, tCrB);
+
+    using TA = typename decltype(tCrA)::value_type;
+    Tensor A_frag = make_tensor<TA>(tCrA.layout());
+    static constexpr auto I = decltype(size<0>(A_frag))::value;
+    static constexpr auto J = decltype(size<1>(A_frag))::value;
+    static constexpr auto K = decltype(size<2>(A_frag))::value;
+    static constexpr int mma_K = 16;
+
+    CUTE_UNROLL
+    for (int k = 0; k < K; ++k) {
+      float scale = K_multi[k_tile * get<2>(wg_tile) + k * mma_K + sg_local_id];
+      CUTE_UNROLL
+      for (int e = 0; e < I * J; ++e) {
+        tCrA[k * I * J + e] =
+            static_cast<TA>(static_cast<float>(tCrA_src[k * I * J + e]) * scale);
+      }
+    }
+
+    cute::gemm(mma, tCrA, tCrB, tCrC);
+
+    barrier_wait(barrier_scope);
+  }
+}
+
 /* gemm_SSS_k_multi: gemm_TTS_k_multi with both operands already in registers,
  * loaded once by the caller with load_A / load_B. No gmem, so no block-2D
  * copy, no reorder, no prefetch and no k-loop -- the held fragments span one

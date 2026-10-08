@@ -895,6 +895,12 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
             make_layout(
                 K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
 
+        /* Both the u and w GEMMs take A_inv as the same A operand, so it is
+           loaded once below and held for the two of them. Warm it here, as
+           early as the tensor exists: everything between this and the load is
+           distance the prefetch gets to hide. */
+        prefetch_A(A_inv_tensor, 0, mma);
+
         /* a/b/g and exp(a) are loaded and calculated once and shared later.
            The per-chunk scaling SLM buffers are dv-independent. */
         if (dv == 0) {
@@ -942,9 +948,18 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
             cU_wu, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
         auto tSrU_wu = thr_mma_wu.partition_sg_fragment_C(gU_wu);
 
+        /* A_inv is read-only, so holding it needs no staging. It is loaded per
+           dv rather than per chunk on purpose: its two consumers sit next to
+           each other here, so the fragment dies before the fused Q*S / W*S
+           GEMM below and adds no pressure where that GEMM needs registers. The
+           two scale it by different per-k vectors, so the held copy is
+           unscaled. */
+        auto tCrA_inv = make_A_frag(mma);
+        load_A(A_inv_tensor, 0, mma, tCrA_inv);
+
         clear(tSrU_wu);
-        gemm_TTS_k_multi(
-            A_inv_tensor, V_wu_T, tSrU_wu, 0, dv, mma, wu_beta_slm_ptr);
+        gemm_STS_k_multi(
+            tCrA_inv, V_wu_T, tSrU_wu, 0, dv, mma, wu_beta_slm_ptr);
         /* With a previous state u is still corrected by -W*S further down, so
            keep the accumulator live and stage it once after the correction. */
         if (!has_prev_state) {
@@ -969,8 +984,8 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
             auto tSrW_wu = thr_mma_wu.partition_sg_fragment_C(gW_wu);
 
             clear(tSrW_wu);
-            gemm_TTS_k_multi(
-                A_inv_tensor, K_tensor_T, tSrW_wu, 0, dk, mma, wu_g_slm_ptr);
+            gemm_STS_k_multi(
+                tCrA_inv, K_tensor_T, tSrW_wu, 0, dk, mma, wu_g_slm_ptr);
             store_C_frag_slm<T>(
                 tSrW_wu,
                 w_slm_tile,
