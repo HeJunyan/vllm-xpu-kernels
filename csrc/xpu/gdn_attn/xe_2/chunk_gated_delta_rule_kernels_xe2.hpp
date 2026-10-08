@@ -66,7 +66,6 @@ struct chunk_gemm_policy_16x16x16 {
 
 using chunk_gemm_policy_compute_A = chunk_gemm_policy_64x64x32_4x1;
 using chunk_gemm_policy_inverse = chunk_gemm_policy_16x16x16;
-using chunk_gemm_policy_compute_wu = chunk_gemm_policy_64x64x32_4x2;
 // Match the cutlass xe35 reference fwd_o policy (64x64x64_4x2) now that the
 // build enables the 512-GRF Xe3.5 target the wide tile needs.
 using chunk_gemm_policy_fwd_o = chunk_gemm_policy_64x64x64_4x2;
@@ -723,7 +722,7 @@ CUTE_DEVICE void chunk_inverse_opt_kernel(
 
 
 
-// Fused compute_wu + fwd_o kernel: the only fwd_o path.
+// The fwd_o kernel. w and u are computed in its own prologue.
 //
 // w and u used to be a producer/consumer intermediate between two kernels,
 // written to HBM by the first and read back by the second. They are now
@@ -736,7 +735,7 @@ CUTE_DEVICE void chunk_inverse_opt_kernel(
 // head_k_dim, so it is computed once per chunk at dv == 0 and staged in SLM for
 // every dv tile to read back.
 template <typename T, typename StateT, class TiledMMA>
-CUTE_DEVICE void chunk_fwd_o_wu_kernel(
+CUTE_DEVICE void chunk_fwd_o_kernel(
     const sycl::local_accessor<float, 1>& slm_mem_const,  // [5 * chunk_size]
     T* core_attn_out,  // [total_seqlen, num_v_heads, head_v_dim]
     T* A,  // [num_v_heads, total_virtual_seqlen, chunk_size], inverted (RO)
@@ -775,7 +774,7 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
   float* g_slm_ptr = slm_mem;
   float* g_multi_slm_ptr = slm_mem + chunk_size;
   float* g_exp_slm_ptr = g_multi_slm_ptr + chunk_size;
-  // Extra SLM used only by the inlined compute_wu prologue.
+  // Extra SLM for the w/u prologue (beta and exp(a)*beta scaling).
   float* wu_beta_slm_ptr = g_exp_slm_ptr + chunk_size;
   float* wu_g_slm_ptr = wu_beta_slm_ptr + chunk_size;
   // Lane-blocked O2 staging tile, past the 5 * chunk_size float scalars. It
@@ -947,23 +946,23 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
         }
 
         /* compute w/u for this chunk */
-        auto v_ptr_wu = v +
+        auto v_ptr = v +
                         static_cast<int64_t>(chunk_offset) * num_v_heads *
                             head_v_dim +
                         v_head_id * head_v_dim;
-        auto V_wu_T_shape = make_shape(head_v_dim, chunk_size);
-        auto V_wu_T = make_tensor(
-            make_gmem_ptr(v_ptr_wu),
+        auto V_T_shape = make_shape(head_v_dim, chunk_size);
+        auto V_T = make_tensor(
+            make_gmem_ptr(v_ptr),
             make_layout(
-                V_wu_T_shape, make_stride(_1{}, head_v_dim * num_v_heads)));
+                V_T_shape, make_stride(_1{}, head_v_dim * num_v_heads)));
 
-        Tensor cU_wu = make_identity_tensor(U_tensor_shape);
-        auto thr_mma_wu = mma.get_slice(local_id);
+        Tensor cU = make_identity_tensor(U_tensor_shape);
+        auto thr_mma = mma.get_slice(local_id);
 
         /* u[dv] = A_inv @ (beta * v) */
-        Tensor gU_wu = local_tile(
-            cU_wu, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
-        auto tSrU_wu = thr_mma_wu.partition_sg_fragment_C(gU_wu);
+        Tensor gU = local_tile(
+            cU, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
+        auto tSrU = thr_mma.partition_sg_fragment_C(gU);
 
         /* A_inv is read-only, so holding it needs no staging. It is loaded per
            dv rather than per chunk on purpose: its two consumers sit next to
@@ -978,14 +977,14 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
           load_B(K_tensor_T_c, 1, mma, tCrKT1);
         }
 
-        clear(tSrU_wu);
+        clear(tSrU);
         gemm_STS_k_multi(
-            tCrA_inv, V_wu_T, tSrU_wu, 0, dv, mma, wu_beta_slm_ptr);
+            tCrA_inv, V_T, tSrU, 0, dv, mma, wu_beta_slm_ptr);
         /* With a previous state u is still corrected by -W*S further down, so
            keep the accumulator live and stage it once after the correction. */
         if (!has_prev_state) {
           store_C_frag_slm<T>(
-              tSrU_wu,
+              tSrU,
               u_slm_tile,
               u_nblocks,
               sg_local_m_coord,
@@ -997,23 +996,23 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
            (dv==0) and stage it in SLM for the fused W*S GEMM below; it never
            reaches HBM. */
         if (has_prev_state && dv == 0) {
-          Tensor cW_wu = make_identity_tensor(W_tensor_shape);
+          Tensor cW = make_identity_tensor(W_tensor_shape);
 
           for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
-            Tensor gW_wu = local_tile(
-                cW_wu, wg_tile, make_coord(0, dk, 0), Step<_1, _1, X>{});
-            auto tSrW_wu = thr_mma_wu.partition_sg_fragment_C(gW_wu);
+            Tensor gW = local_tile(
+                cW, wg_tile, make_coord(0, dk, 0), Step<_1, _1, X>{});
+            auto tSrW = thr_mma.partition_sg_fragment_C(gW);
 
-            clear(tSrW_wu);
+            clear(tSrW);
             if (dk == 0) {
               gemm_SSS_k_multi(
-                  tCrA_inv, tCrKT0, tSrW_wu, mma, sg_local_id, wu_g_slm_ptr);
+                  tCrA_inv, tCrKT0, tSrW, mma, sg_local_id, wu_g_slm_ptr);
             } else {
               gemm_SSS_k_multi(
-                  tCrA_inv, tCrKT1, tSrW_wu, mma, sg_local_id, wu_g_slm_ptr);
+                  tCrA_inv, tCrKT1, tSrW, mma, sg_local_id, wu_g_slm_ptr);
             }
             store_C_frag_slm<T>(
-                tSrW_wu,
+                tSrW,
                 w_slm_tile,
                 w_nblocks,
                 sg_local_m_coord,
@@ -1031,10 +1030,6 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
         auto S_tensor = make_tensor(
             make_gmem_ptr(S_ptr),
             make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
-
-        Tensor cU = make_identity_tensor(U_tensor_shape);
-
-        auto thr_mma = mma.get_slice(local_id);
 
         auto q_ptr =
             q + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
@@ -1151,11 +1146,11 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
           // HBM, so there is no reorder and no block-2D copy left for u.
           CUTE_UNROLL
           for (int i = 0; i < tSrU_d.size(); ++i) {
-            tSrU_wu(i) -= tSrU_d(i);
+            tSrU(i) -= tSrU_d(i);
           }
 
           store_C_frag_slm<T>(
-              tSrU_wu,
+              tSrU,
               u_slm_tile,
               u_nblocks,
               sg_local_m_coord,
@@ -1289,7 +1284,7 @@ template <typename T, typename StateTag>
 class ChunkInverseKernel;
 
 template <typename T, typename StateT, bool BigSG>
-class ChunkFwdOWUKernel;
+class ChunkFwdOKernel;
 
 template <typename T, typename StateT>
 void kernel_launcher(
@@ -1462,7 +1457,7 @@ void kernel_launcher(
     });
   }
 
-  // compute O, optionally fused with compute_wu.
+  // compute O.
   //
   // chunk_fwd_o is the dominant sub-kernel of the delta stage. Its launch grid
   // is (batch_size, num_v_heads * dv_split).
@@ -1480,14 +1475,13 @@ void kernel_launcher(
   const int fwd_o_dv_split = head_v_dim / chunk_size;
   const int fwd_o_wgs = batch_size * num_v_heads * fwd_o_dv_split;
 
-  // compute_wu is always fused into fwd_o: w and u never reach HBM, so there
-  // is nothing for a separate pass to hand over.
+  // w and u never reach HBM, so there is nothing for a separate pass to hand
+  // over; fwd_o computes them in its own prologue.
   {
-    // Fused compute_wu + fwd_o. The grid is already large, so use the compact
-    // sub-group layout (the fused kernel is register-heavier; the wider 4x4
-    // layout regresses here).
+    // The compact sub-group layout: this kernel is register-heavy and the
+    // wider 4x4 layout regresses here.
     // 3 * chunk_size for fwd_o (g / g_multi / g_exp) plus 2 * chunk_size for
-    // the inlined compute_wu prologue (beta and exp(a)*beta scaling), plus the
+    // the w/u prologue (beta and exp(a)*beta scaling), plus the
     // lane-blocked staging tiles: O2 for the GRF-resident O2U A operand, W for
     // the fused W*S A operand, and u -- staged once and read back both as the
     // O2U B operand and transposed as the state update's A operand -- so that
@@ -1505,11 +1499,11 @@ void kernel_launcher(
     queue.submit([&](sycl::handler& cgh) {
       sycl::local_accessor<float, 1> local_mem(
           sycl::range<1>(slm_size_fwd_o), cgh);
-      cgh.parallel_for<ChunkFwdOWUKernel<T, StateT, false>>(
+      cgh.parallel_for<ChunkFwdOKernel<T, StateT, false>>(
           sycl::nd_range<3>{global_fwd_o * local_fwd_o, local_fwd_o},
           kernel_props,
           [=](auto) {
-            chunk_fwd_o_wu_kernel<T, StateT, MMAFwdOSmall>(
+            chunk_fwd_o_kernel<T, StateT, MMAFwdOSmall>(
                 local_mem,
                 core_attn_out,
                 A,
