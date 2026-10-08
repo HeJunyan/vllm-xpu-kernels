@@ -870,6 +870,23 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
       auto tCrO2_A = mma.get_slice(local_id).partition_sg_fragment_A(
           gO2A(_, _, 0));
 
+      /* K^T feeds the w GEMM and every state update as the same B operand --
+         two tiles, read three times each per chunk. Hold both for the chunk
+         and load them once at dv == 0. Named fragments, not an array: an
+         aggregate indexed by a runtime dk would be pushed out to private
+         memory. */
+      auto k_ptr_c =
+          k + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
+      auto K_tensor_T_c = make_tensor(
+          make_gmem_ptr(k_ptr_c),
+          make_layout(
+              make_shape(head_k_dim, chunk_size),
+              make_stride(_1{}, head_k_dim * num_k_heads)));
+      auto tCrKT0 = make_B_frag(mma);
+      auto tCrKT1 = make_B_frag(mma);
+      prefetch_B(K_tensor_T_c, 0, mma, 1);
+      prefetch_B(K_tensor_T_c, 1, mma, 1);
+
       for (int dv = 0; dv < dv_split; ++dv) {
         /* w and u are produced and consumed entirely on chip now, so only
            their tile shapes survive -- the gmem workspaces are gone. */
@@ -956,6 +973,10 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
            unscaled. */
         auto tCrA_inv = make_A_frag(mma);
         load_A(A_inv_tensor, 0, mma, tCrA_inv);
+        if (dv == 0) {
+          load_B(K_tensor_T_c, 0, mma, tCrKT0);
+          load_B(K_tensor_T_c, 1, mma, tCrKT1);
+        }
 
         clear(tSrU_wu);
         gemm_STS_k_multi(
@@ -984,8 +1005,13 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
             auto tSrW_wu = thr_mma_wu.partition_sg_fragment_C(gW_wu);
 
             clear(tSrW_wu);
-            gemm_STS_k_multi(
-                tCrA_inv, K_tensor_T, tSrW_wu, 0, dk, mma, wu_g_slm_ptr);
+            if (dk == 0) {
+              gemm_SSS_k_multi(
+                  tCrA_inv, tCrKT0, tSrW_wu, mma, sg_local_id, wu_g_slm_ptr);
+            } else {
+              gemm_SSS_k_multi(
+                  tCrA_inv, tCrKT1, tSrW_wu, mma, sg_local_id, wu_g_slm_ptr);
+            }
             store_C_frag_slm<T>(
                 tSrW_wu,
                 w_slm_tile,
@@ -1220,7 +1246,11 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
             clear(tSrS_d);
           }
 
-            gemm_STS(tCrU_A, K_tensor_T, tSrS_d, dv, dk, mma);
+            if (dk == 0) {
+              cute::gemm(mma, tCrU_A, tCrKT0, tSrS_d);
+            } else {
+              cute::gemm(mma, tCrU_A, tCrKT1, tSrS_d);
+            }
           reorder(tSrS_d, tCrS_d);
           copy(copy_S_d, tCrS_d, tCgS_d);
         }
