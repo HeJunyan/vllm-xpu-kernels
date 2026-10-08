@@ -1326,6 +1326,12 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
           slm_mem_const.template get_multi_ptr<sycl::access::decorated::yes>()
               .get()) +
       5 * chunk_size * static_cast<int>(sizeof(float));
+  // Lane-blocked W staging tile. W = A_inv@(g*k) is a C accumulator the fused
+  // W*S GEMM consumes as an A operand, so routing it through SLM drops its HBM
+  // round-trip and the reorder in front of each dpas.
+  SlmPtr w_slm_tile =
+      o2_slm_tile + slm_a_tile_bytes(chunk_size, chunk_size);
+  const int w_kblocks = head_k_dim / sub_group_size;
 
   TiledMMA mma{};
   auto wg_tile = mma.tile_mnk();
@@ -1491,26 +1497,28 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
         reorder(tSrU_wu, tCrU_wu);
         copy(copy_U_wu, tCrU_wu, tCgU_wu);
 
-        /* w = A_inv@(g*k). It's dv-independent, so compute and store it
-           only once (dv==0) and let the later dv iterations read it back
-           from HBM via W_tensor below. */
+        /* w = A_inv@(g*k). It's dv-independent, so compute it only once
+           (dv==0) and stage it in SLM for the fused W*S GEMM below; it never
+           reaches HBM. */
         if (has_prev_state && dv == 0) {
           Tensor cW_wu = make_identity_tensor(W_tensor.shape());
-          auto copy_W_wu = get_block_2d_copy_D<void>(mma, W_tensor);
-          auto thr_copy_W_wu = copy_W_wu.get_slice(local_id);
 
           for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
             Tensor gW_wu = local_tile(
                 cW_wu, wg_tile, make_coord(0, dk, 0), Step<_1, _1, X>{});
-            auto tCrW_wu = thr_copy_W_wu.partition_sg_fragment_S(gW_wu);
-            auto tCgW_wu = thr_copy_W_wu.partition_D(gW_wu);
             auto tSrW_wu = thr_mma_wu.partition_sg_fragment_C(gW_wu);
 
             clear(tSrW_wu);
             gemm_TTS_k_multi(
                 A_inv_tensor, K_tensor_T, tSrW_wu, 0, dk, mma, wu_g_slm_ptr);
-            reorder(tSrW_wu, tCrW_wu);
-            copy(copy_W_wu, tCrW_wu, tCgW_wu);
+            store_C_frag_slm_A<T>(
+                tSrW_wu,
+                w_slm_tile,
+                w_kblocks,
+                sg_local_m_coord,
+                sg_local_n_coord,
+                sg_local_id,
+                dk * (chunk_size / sub_group_size));
           }
         }
 
@@ -1576,9 +1584,10 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
           }
         }
 
-        store_C_frag_slm_A<chunk_size / sub_group_size, T>(
+        store_C_frag_slm_A<T>(
             tSrO2_c,
             o2_slm_tile,
+            chunk_size / sub_group_size,
             sg_local_m_coord,
             sg_local_n_coord,
             sg_local_id);
@@ -1588,7 +1597,11 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
         item.barrier(sycl::access::fence_space::local_space);
 
         load_A_frag_slm<T>(
-            tCrO2_A, o2_slm_tile, sg_local_m_coord, sg_local_id);
+            tCrO2_A,
+            o2_slm_tile,
+            chunk_size / sub_group_size,
+            sg_local_m_coord,
+            sg_local_id);
         }  // end if (dv == 0): compute O2 once
 
         auto U_tensor_T_shape = make_shape(head_v_dim, chunk_size);
@@ -1625,9 +1638,20 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
           clear(tSrO_c);
 
           // Fused gemm: W×S[dv] -> tSrU_d, Q×S[dv] -> tSrO_c
-          // S is loaded once and reused in registers for both
-            gemm_TTS_fused_2A(
-              W_tensor, Q_tensor, S_tensor, tSrU_d, tSrO_c, 0, 0, dv, mma);
+          // S is loaded once and reused in registers for both; W is gathered
+          // from its SLM staging tile straight into the MMA A fragment.
+            gemm_QTS_fused_2A<T>(
+              w_slm_tile,
+              w_kblocks,
+              Q_tensor,
+              S_tensor,
+              tSrU_d,
+              tSrO_c,
+              0,
+              dv,
+              mma,
+              sg_local_m_coord,
+              sg_local_id);
 
           // --- WS epilogue: U_new[dv] = U_old[dv] - W×S[dv] ---
           auto tCrU_d = thr_copy_U_d.partition_sg_fragment_S(gU_C);
@@ -1971,11 +1995,12 @@ void kernel_launcher(
     // layout regresses here).
     // 3 * chunk_size for fwd_o (g / g_multi / g_exp) plus 2 * chunk_size for
     // the inlined compute_wu prologue (beta and exp(a)*beta scaling), plus the
-    // lane-blocked O2 staging tile that hands mask(Q*K^T) to the GRF-resident
-    // O2U A operand.
+    // lane-blocked staging tiles that hand mask(Q*K^T) to the GRF-resident O2U
+    // A operand and W to the fused W*S A operand.
     int slm_size_fwd_o =
         5 * chunk_size +
-        slm_a_tile_bytes<chunk_size, chunk_size>() /
+        (slm_a_tile_bytes(chunk_size, chunk_size) +
+         slm_a_tile_bytes(chunk_size, head_k_dim)) /
             static_cast<int>(sizeof(float));
     int threads_fwd_o = size(MMAFwdOSmall{});
     sycl::range<3> local_fwd_o(1, 1, threads_fwd_o);

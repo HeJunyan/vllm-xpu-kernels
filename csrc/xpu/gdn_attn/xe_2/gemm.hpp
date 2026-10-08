@@ -76,12 +76,9 @@ static constexpr int kSlmASgSize = 16;
 // One (m-block, k-block) pair across all lanes.
 static constexpr int kSlmABlockBytes = kSlmALaneBytes * kSlmASgSize;
 
-/* Bytes needed for a (BLK_M, BLK_K) lane-blocked A tile. */
-template <int BlkM, int BlkK>
-static constexpr int slm_a_tile_bytes() {
-  static_assert(BlkM % kSlmALaneElems == 0 && BlkK % kSlmASgSize == 0,
-                "a lane-blocked A tile is a whole number of 16x16 blocks");
-  return (BlkM / kSlmALaneElems) * (BlkK / kSlmASgSize) * kSlmABlockBytes;
+/* Bytes needed for a (BlkM, K) lane-blocked A tile. */
+CUTE_HOST_DEVICE constexpr int slm_a_tile_bytes(int blk_m, int k) {
+  return (blk_m / kSlmALaneElems) * (k / kSlmASgSize) * kSlmABlockBytes;
 }
 
 /* Decorated local-space pointers: SLM address arithmetic stays 32-bit. */
@@ -99,21 +96,24 @@ using SlmLaneRunCPtr = sycl::decorated_local_ptr<const SlmLaneRun>::pointer;
 
 /* Stores this sub-group's (16 m, SG_N n) fp32 C accumulator, narrowed to T,
  * as columns k = n of a lane-blocked A tile: the producer's N index is the
- * consumer's contracted index. KBlocks is the tile's BLK_K/16. */
-template <int KBlocks, class T, class CFrag>
+ * consumer's contracted index. The tile may be wider than one BLK_K, so
+ * kblocks_total is its full k-block count and kblk_base is where this
+ * accumulator's n tile starts in it. */
+template <class T, class CFrag>
 CUTE_DEVICE void store_C_frag_slm_A(
     CFrag const& tSrC,
     SlmPtr tile,
+    int kblocks_total,
     int sg_m,
     int sg_n,
-    int lane) {
+    int lane,
+    int kblk_base = 0) {
   static_assert(sizeof(T) == 2, "lane-blocked SLM tiles are 16-bit");
   using CLayout = cute::remove_cvref_t<decltype(tSrC.layout())>;
   constexpr int kNBlk = cute::size<2>(CLayout{});
   constexpr int kMRun = cute::size<0>(CLayout{}) * cute::size<1>(CLayout{});
   static_assert(kMRun == kSlmALaneElems,
                 "C fragment must own exactly 16 m-rows per lane");
-  static_assert(kNBlk <= KBlocks, "C n-blocks must fit the tile's k-blocks");
 
   CUTE_UNROLL
   for (int nb = 0; nb < kNBlk; ++nb) {
@@ -124,16 +124,24 @@ CUTE_DEVICE void store_C_frag_slm_A(
       run[i] = static_cast<T>(tSrC(nb * kSlmALaneElems + i));
     }
     *reinterpret_cast<SlmLaneRunPtr>(
-        tile + (sg_m * KBlocks + sg_n * kNBlk + nb) * kSlmABlockBytes +
+        tile +
+        (sg_m * kblocks_total + kblk_base + sg_n * kNBlk + nb) *
+            kSlmABlockBytes +
         lane * kSlmALaneBytes) = *reinterpret_cast<const SlmLaneRun*>(run);
   }
 }
 
-/* Gathers this sub-group's A operand -- 16 m-rows by the full BLK_K -- out of a
+/* Gathers this sub-group's A operand -- 16 m-rows by one BLK_K -- out of a
  * lane-blocked A tile straight into its MMA fragment, no reorder in front of
- * the dpas. */
+ * the dpas. kblk_base selects the k-tile when the tile spans several. */
 template <class T, class AFrag>
-CUTE_DEVICE void load_A_frag_slm(AFrag& tCrA, SlmCPtr tile, int sg_m, int lane) {
+CUTE_DEVICE void load_A_frag_slm(
+    AFrag& tCrA,
+    SlmCPtr tile,
+    int kblocks_total,
+    int sg_m,
+    int lane,
+    int kblk_base = 0) {
   static_assert(sizeof(T) == 2, "lane-blocked SLM tiles are 16-bit");
   using ALayout = cute::remove_cvref_t<decltype(tCrA.layout())>;
   constexpr int kKBlk = cute::size<2>(ALayout{});
@@ -145,7 +153,8 @@ CUTE_DEVICE void load_A_frag_slm(AFrag& tCrA, SlmCPtr tile, int sg_m, int lane) 
   for (int kb = 0; kb < kKBlk; ++kb) {
     *reinterpret_cast<SlmLaneRun*>(&tCrA(kb * kSlmALaneElems)) =
         *reinterpret_cast<SlmLaneRunCPtr>(
-            tile + (sg_m * kKBlk + kb) * kSlmABlockBytes +
+            tile +
+            (sg_m * kblocks_total + kblk_base + kb) * kSlmABlockBytes +
             lane * kSlmALaneBytes);
   }
 }
@@ -653,6 +662,108 @@ CUTE_DEVICE void gemm_TTS_fused_2A(
     // Reorder B (shared) and A1, then first GEMM
     reorder(tBrB, tCrB);
     reorder(tArA1, tCrA);
+    cute::gemm(mma, tCrA, tCrB, tCrC1);
+
+    // Reorder A2 reusing MMA A fragment, B stays in register
+    reorder(tArA2, tCrA);
+    cute::gemm(mma, tCrA, tCrB, tCrC2);
+
+    barrier_wait(barrier_scope);
+  }
+}
+
+/* gemm_QTS_fused_2A: gemm_TTS_fused_2A with A1 coming from a lane-blocked SLM
+ * A tile instead of gmem. A1 is a C accumulator an earlier step produced, so
+ * routing it through SLM drops both its HBM round-trip and the reorder in front
+ * of each dpas -- the gather lands directly in the MMA fragment. A2 and the
+ * shared B still stream from gmem with their prefetches untouched. */
+template <
+    class T,
+    class A2Tensor,
+    class BTensor,
+    class SGCTensor1,
+    class SGCTensor2,
+    class TiledMMA>
+CUTE_DEVICE void gemm_QTS_fused_2A(
+    SlmCPtr sA1,       // lane-blocked A tile holding A1
+    int a1_kblocks,    // A1 tile's total k-block count
+    A2Tensor const& A2,  // (M,K) second A operand
+    BTensor const& B,    // (N,K) shared B operand
+    SGCTensor1& tCrC1,   // accumulator for A1 * B^T
+    SGCTensor2& tCrC2,   // accumulator for A2 * B^T
+    int wg_m2,           // m tile index for A2
+    int wg_n,            // n tile index for B (shared)
+    TiledMMA const& mma,
+    int sg_m,
+    int lane) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+
+  Tensor cA2 = make_identity_tensor(A2.shape());
+  Tensor cB = make_identity_tensor(B.shape());
+
+  auto wg_tile = mma.tile_mnk();
+
+  Tensor gA2 = local_tile(cA2, select<0, 2>(wg_tile), make_coord(wg_m2, _));
+  Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _));
+
+  auto copy_a2 = get_block_2d_copy_A<void>(mma, A2);
+  auto copy_b = get_block_2d_copy_B<void>(mma, B);
+
+  auto thr_mma = mma.get_slice(local_id);
+  auto thr_copy_a2 = copy_a2.get_slice(local_id);
+  auto thr_copy_b = copy_b.get_slice(local_id);
+
+  auto tCrA = thr_mma.partition_sg_fragment_A(gA2(_, _, 0));
+  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+
+  auto tArA2 = thr_copy_a2.partition_sg_fragment_D(gA2(_, _, 0));
+  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
+
+  Tensor tAgA2 = thr_copy_a2.partition_S(gA2);
+  Tensor tBgB = thr_copy_b.partition_S(gB);
+
+  auto prefetch_a2 = make_block_2d_prefetch(copy_a2);
+  auto prefetch_b = make_block_2d_prefetch(copy_b);
+
+  auto thr_prefetch_A2 = prefetch_a2.get_slice(local_id);
+  auto thr_prefetch_B = prefetch_b.get_slice(local_id);
+
+  auto pAgA2 = thr_prefetch_A2.partition_S(gA2);
+  auto pBgB = thr_prefetch_B.partition_S(gB);
+
+  const int prefetch_dist = 3;
+
+  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
+  // k-blocks one MMA k-tile spans, i.e. how far the SLM gather steps per trip.
+  constexpr int kKBlkPerTile =
+      decltype(get<2>(wg_tile))::value / kSlmASgSize;
+
+  int k_tile_count = ceil_div(shape<1>(A2), get<2>(wg_tile));
+  int k_tile_prefetch = 0;
+
+  CUTE_UNROLL
+  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+    prefetch(prefetch_a2, pAgA2(_, _, _, k_tile_prefetch));
+    prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+  }
+
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+    barrier_arrive(barrier_scope);
+
+    copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
+    copy(copy_a2, tAgA2(_, _, _, k_tile), tArA2);
+
+    if (k_tile_prefetch < k_tile_count) {
+      prefetch(prefetch_a2, pAgA2(_, _, _, k_tile_prefetch));
+      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+    }
+
+    reorder(tBrB, tCrB);
+
+    // A1 gathers straight into the MMA fragment -- no reorder.
+    load_A_frag_slm<T>(
+        tCrA, sA1, a1_kblocks, sg_m, lane, k_tile * kKBlkPerTile);
     cute::gemm(mma, tCrA, tCrB, tCrC1);
 
     // Reorder A2 reusing MMA A fragment, B stays in register
