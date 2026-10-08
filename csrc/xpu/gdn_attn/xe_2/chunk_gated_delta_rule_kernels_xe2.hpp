@@ -721,565 +721,25 @@ CUTE_DEVICE void chunk_inverse_opt_kernel(
   }
 }
 
-template <typename T, class TiledMMA>
-CUTE_DEVICE void chunk_compute_wu_kernel(
-    const sycl::local_accessor<float, 1>& slm_mem_const,
-    T* A,
-    T* w,
-    T* u,
-    const T* q,
-    const T* k,
-    const T* v,
-    const float* b,
-    const float* a,
-    const float* A_log,
-    const T* dt_bias,
-    const int* query_start_loc,
-    const bool* has_initial_state,
-    const int total_virtual_seqlen,
-    const int batch_size,
-    const int num_k_heads,
-    const int head_k_dim,
-    const int num_v_heads,
-    const int head_v_dim) {
-  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-  int local_id = item.get_local_linear_id();
-  int local_range = item.get_local_range(2);
-  int v_head_id = item.get_group(1) % num_v_heads;
-  int chunk_id = item.get_group(1) / num_v_heads;
-  const int global_chunk_range = item.get_group_range(1) / num_v_heads;
 
-  float* slm_mem = static_cast<float*>(
-      slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>()
-          .get());
-  float* g_slm_ptr = slm_mem;
-  float* beta_slm_ptr = g_slm_ptr + chunk_size;
 
-  TiledMMA mma{};
-  auto wg_tile = mma.tile_mnk();
-  auto thr_mma = mma.get_slice(local_id);
-
-  static constexpr auto tile_m = get<0>(wg_tile);
-  static constexpr auto tile_n = get<1>(wg_tile);
-
-  static constexpr auto ATOM_M =
-      get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());
-  static constexpr auto ATOM_N =
-      get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());
-
-  static constexpr auto SG_M = tile_m / ATOM_M;  // BLK_M / ATOM_M;
-  static constexpr auto SG_N = tile_n / ATOM_N;  // BLK_N / ATOM_N;
-
-  auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N;
-  auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
-  int m_tile_start = 0;
-  int n_tile_start = 0;
-  int m_sg_start = sg_local_m_coord * SG_M;
-  int n_sg_start = sg_local_n_coord * SG_N;
-
-  using TileShape = decltype(mma.tile_mnk());
-
-  int pre_chunks = 0;
-
-  const int kv_ratio = num_v_heads / num_k_heads;
-
-  for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
-    const bool initial_state = has_initial_state[batch_id];
-    const int seq_start_offset = query_start_loc[batch_id];
-    const int seq_end_offset = query_start_loc[batch_id + 1];
-    const int seq_len = seq_end_offset - seq_start_offset;
-
-    const int current_chunks = (seq_len + chunk_size - 1) / chunk_size;
-    const int cumsum_chunks = pre_chunks + current_chunks;
-
-    if (chunk_id >= cumsum_chunks) {
-      pre_chunks = cumsum_chunks;
-      continue;
-    }
-
-    while (chunk_id < cumsum_chunks) {
-      const int chunk_start_offset = chunk_id * chunk_size;
-
-      // WAR fence: previous iteration's sub-groups may still be
-      // reading beta_slm_ptr/g_slm_ptr; all must arrive before any
-      // sub-group refills the SLM for this iteration.
-      item.barrier(sycl::access::fence_space::local_space);
-      CUTE_UNROLL
-      for (int e = local_id; e < chunk_size; e += local_range) {
-        float beta_value =
-            b[(chunk_start_offset + e) + v_head_id * total_virtual_seqlen];
-        float a_value =
-            a[(chunk_start_offset + e) + v_head_id * total_virtual_seqlen];
-        beta_slm_ptr[e] = beta_value;
-        g_slm_ptr[e] = sycl::native::exp(a_value) * beta_value;
-      }
-
-      item.barrier(sycl::access::fence_space::local_space);
-
-      auto A_ptr = A +
-                   static_cast<int64_t>(v_head_id) * total_virtual_seqlen *
-                       chunk_size +
-                   chunk_start_offset * chunk_size;
-      auto A_tensor_shape = make_shape(chunk_size, chunk_size);
-      auto A_tensor = make_tensor(
-          make_gmem_ptr(A_ptr),
-          make_layout(A_tensor_shape, make_stride(chunk_size, _1{})));
-
-      auto v_ptr = v +
-                   static_cast<int64_t>(chunk_start_offset) * num_v_heads *
-                       head_v_dim +
-                   v_head_id * head_v_dim;
-      auto V_tensor_T_shape = make_shape(head_v_dim, chunk_size);
-      auto V_tensor_T = make_tensor(
-          make_gmem_ptr(v_ptr),
-          make_layout(
-              V_tensor_T_shape, make_stride(_1{}, head_v_dim * num_v_heads)));
-      auto U_ptr = u +
-                   static_cast<int64_t>(v_head_id) * total_virtual_seqlen *
-                       head_v_dim +
-                   chunk_start_offset * head_v_dim;
-      auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
-      auto U_tensor = make_tensor(
-          make_gmem_ptr(U_ptr),
-          make_layout(U_tensor_shape, make_stride(head_v_dim, _1{})));
-
-      Tensor cU = make_identity_tensor(U_tensor.shape());
-      auto copy_U_c = get_block_2d_copy_D<void>(mma, U_tensor);
-      auto thr_copy_U_c = copy_U_c.get_slice(local_id);
-
-      for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
-        Tensor gU_C =
-            local_tile(cU, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
-        auto tCrU_c = thr_copy_U_c.partition_sg_fragment_S(gU_C);
-        auto tCgU_c = thr_copy_U_c.partition_D(gU_C);
-        auto tSrU_c = thr_mma.partition_sg_fragment_C(gU_C);
-        clear(tSrU_c);
-        gemm_TTS_k_multi(
-            A_tensor, V_tensor_T, tSrU_c, 0, dv, mma, beta_slm_ptr);
-        reorder(tSrU_c, tCrU_c);
-        copy(copy_U_c, tCrU_c, tCgU_c);
-      }
-
-      if (((chunk_id - pre_chunks) != 0) || initial_state) {
-        auto k_ptr = k +
-                     static_cast<int64_t>(chunk_start_offset) * num_k_heads *
-                         head_k_dim +
-                     (v_head_id / kv_ratio) * head_k_dim;
-        auto K_tensor_T_shape = make_shape(head_k_dim, chunk_size);
-        auto K_tensor_T = make_tensor(
-            make_gmem_ptr(k_ptr),
-            make_layout(
-                K_tensor_T_shape,
-                make_stride(_1{}, head_k_dim * num_k_heads)));
-        auto W_ptr = w +
-                     static_cast<int64_t>(v_head_id) * total_virtual_seqlen *
-                         head_k_dim +
-                     chunk_start_offset * head_k_dim;
-        auto W_tensor_shape = make_shape(chunk_size, head_k_dim);
-        auto W_tensor = make_tensor(
-            make_gmem_ptr(W_ptr),
-            make_layout(W_tensor_shape, make_stride(head_k_dim, _1{})));
-
-        Tensor cW = make_identity_tensor(W_tensor.shape());
-        auto copy_W_c = get_block_2d_copy_D<void>(mma, W_tensor);
-        auto thr_copy_W_c = copy_W_c.get_slice(local_id);
-
-        for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
-          Tensor gW_C = local_tile(
-              cW, wg_tile, make_coord(0, dk, 0), Step<_1, _1, X>{});
-          auto tCrW_c = thr_copy_W_c.partition_sg_fragment_S(gW_C);
-          auto tCgW_c = thr_copy_W_c.partition_D(gW_C);
-          auto tSrW_c = thr_mma.partition_sg_fragment_C(gW_C);
-          clear(tSrW_c);
-          gemm_TTS_k_multi(
-              A_tensor, K_tensor_T, tSrW_c, 0, dk, mma, g_slm_ptr);
-          reorder(tSrW_c, tCrW_c);
-          copy(copy_W_c, tCrW_c, tCgW_c);
-        }
-      }
-      chunk_id += global_chunk_range;
-    }
-    pre_chunks = cumsum_chunks;
-  }
-}
-
-template <typename T, typename StateT, class TiledMMA>
-CUTE_DEVICE void chunk_fwd_o_kernel(
-    const sycl::local_accessor<float, 1>& slm_mem_const,  // [3 * chunk_size]
-    T* core_attn_out,  // [total_seqlen, num_v_heads, head_v_dim]
-    T* A,  // [num_v_heads, total_virtual_seqlen, chunk_size], temp O2 buffer
-    T* w,  // [num_v_heads, total_virtual_seqlen, head_k_dim]
-    T* u,  // [num_v_heads, total_virtual_seqlen, head_v_dim]
-    const T* q,  // [total_virtual_seqlen, num_k_heads, head_k_dim]
-    const T* k,  // [total_virtual_seqlen, num_k_heads, head_k_dim]
-    const float* a,
-    StateT*
-        ssm_state,  // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
-    const int ssm_state_stride_0,
-    const int* query_start_loc,
-    const int* cache_indices,
-    const bool* has_initial_state,
-    const int* token_indx,
-    const int batch_size,
-    const int total_virtual_seqlen,
-    const int num_k_heads,
-    const int head_k_dim,
-    const int num_v_heads,
-    const int head_v_dim) {
-  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-  int local_id = item.get_local_linear_id();
-  int current_batch_id = item.get_group(0);
-
-  // head_v_dim is split across the grid: group(1) enumerates
-  // (v_head_id, dv_idx) pairs so each work-group owns a single
-  // head_v_dim/chunk_size output tile.
-  const int dv_split = head_v_dim / chunk_size;
-  int v_head_id = item.get_group(1) / dv_split;
-  int dv = item.get_group(1) % dv_split;
-  int local_range = item.get_local_range(2);
-
-  auto sg = item.get_sub_group();
-  int sg_local_id = sg.get_local_linear_id();
-
-  float* slm_mem = static_cast<float*>(
-      slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>()
-          .get());
-  float* g_slm_ptr = slm_mem;
-  float* g_multi_slm_ptr = slm_mem + chunk_size;
-  float* g_exp_slm_ptr = g_multi_slm_ptr + chunk_size;
-
-  TiledMMA mma{};
-  auto wg_tile = mma.tile_mnk();
-
-  static constexpr auto tile_m = get<0>(wg_tile);
-  static constexpr auto tile_n = get<1>(wg_tile);
-
-  static constexpr auto ATOM_M =
-      get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());
-  static constexpr auto ATOM_N =
-      get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());
-
-  static constexpr auto SG_M = tile_m / ATOM_M;  // BLK_M / ATOM_M;
-  static constexpr auto SG_N = tile_n / ATOM_N;  // BLK_N / ATOM_N;
-
-  auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N;
-  auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
-  int m_tile_start = 0;
-  int n_tile_start = 0;
-  int m_sg_start = sg_local_m_coord * SG_M;
-  int n_sg_start = sg_local_n_coord * SG_N;
-
-  const int kv_ratio = num_v_heads / num_k_heads;
-  const int kv_head_id = v_head_id / kv_ratio;
-
-  int pre_chunks = 0;
-
-  for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
-    const bool initial_state = has_initial_state[batch_id];
-    const int seq_start_offset = query_start_loc[batch_id];
-    const int seq_end_offset = query_start_loc[batch_id + 1];
-    const int seq_len = seq_end_offset - seq_start_offset;
-
-    const int current_chunks = (seq_len + chunk_size - 1) / chunk_size;
-
-    if (current_batch_id != batch_id) {
-      pre_chunks += current_chunks;
-      continue;
-    }
-
-    StateT* ssm_state_ptr =
-        ssm_state +
-        static_cast<int64_t>(cache_indices[batch_id]) * ssm_state_stride_0 +
-        v_head_id * head_v_dim * head_k_dim;
-
-    for (int chunk_id = 0; chunk_id < current_chunks; ++chunk_id) {
-      const bool has_prev_state = (chunk_id != 0) || initial_state;
-      const int out_chunk_offset = seq_start_offset + chunk_id * chunk_size;
-      const int chunk_offset = (pre_chunks + chunk_id) * chunk_size;
-
-      int current_chunk_size = chunk_size;
-      if ((chunk_id + 1) * chunk_size > seq_len) {
-        current_chunk_size = seq_len - chunk_id * chunk_size;
-      }
-
-      float g_last_value =
-          a[(chunk_offset + current_chunk_size - 1) +
-            v_head_id * total_virtual_seqlen];
-      float g_last_value_exp = sycl::native::exp(g_last_value);
-      // WAR fence: the previous chunk iteration's sub-groups may
-      // still be reading g_slm_ptr/g_multi_slm_ptr/g_exp_slm_ptr in
-      // their output/state GEMM epilogues; all must arrive before any
-      // sub-group refills these SLM buffers for this chunk.
-      item.barrier(sycl::access::fence_space::local_space);
-      CUTE_UNROLL
-      for (int e = local_id; e < current_chunk_size; e += local_range) {
-        float g_cumsum_value =
-            a[(chunk_offset + e) + v_head_id * total_virtual_seqlen];
-        g_slm_ptr[e] = g_cumsum_value;
-        g_multi_slm_ptr[e] = sycl::native::exp(g_last_value - g_cumsum_value);
-        g_exp_slm_ptr[e] = sycl::native::exp(g_cumsum_value);
-      }
-
-      CUTE_UNROLL
-      for (int e = current_chunk_size + local_id; e < chunk_size;
-           e += local_range) {
-        g_slm_ptr[e] = 0.0f;
-        g_multi_slm_ptr[e] = 0.0f;
-        g_exp_slm_ptr[e] = 0.0f;
-      }
-      item.barrier(sycl::access::fence_space::local_space);
-
-      auto W_ptr = w + v_head_id * total_virtual_seqlen * head_k_dim +
-                   chunk_offset * head_k_dim;
-      auto W_tensor_shape = make_shape(chunk_size, head_k_dim);
-      auto W_tensor = make_tensor(
-          make_gmem_ptr(W_ptr),
-          make_layout(W_tensor_shape, make_stride(head_k_dim, _1{})));
-
-      auto U_ptr = u + v_head_id * total_virtual_seqlen * head_v_dim +
-                   chunk_offset * head_v_dim;
-      auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
-      auto U_tensor = make_tensor(
-          make_gmem_ptr(U_ptr),
-          make_layout(U_tensor_shape, make_stride(head_v_dim, _1{})));
-
-      StateT* S_ptr = ssm_state_ptr;
-      auto S_tensor_shape = make_shape(head_v_dim, head_k_dim);
-      auto S_tensor = make_tensor(
-          make_gmem_ptr(S_ptr),
-          make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
-
-      Tensor cU = make_identity_tensor(U_tensor.shape());
-
-      auto copy_U_c = get_block_2d_copy_C<void>(mma, U_tensor);
-      auto copy_U_d = get_block_2d_copy_D<void>(mma, U_tensor);
-
-      auto thr_copy_U_c = copy_U_c.get_slice(local_id);
-      auto thr_copy_U_d = copy_U_d.get_slice(local_id);
-
-      auto thr_mma = mma.get_slice(local_id);
-
-      auto q_ptr =
-          q + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
-      auto Q_tensor_shape = make_shape(current_chunk_size, head_k_dim);
-      auto Q_tensor = make_tensor(
-          make_gmem_ptr(q_ptr),
-          make_layout(
-              Q_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
-
-      auto k_ptr =
-          k + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
-      auto K_tensor_shape = make_shape(chunk_size, head_k_dim);
-      auto K_tensor = make_tensor(
-          make_gmem_ptr(k_ptr),
-          make_layout(
-              K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
-
-      auto O2_ptr =
-          A +
-          static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
-          chunk_offset * chunk_size;
-      auto O2_tensor_shape = make_shape(current_chunk_size, chunk_size);
-      auto O2_tensor = make_tensor(
-          make_gmem_ptr(O2_ptr),
-          make_layout(O2_tensor_shape, make_stride(chunk_size, _1{})));
-      Tensor cO2 = make_identity_tensor(O2_tensor_shape);
-      auto copy_O2_c = get_block_2d_copy_D<void>(mma, O2_tensor);
-      auto thr_copy_O2_c = copy_O2_c.get_slice(local_id);
-
-      Tensor gO2_C =
-          local_tile(cO2, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
-      auto tCrO2_c = thr_copy_O2_c.partition_sg_fragment_S(gO2_C);
-      auto tCgO2_c = thr_copy_O2_c.partition_D(gO2_C);
-      auto tSrO2_c = thr_mma.partition_sg_fragment_C(gO2_C);
-
-      // QK MMA: compute O2 = mask(Q × K^T) first (no dependency on WS)
-      clear(tSrO2_c);
-      gemm_TTS(Q_tensor, K_tensor, tSrO2_c, 0, 0, mma);
-
-      CUTE_UNROLL
-      for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
-        int n_idx =
-            n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
-        CUTE_UNROLL
-        for (int sm = 0; sm < SG_M; ++sm) {
-          int m_idx = m_tile_start + m_sg_start + sm;
-          tSrO2_c(sn * SG_M + sm) *=
-              sycl::native::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]);
-          if (m_idx < n_idx) {
-            tSrO2_c(sn * SG_M + sm) = 0.0f;
-          }
-        }
-      }
-      reorder(tSrO2_c, tCrO2_c);
-      copy(copy_O2_c, tCrO2_c, tCgO2_c);
-
-      auto U_tensor_T_shape = make_shape(head_v_dim, chunk_size);
-      auto U_tensor_T = make_tensor(
-          make_gmem_ptr(U_ptr),
-          make_layout(U_tensor_T_shape, make_stride(_1{}, head_v_dim)));
-      auto O_ptr =
-          core_attn_out +
-          (token_indx ? token_indx[out_chunk_offset] : out_chunk_offset) *
-              num_v_heads * head_v_dim +
-          v_head_id * head_v_dim;
-      auto O_tensor_shape = make_shape(current_chunk_size, head_v_dim);
-      auto O_tensor = make_tensor(
-          make_gmem_ptr(O_ptr),
-          make_layout(
-              O_tensor_shape, make_stride(num_v_heads * head_v_dim, _1{})));
-
-      Tensor cO = make_identity_tensor(O_tensor.shape());
-      auto copy_O_c = get_block_2d_copy_D<void>(mma, O_tensor);
-      auto thr_copy_O_c = copy_O_c.get_slice(local_id);
-
-      if (has_prev_state) {
-        // Fused WS+QS dv loop: S[dv] is loaded once per k_tile and reused
-        // in registers for both WS (W×S) and QS (Q×S) DPAS operations.
-        // --- Fused WS+QS MMA: share S[dv] load in registers ---
-        Tensor gU_C =
-            local_tile(cU, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
-        auto tSrU_d = thr_mma.partition_sg_fragment_C(gU_C);
-        clear(tSrU_d);
-
-        Tensor gO_C =
-            local_tile(cO, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
-        auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
-        clear(tSrO_c);
-
-        // Fused gemm: W×S[dv] -> tSrU_d, Q×S[dv] -> tSrO_c
-        // S is loaded once and reused in registers for both
-        gemm_TTS_fused_2A(
-            W_tensor, Q_tensor, S_tensor, tSrU_d, tSrO_c, 0, 0, dv, mma);
-
-        // --- WS epilogue: U_new[dv] = U_old[dv] - W×S[dv] ---
-        auto tCrU_d = thr_copy_U_d.partition_sg_fragment_S(gU_C);
-        auto tCgU_d = thr_copy_U_d.partition_D(gU_C);
-        auto tCrU_c_save = thr_copy_U_c.partition_sg_fragment_D(gU_C);
-        reorder(tSrU_d, tCrU_c_save);
-
-        auto tCgU_c = thr_copy_U_c.partition_S(gU_C);
-        auto tCrU_c = thr_copy_U_c.partition_sg_fragment_D(gU_C);
-        copy(copy_U_c, tCgU_c, tCrU_c);
-
-        CUTE_UNROLL
-        for (int i = 0; i < tCrU_c_save.size(); ++i) {
-          tCrU_c(i) -= tCrU_c_save(i);
-        }
-
-        reorder(tCrU_c, tCrU_d);
-        copy(copy_U_d, tCrU_d, tCgU_d);
-
-        // --- QS epilogue: apply exp(g) scaling ---
-        CUTE_UNROLL
-        for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
-          int n_idx =
-              n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
-          CUTE_UNROLL
-          for (int sm = 0; sm < SG_M; ++sm) {
-            int m_idx = m_tile_start + m_sg_start + sm;
-            tSrO_c(sn * SG_M + sm) *= g_exp_slm_ptr[(m_idx)];
-          }
-        }
-
-        // Barrier: ensure U_new[dv] is visible across all subgroups
-        // before O2U reads it via U_tensor_T.
-        item.barrier(sycl::access::fence_space::local_space);
-
-        // --- O2U MMA: O[dv] += O1[dv] + O2 × U_T[dv] ---
-        gemm_TTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
-        auto tCrO_c = thr_copy_O_c.partition_sg_fragment_S(gO_C);
-        auto tCgO_c = thr_copy_O_c.partition_D(gO_C);
-        reorder(tSrO_c, tCrO_c);
-        copy(copy_O_c, tCrO_c, tCgO_c);
-      }
-
-      auto K_tensor_T_shape = make_shape(head_k_dim, chunk_size);
-      auto K_tensor_T = make_tensor(
-          make_gmem_ptr(k_ptr),
-          make_layout(
-              K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
-
-      Tensor cS = make_identity_tensor(S_tensor.shape());
-      auto copy_S_c = get_block_2d_copy_C<void>(mma, S_tensor);
-      auto copy_S_d = get_block_2d_copy_D<void>(mma, S_tensor);
-      auto thr_copy_S_c = copy_S_c.get_slice(local_id);
-      auto thr_copy_S_d = copy_S_d.get_slice(local_id);
-
-      for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
-        Tensor gS_C =
-            local_tile(cS, wg_tile, make_coord(dv, dk, 0), Step<_1, _1, X>{});
-        auto tCrS_d = thr_copy_S_d.partition_sg_fragment_S(gS_C);
-        auto tCgS_d = thr_copy_S_d.partition_D(gS_C);
-        auto tSrS_d = thr_mma.partition_sg_fragment_C(gS_C);
-
-        // Seed accumulator with exp(g_last) * S_prev when previous state
-        // exists; otherwise start from zeros.
-        if (has_prev_state) {
-          auto tCgS_c = thr_copy_S_c.partition_S(gS_C);
-          auto tCrS_c = thr_copy_S_c.partition_sg_fragment_D(gS_C);
-          copy(copy_S_c, tCgS_c, tCrS_c);
-
-          reorder(tCrS_c, tSrS_d);
-          CUTE_UNROLL
-          for (int i = 0; i < tCrS_c.size(); ++i) {
-            tSrS_d(i) *= g_last_value_exp;
-          }
-        } else {
-          clear(tSrS_d);
-        }
-
-        gemm_TTS_k_multi(
-            U_tensor_T, K_tensor_T, tSrS_d, dv, dk, mma, g_multi_slm_ptr);
-        reorder(tSrS_d, tCrS_d);
-        copy(copy_S_d, tCrS_d, tCgS_d);
-      }
-
-      if (!has_prev_state) {
-        Tensor gO_C =
-            local_tile(cO, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
-        auto tCrO_c = thr_copy_O_c.partition_sg_fragment_S(gO_C);
-        auto tCgO_c = thr_copy_O_c.partition_D(gO_C);
-        auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
-
-        clear(tSrO_c);
-        gemm_TTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
-        reorder(tSrO_c, tCrO_c);
-        copy(copy_O_c, tCrO_c, tCgO_c);
-      }
-    }
-    pre_chunks += current_chunks;
-  }
-}
-
-// Fused compute_wu + fwd_o kernel.
+// Fused compute_wu + fwd_o kernel: the only fwd_o path.
 //
-// chunk_compute_wu_kernel (produces w, u) and chunk_fwd_o_kernel (consumes
-// w, u to produce core_attn_out / ssm_state) are consecutive, w/u being a
-// pure producer/consumer intermediate written to HBM by the first and read
-// back by the second. This kernel fuses them: it keeps chunk_fwd_o's grid
-// ((batch, num_v_heads * dv_split), sequential over chunks within a batch)
-// and, at the top of each chunk iteration, inlines the compute_wu math to
-// produce w/u for that chunk right before consuming them. This removes a full
-// kernel launch and the launch-boundary global sync, and keeps w/u hot in L2.
+// w and u used to be a producer/consumer intermediate between two kernels,
+// written to HBM by the first and read back by the second. They are now
+// produced and consumed inside this one kernel and never leave the sub-slice,
+// so there is nothing left for a separate pass to hand over and no gmem
+// workspace to allocate. The grid is (batch, num_v_heads), sequential over the
+// chunks of a batch, with the dv tiles looped internally.
 //
-// Notes on the fusion:
-//  - u is separable along head_v_dim, so each dv work-group produces only its
-//    own u[dv] slice (no redundant work). w spans the full head_k_dim and is
-//    needed in full by every dv work-group, so it is recomputed per dv; the
-//    dv work-groups write identical w values, which is safe.
-//  - Unlike the standalone chunk_fwd_o_kernel, this kernel must NOT reuse the
-//    A buffer as the O2 scratch: the inlined compute_wu still reads the
-//    inverted A, and a sibling dv work-group overwriting A with O2 would race.
-//    A dedicated O2 buffer is used instead, leaving A read-only here.
+// u is separable along head_v_dim and is computed per dv tile. w spans the full
+// head_k_dim, so it is computed once per chunk at dv == 0 and staged in SLM for
+// every dv tile to read back.
 template <typename T, typename StateT, class TiledMMA>
 CUTE_DEVICE void chunk_fwd_o_wu_kernel(
     const sycl::local_accessor<float, 1>& slm_mem_const,  // [5 * chunk_size]
     T* core_attn_out,  // [total_seqlen, num_v_heads, head_v_dim]
     T* A,  // [num_v_heads, total_virtual_seqlen, chunk_size], inverted (RO)
-    T* O2,  // [num_v_heads, total_virtual_seqlen, chunk_size], O2 scratch
-    T* w,  // [num_v_heads, total_virtual_seqlen, head_k_dim], scratch
-    T* u,  // [num_v_heads, total_virtual_seqlen, head_v_dim], scratch
     const T* q,  // [total_virtual_seqlen, num_k_heads, head_k_dim]
     const T* k,  // [total_virtual_seqlen, num_k_heads, head_k_dim]
     const T* v,  // [total_virtual_seqlen, num_v_heads, head_v_dim]
@@ -1411,21 +871,10 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
           gO2A(_, _, 0));
 
       for (int dv = 0; dv < dv_split; ++dv) {
-        /* W tensor */
-        auto W_ptr = w + v_head_id * total_virtual_seqlen * head_k_dim +
-                     chunk_offset * head_k_dim;
+        /* w and u are produced and consumed entirely on chip now, so only
+           their tile shapes survive -- the gmem workspaces are gone. */
         auto W_tensor_shape = make_shape(chunk_size, head_k_dim);
-        auto W_tensor = make_tensor(
-            make_gmem_ptr(W_ptr),
-            make_layout(W_tensor_shape, make_stride(head_k_dim, _1{})));
-
-        /* U tensor */
-        auto U_ptr = u + v_head_id * total_virtual_seqlen * head_v_dim +
-                     chunk_offset * head_v_dim;
         auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
-        auto U_tensor = make_tensor(
-            make_gmem_ptr(U_ptr),
-            make_layout(U_tensor_shape, make_stride(head_v_dim, _1{})));
 
         /* A inv tensor */
         auto A_inv_ptr = A +
@@ -1485,7 +934,7 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
             make_layout(
                 V_wu_T_shape, make_stride(_1{}, head_v_dim * num_v_heads)));
 
-        Tensor cU_wu = make_identity_tensor(U_tensor.shape());
+        Tensor cU_wu = make_identity_tensor(U_tensor_shape);
         auto thr_mma_wu = mma.get_slice(local_id);
 
         /* u[dv] = A_inv @ (beta * v) */
@@ -1512,7 +961,7 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
            (dv==0) and stage it in SLM for the fused W*S GEMM below; it never
            reaches HBM. */
         if (has_prev_state && dv == 0) {
-          Tensor cW_wu = make_identity_tensor(W_tensor.shape());
+          Tensor cW_wu = make_identity_tensor(W_tensor_shape);
 
           for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
             Tensor gW_wu = local_tile(
@@ -1542,7 +991,7 @@ CUTE_DEVICE void chunk_fwd_o_wu_kernel(
             make_gmem_ptr(S_ptr),
             make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
 
-        Tensor cU = make_identity_tensor(U_tensor.shape());
+        Tensor cU = make_identity_tensor(U_tensor_shape);
 
         auto thr_mma = mma.get_slice(local_id);
 
@@ -1794,12 +1243,6 @@ class ChunkInverseOptKernel;
 template <typename T, typename StateTag>
 class ChunkInverseKernel;
 
-template <typename T, typename StateTag>
-class ChunkComputeWUKernel;
-
-template <typename T, typename StateT, bool BigSG>
-class ChunkFwdOKernel;
-
 template <typename T, typename StateT, bool BigSG>
 class ChunkFwdOWUKernel;
 
@@ -1811,9 +1254,6 @@ void kernel_launcher(
     const T* k,
     const T* v,
     T* A,
-    T* w,
-    T* u,
-    T* O2,
     const float* b,
     float* a,
     const float* A_log,
@@ -1989,40 +1429,15 @@ void kernel_launcher(
       SGLayoutFwdO>::TiledMMA;
   using WGTileFwdOBig = chunk_gemm_policy_fwd_o_big::WGTile;
   using SGLayoutFwdOBig = chunk_gemm_policy_fwd_o_big::SGLayout;
-  using MMAFwdOBig = typename TiledMMAHelper<
-      MMA_Atom<decltype(op)>,
-      Layout<WGTileFwdOBig>,
-      SGLayoutFwdOBig>::TiledMMA;
 
   // Split head_v_dim (dv_split tiles) across the grid so each work-group
   // owns one output tile.
   const int fwd_o_dv_split = head_v_dim / chunk_size;
   const int fwd_o_wgs = batch_size * num_v_heads * fwd_o_dv_split;
 
-  // Decide whether to fuse compute_wu into fwd_o.
-  //
-  // The standalone compute_wu runs on a persistent, chunk-parallel grid of
-  // ~sm_count * MaxThreadsPerSM / wg_threads work-groups. Folding it into
-  // fwd_o serializes it behind fwd_o's per-batch chunk loop and recomputes w
-  // once per dv tile. That is a win (one fewer launch, w/u stay hot in L2)
-  // only when fwd_o's own grid is already at least as wide as compute_wu's;
-  // when fwd_o's grid is small (e.g. tp4 with batch=1 -> 32 work-groups) the
-  // fused kernel loses compute_wu's parallelism and regresses, so keep the two
-  // kernels separate there.
-  const int compute_wu_wgs = sm_count * MaxThreadsPerSM / size(MMAFwdOSmall{});
-  // Fuse compute_wu into fwd_o only once the fused kernel's own launch grid is
-  // at least as wide as compute_wu's persistent grid. The fused kernel loops
-  // the dv tiles internally, so its grid is (batch_size * num_v_heads) work-
-  // groups (not the dv-split-widened fwd_o_wgs). Fusing serializes compute_wu
-  // behind fwd_o's per-batch chunk loop, so it only pays off (one fewer launch,
-  // w/u stay hot in L2) when that fused grid already saturates the GPU. For
-  // small batches (e.g. tp4 batch<8 -> <128 work-groups) the separate
-  // compute_wu + fwd_o path wins: compute_wu keeps its full-width grid and
-  // fwd_o runs a dv-split-widened grid, so idle cores stay fed.
-  const int fused_wgs = batch_size * num_v_heads;
-  const bool fuse_wu = (fused_wgs >= compute_wu_wgs);
-
-  if (fuse_wu) {
+  // compute_wu is always fused into fwd_o: w and u never reach HBM, so there
+  // is nothing for a separate pass to hand over.
+  {
     // Fused compute_wu + fwd_o. The grid is already large, so use the compact
     // sub-group layout (the fused kernel is register-heavier; the wider 4x4
     // layout regresses here).
@@ -2053,9 +1468,6 @@ void kernel_launcher(
                 local_mem,
                 core_attn_out,
                 A,
-                O2,
-                w,
-                u,
                 q,
                 k,
                 v,
@@ -2075,109 +1487,6 @@ void kernel_launcher(
                 head_v_dim);
           });
     });
-  } else {
-    // Separate compute_wu + fwd_o. compute_wu keeps its wide persistent grid,
-    // and fwd_o reuses A as its O2 scratch (no aliasing hazard here because
-    // compute_wu has fully consumed the inverted A before fwd_o launches).
-
-    // ---- compute W U ----
-    using WGTileComputeWU = chunk_gemm_policy_compute_wu::WGTile;
-    using SGLayoutComputeWU = chunk_gemm_policy_compute_wu::SGLayout;
-    using MMAComputeWU = typename TiledMMAHelper<
-        MMA_Atom<decltype(op)>,
-        Layout<WGTileComputeWU>,
-        SGLayoutComputeWU>::TiledMMA;
-    int MaxThreadsPerWorkgroupComputeWU = size(MMAComputeWU{});
-    sycl::range<3> local_compute_wu(1, 1, MaxThreadsPerWorkgroupComputeWU);
-    sycl::range<3> global_compute_wu(
-        1,
-        (sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroupComputeWU +
-         num_v_heads - 1) /
-            num_v_heads * num_v_heads,
-        1);
-    int slm_size_compute_wu = chunk_size * 2;
-
-    queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> local_mem(
-          sycl::range<1>(slm_size_compute_wu), cgh);
-      cgh.parallel_for<ChunkComputeWUKernel<T, StateT>>(
-          sycl::nd_range<3>{
-              global_compute_wu * local_compute_wu, local_compute_wu},
-          kernel_props,
-          [=](auto) {
-            chunk_compute_wu_kernel<T, MMAComputeWU>(
-                local_mem,
-                A,
-                w,
-                u,
-                q,
-                k,
-                v,
-                b,
-                a,
-                A_log,
-                dt_bias,
-                query_start_loc,
-                has_initial_state,
-                total_virtual_seqlen,
-                batch_size,
-                num_k_heads,
-                head_k_dim,
-                num_v_heads,
-                head_v_dim);
-          });
-    });
-
-    // ---- compute O ----
-    // Use the wider sub-group layout when the grid has fewer work-groups than
-    // Xe cores, so otherwise-idle cores extract more XMX throughput per tile.
-    const bool use_big_fwd_o = fwd_o_wgs < 2 * sm_count;
-    int slm_size_fwd_o = 3 * chunk_size;
-
-    auto launch_fwd_o = [&](auto big_tag) {
-      constexpr bool BigSG = decltype(big_tag)::value;
-      using MMAFwdO = std::conditional_t<BigSG, MMAFwdOBig, MMAFwdOSmall>;
-      int MaxThreadsPerWorkgroupFwdO = size(MMAFwdO{});
-      sycl::range<3> local_fwd_o(1, 1, MaxThreadsPerWorkgroupFwdO);
-      sycl::range<3> global_fwd_o(batch_size, num_v_heads * fwd_o_dv_split, 1);
-
-      queue.submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> local_mem(
-            sycl::range<1>(slm_size_fwd_o), cgh);
-        cgh.parallel_for<ChunkFwdOKernel<T, StateT, BigSG>>(
-            sycl::nd_range<3>{global_fwd_o * local_fwd_o, local_fwd_o},
-            kernel_props,
-            [=](auto) {
-              chunk_fwd_o_kernel<T, StateT, MMAFwdO>(
-                  local_mem,
-                  core_attn_out,
-                  A,
-                  w,
-                  u,
-                  q,
-                  k,
-                  a,
-                  ssm_state,
-                  ssm_state_stride_0,
-                  query_start_loc,
-                  cache_indices,
-                  has_initial_state,
-                  token_indx,
-                  batch_size,
-                  total_virtual_seqlen,
-                  num_k_heads,
-                  head_k_dim,
-                  num_v_heads,
-                  head_v_dim);
-            });
-      });
-    };
-
-    if (use_big_fwd_o) {
-      launch_fwd_o(std::true_type{});
-    } else {
-      launch_fwd_o(std::false_type{});
-    }
   }
 }
 
@@ -2330,18 +1639,6 @@ void chunk_gated_delta_rule_impl_xe2(
     torch::Tensor A = torch::empty(
         {num_v_heads, total_seqlen + padding_size, chunk_size},
         torch::dtype(dtype).device(device).requires_grad(false));
-    torch::Tensor w = torch::empty(
-        {num_v_heads, total_seqlen + padding_size, head_k_dim},
-        torch::dtype(dtype).device(device).requires_grad(false));
-    torch::Tensor u = torch::empty(
-        {num_v_heads, total_seqlen + padding_size, head_v_dim},
-        torch::dtype(dtype).device(device).requires_grad(false));
-    // Dedicated O2 scratch for the fused fwd_o+wu kernel. The standalone fwd_o
-    // reused A as O2 scratch, but the fused kernel still reads the inverted A
-    // in its inlined compute_wu, so O2 must not alias A.
-    torch::Tensor O2 = torch::empty(
-        {num_v_heads, total_seqlen + padding_size, chunk_size},
-        torch::dtype(dtype).device(device).requires_grad(false));
 
 #define LAUNCH_NATIVE(scalar_t, state_scalar_t)                    \
   kernel_launcher<scalar_t, state_scalar_t>(                       \
@@ -2351,9 +1648,6 @@ void chunk_gated_delta_rule_impl_xe2(
       reinterpret_cast<scalar_t*>(k.data_ptr()),                   \
       reinterpret_cast<scalar_t*>(v.data_ptr()),                   \
       reinterpret_cast<scalar_t*>(A.data_ptr()),                   \
-      reinterpret_cast<scalar_t*>(w.data_ptr()),                   \
-      reinterpret_cast<scalar_t*>(u.data_ptr()),                   \
-      reinterpret_cast<scalar_t*>(O2.data_ptr()),                  \
       reinterpret_cast<float*>(b.data_ptr()),                      \
       reinterpret_cast<float*>(a.data_ptr()),                      \
       reinterpret_cast<float*>(A_log.data_ptr()),                  \
