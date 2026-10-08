@@ -53,6 +53,141 @@ namespace gdn {
 
 using namespace cute;
 
+/* How many k-tiles ahead the GEMMs run their block-2D prefetches. */
+static constexpr int kPrefetchDist = 3;
+
+/* ---- Standalone operand prefetch and load ----------------------------------
+ *
+ * The warm-up a gemm_* issues before its k-loop, and the copy+reorder it does
+ * inside, are the two parts of its pipeline the caller may want to own.
+ *
+ * Hoisting the prefetch lets it be issued earlier -- ahead of a barrier the
+ * GEMM must trail, or ahead of unrelated work -- which is the whole point of a
+ * prefetch: the further in front of the load it sits, the more latency it
+ * hides.
+ *
+ * Hoisting the load lets one operand serve several GEMMs. A fragment loaded
+ * once here is reordered once; feeding it to a gemm_S** variant then skips
+ * both the block-2D load and the reorder every consumer would otherwise pay.
+ * Watch the live range when holding one: a fragment kept across an unrelated
+ * GEMM is register pressure exactly where that GEMM needs the registers.
+ */
+template <class ATensor, class TiledMMA>
+CUTE_DEVICE void prefetch_A(
+    ATensor const& A,  // (M,K) gmem
+    int wg_m,
+    TiledMMA const& mma,
+    int k_tiles = kPrefetchDist) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+
+  Tensor cA = make_identity_tensor(A.shape());
+  auto wg_tile = mma.tile_mnk();
+  Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));
+
+  auto prefetch_a = make_block_2d_prefetch(get_block_2d_copy_A<void>(mma, A));
+  auto pAgA = prefetch_a.get_slice(local_id).partition_S(gA);
+
+  int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
+  CUTE_UNROLL
+  for (int i = 0; i < k_tiles; ++i) {
+    if (i < k_tile_count) {
+      prefetch(prefetch_a, pAgA(_, _, _, i));
+    }
+  }
+}
+
+template <class BTensor, class TiledMMA>
+CUTE_DEVICE void prefetch_B(
+    BTensor const& B,  // (N,K) gmem
+    int wg_n,
+    TiledMMA const& mma,
+    int k_tiles = kPrefetchDist) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+
+  Tensor cB = make_identity_tensor(B.shape());
+  auto wg_tile = mma.tile_mnk();
+  Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _));
+
+  auto prefetch_b = make_block_2d_prefetch(get_block_2d_copy_B<void>(mma, B));
+  auto pBgB = prefetch_b.get_slice(local_id).partition_S(gB);
+
+  int k_tile_count = ceil_div(shape<1>(B), get<2>(wg_tile));
+  CUTE_UNROLL
+  for (int i = 0; i < k_tiles; ++i) {
+    if (i < k_tile_count) {
+      prefetch(prefetch_b, pBgB(_, _, _, i));
+    }
+  }
+}
+
+/* Empty MMA operand fragments, so a caller can declare one without spelling
+ * out the partitioning. */
+template <class TiledMMA>
+CUTE_DEVICE auto make_A_frag(TiledMMA const& mma) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+  Tensor cA = make_identity_tensor(select<0, 2>(mma.tile_mnk()));
+  return mma.get_slice(local_id).partition_sg_fragment_A(cA);
+}
+
+template <class TiledMMA>
+CUTE_DEVICE auto make_B_frag(TiledMMA const& mma) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+  Tensor cB = make_identity_tensor(select<1, 2>(mma.tile_mnk()));
+  return mma.get_slice(local_id).partition_sg_fragment_B(cB);
+}
+
+/* Loads one BLK_M x BLK_K tile of a gmem A operand into the caller's fragment:
+ * the block-2D copy and the reorder a GEMM would have done inline. */
+template <class ATensor, class TiledMMA, class AFrag>
+CUTE_DEVICE void load_A(
+    ATensor const& A,  // (M,K) gmem
+    int wg_m,
+    TiledMMA const& mma,
+    AFrag& tCrA,  // out
+    int k_tile = 0) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+
+  Tensor cA = make_identity_tensor(A.shape());
+  auto wg_tile = mma.tile_mnk();
+  Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));
+
+  auto copy_a = get_block_2d_copy_A<void>(mma, A);
+  auto thr_copy_a = copy_a.get_slice(local_id);
+  auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+  Tensor tAgA = thr_copy_a.partition_S(gA);
+
+  copy(copy_a, tAgA(_, _, _, k_tile), tArA);
+  reorder(tArA, tCrA);
+}
+
+template <class BTensor, class TiledMMA, class BFrag>
+CUTE_DEVICE void load_B(
+    BTensor const& B,  // (N,K) gmem
+    int wg_n,
+    TiledMMA const& mma,
+    BFrag& tCrB,  // out
+    int k_tile = 0) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+
+  Tensor cB = make_identity_tensor(B.shape());
+  auto wg_tile = mma.tile_mnk();
+  Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _));
+
+  auto copy_b = get_block_2d_copy_B<void>(mma, B);
+  auto thr_copy_b = copy_b.get_slice(local_id);
+  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
+  Tensor tBgB = thr_copy_b.partition_S(gB);
+
+  copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
+  reorder(tBrB, tCrB);
+}
+
 /* ---- Lane-blocked SLM staging for DPAS operands ----------------------------
  *
  * One layout, written once, read three ways.
@@ -554,6 +689,50 @@ CUTE_DEVICE void gemm_TTS_k_multi(
 
     barrier_wait(barrier_scope);
   }
+}
+
+/* gemm_SSS_k_multi: gemm_TTS_k_multi with both operands already in registers,
+ * loaded once by the caller with load_A / load_B. No gmem, so no block-2D
+ * copy, no reorder, no prefetch and no k-loop -- the held fragments span one
+ * BLK_K, which is the whole contraction.
+ *
+ * A is scaled per k and consumers of the same matrix scale it differently, so
+ * the held fragment stays unscaled and the scale is folded into the copy that
+ * builds the operand here. That copy is the fragment gemm_TTS_k_multi would
+ * have reordered from gmem anyway, so holding A costs only the held fragment.
+ */
+template <
+    class ASGCTensor,
+    class BSGCTensor,
+    class CSGCTensor,
+    class TiledMMA>
+CUTE_DEVICE void gemm_SSS_k_multi(
+    ASGCTensor const& tCrA_src,  // (M,K) held, unscaled
+    BSGCTensor const& tCrB,      // (N,K) held
+    CSGCTensor& tCrC,            // (M,N)
+    TiledMMA const& mma,
+    int lane,
+    float* K_multi) {
+  auto tCrA = make_A_frag(mma);
+
+  using TA = typename decltype(tCrA)::value_type;
+  Tensor A_frag = make_tensor<TA>(tCrA.layout());
+  static constexpr auto I = decltype(size<0>(A_frag))::value;
+  static constexpr auto J = decltype(size<1>(A_frag))::value;
+  static constexpr auto K = decltype(size<2>(A_frag))::value;
+  static constexpr int mma_K = 16;
+
+  CUTE_UNROLL
+  for (int k = 0; k < K; ++k) {
+    float scale = K_multi[k * mma_K + lane];
+    CUTE_UNROLL
+    for (int e = 0; e < I * J; ++e) {
+      tCrA[k * I * J + e] =
+          static_cast<TA>(static_cast<float>(tCrA_src[k * I * J + e]) * scale);
+    }
+  }
+
+  cute::gemm(mma, tCrA, tCrB, tCrC);
 }
 
 // Fused dual-A GEMM: computes C1 += A1 * B^T and C2 += A2 * B^T
