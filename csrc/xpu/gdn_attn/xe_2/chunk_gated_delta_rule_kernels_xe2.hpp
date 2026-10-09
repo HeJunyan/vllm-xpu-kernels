@@ -1024,10 +1024,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           }
         }
 
-        /* Ensure w/u are globally visible before the fwd_o body reads them. */
-        item.barrier(sycl::access::fence_space::global_and_local);
-
-
         auto O2_tensor_shape = make_shape(current_chunk_size, chunk_size);
         Tensor cO2 = make_identity_tensor(O2_tensor_shape);
 
@@ -1064,10 +1060,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
             sg_local_m_coord,
             sg_local_n_coord,
             sg_local_id);
-
-        // The whole O2 tile must be in SLM before any sub-group gathers the
-        // n-blocks the other n sub-groups produced.
-        item.barrier(sycl::access::fence_space::local_space);
 
         load_A_frag_slm<T>(
             tCrO2_A,
@@ -1151,10 +1143,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
               tSrO_c(sn * SG_M + sm) *= g_exp_slm_ptr[(m_idx)];
             }
           }
-
-          // Barrier: u[dv] is staged per sub-group, so its SLM tiles must be
-          // complete before any sub-group gathers the parts the others wrote.
-          item.barrier(sycl::access::fence_space::local_space);
 
           // --- O2U MMA: O[dv] += O1[dv] + O2 × U_T[dv] ---
           // O2 is GRF-resident as tCrO2_A, u comes from its SLM B tile.

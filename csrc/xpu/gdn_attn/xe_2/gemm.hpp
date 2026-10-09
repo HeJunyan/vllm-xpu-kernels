@@ -282,6 +282,9 @@ CUTE_DEVICE void store_C_frag_slm(
         (sg_m * nblocks + nblk_base + sg_n * kNBlk + nb) * kSlmBlockBytes +
         lane * kSlmLaneBytes) = *reinterpret_cast<const SlmLaneRun*>(run);
   }
+
+  sycl::ext::oneapi::this_work_item::get_nd_item<3>().barrier(
+      sycl::access::fence_space::local_space);
 }
 
 /* A(m, k = n): the consumer contracts over the producer's N. Gathers 16 m-rows
