@@ -788,14 +788,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
   // Lane-blocked W staging tile. W = A_inv@(g*k) is a C accumulator the fused
   // W*S GEMM consumes as an A operand, so routing it through SLM drops its HBM
   // round-trip and the reorder in front of each dpas.
-  SlmPtr w_slm_tile =
+  /* delta = beta * (v - exp(a) * K.S), the U GEMM's B operand. It replaces
+     the staged W of the old factorization; see the reassociation below. */
+  SlmPtr delta_slm_tile =
       o2_slm_tile + slm_tile_bytes(chunk_size, chunk_size);
-  const int w_nblocks = head_k_dim / sub_group_size;
+  const int delta_nblocks = chunk_size / sub_group_size;
   // u is a pure scratch tensor: the fused kernel both produces and consumes it,
   // so it never needs to reach HBM. It is staged once, in B layout, and read
   // back two ways -- as a B operand by the O2U GEMM and transposed as the state
   // update's A operand.
-  SlmPtr u_slm_tile = w_slm_tile + slm_tile_bytes(chunk_size, head_k_dim);
+  SlmPtr u_slm_tile =
+      delta_slm_tile + slm_tile_bytes(chunk_size, chunk_size);
   const int u_nblocks = chunk_size / sub_group_size;
 
   TiledMMA mma{};
@@ -894,6 +897,14 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           make_gmem_ptr(v_ptr),
           make_layout(
               V_T_shape, make_stride(_1{}, head_v_dim * num_v_heads)));
+      /* The same v read as (token, v_dim): delta is seeded from it as a C
+         fragment, which the transposed view above cannot serve. */
+      auto V_tensor = make_tensor(
+          make_gmem_ptr(v_ptr),
+          make_layout(
+              make_shape(chunk_size, head_v_dim),
+              make_stride(head_v_dim * num_v_heads, _1{})));
+      Tensor cV = make_identity_tensor(V_tensor.shape());
 
       /* O2 tensor */
       Tensor cO2_A = make_identity_tensor(
@@ -928,8 +939,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           make_layout(A_inv_shape, make_stride(chunk_size, _1{})));
 
       /* W tensor */
-      auto W_tensor_shape = make_shape(chunk_size, head_k_dim);
-      Tensor cW = make_identity_tensor(W_tensor_shape);
 
       /* U tensor */
       auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
@@ -997,47 +1006,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           load_B(K_tensor_T, 1, mma, tCrK_T1);
         }
 
-        clear(tSrU);
-        gemm_STS_k_multi(
-            tCrA_inv, V_T, tSrU, 0, dv, mma, wu_beta_slm_ptr);
-
-        /* With a previous state u is still corrected by -W*S further down, so
-           keep the accumulator live and stage it once after the correction. */
-        if (!has_prev_state) {
-          store_C_frag_to_slm<T>(
-              tSrU,
-              u_slm_tile,
-              u_nblocks,
-              sg_local_m_coord,
-              sg_local_n_coord,
-              sg_local_id);
-        }
-
-        /* w = A_inv@(g*k). It's dv-independent, compute it only once. */
-        if (has_prev_state && dv == 0) {
-          for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
-            Tensor gW = local_tile(
-                cW, wg_tile, make_coord(0, dk, 0), Step<_1, _1, X>{});
-            auto tSrW = thr_mma.partition_sg_fragment_C(gW);
-
-            clear(tSrW);
-            if (dk == 0) {
-              gemm_SSS_k_multi(
-                  tCrA_inv, tCrK_T0, tSrW, mma, sg_local_id, wu_g_slm_ptr);
-            } else {
-              gemm_SSS_k_multi(
-                  tCrA_inv, tCrK_T1, tSrW, mma, sg_local_id, wu_g_slm_ptr);
-            }
-            store_C_frag_to_slm<T>(
-                tSrW,
-                w_slm_tile,
-                w_nblocks,
-                sg_local_m_coord,
-                sg_local_n_coord,
-                sg_local_id,
-                dk * (chunk_size / sub_group_size));
-          }
-        }
+        /* u is built further down, after delta. W is gone: see below. */
 
         /* compute O2 = mask(Q × K^T) once (dv==0). */
         if (dv == 0) {
@@ -1080,8 +1049,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           // --- Fused WS+QS MMA: share S[dv] load in registers ---
           Tensor gU_C =
               local_tile(cU, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
-          auto tSrU_d = thr_mma.partition_sg_fragment_C(gU_C);
-          clear(tSrU_d);
+          auto tSrKS = thr_mma.partition_sg_fragment_C(gU_C);
+          clear(tSrKS);
 
           Tensor gO_C =
               local_tile(cO, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
@@ -1122,15 +1091,9 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
 
               load_B(S_tensor, dv, mma, tCrS, kt);
 
-              /* W gathers straight into the MMA fragment -- no reorder. */
-              load_A_frag_from_slm<T>(
-                  tCrA,
-                  w_slm_tile,
-                  w_nblocks,
-                  sg_local_m_coord,
-                  sg_local_id,
-                  kt * kNBlkPerTile);
-              cute::gemm(mma, tCrA, tCrS, tSrU_d);
+              /* K, unscaled: the gates ride on delta below, not on this. */
+              load_A(K_tensor, 0, mma, tCrA, kt);
+              cute::gemm(mma, tCrA, tCrS, tSrKS);
 
               /* Q takes the same fragment; S stays put for both. */
               load_A(Q_tensor, 0, mma, tCrA, kt);
@@ -1140,14 +1103,53 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
             }
           }
 
-          // --- WS epilogue: U_new[dv] = u[dv] - W×S[dv] ---
-          // Both accumulators are MMA C fragments of the same tile held by the
-          // same sub-group, so the correction lands in place; the result is
-          // staged straight to SLM in both operand layouts and never reaches
-          // HBM, so there is no reorder and no block-2D copy left for u.
+          /* delta[t,n] = beta[t] * (v[t,n] - exp(a[t]) * (K.S)[t,n]), then
+             u = A_inv . delta. This is the old
+                 u = A_inv.(beta*v) - [A_inv.(g*K)].S,  g = exp(a)*beta
+             reassociated as
+                 u = A_inv.[ beta * (v - exp(a)*(K.S)) ],
+             which is why there is no W above: A_inv factors out, so the GEMM
+             that used to build W is folded into this one. beta rides A_inv's
+             contracted index, so folding it into delta also leaves that GEMM
+             with no per-k scale. */
+          auto tSrDelta = thr_mma.partition_sg_fragment_C(gU_C);
+          {
+            auto copy_V_c = get_block_2d_copy_C<void>(mma, V_tensor);
+            auto thr_copy_V_c = copy_V_c.get_slice(local_id);
+            Tensor gV_C = local_tile(
+                cV, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
+            auto tCrV_c = thr_copy_V_c.partition_sg_fragment_D(gV_C);
+            copy(copy_V_c, thr_copy_V_c.partition_S(gV_C), tCrV_c);
+            reorder(tCrV_c, tSrDelta);
+          }
+
           CUTE_UNROLL
-          for (int i = 0; i < tSrU_d.size(); ++i) {
-            tSrU(i) -= tSrU_d(i);
+          for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
+            CUTE_UNROLL
+            for (int sm = 0; sm < SG_M; ++sm) {
+              int m_idx = m_tile_start + m_sg_start + sm;
+              const int i = sn * SG_M + sm;
+              tSrDelta(i) =
+                  (tSrDelta(i) - g_exp_slm_ptr[m_idx] * tSrKS(i)) *
+                  wu_beta_slm_ptr[m_idx];
+            }
+          }
+
+          store_C_frag_to_slm<T>(
+              tSrDelta,
+              delta_slm_tile,
+              delta_nblocks,
+              sg_local_m_coord,
+              sg_local_n_coord,
+              sg_local_id);
+
+          clear(tSrU);
+          {
+            PackedBFrag delta_op;
+            load_B_raw_from_slm<T>(
+                delta_op, delta_slm_tile, delta_nblocks, sg_local_n_coord,
+                sg_local_id);
+            cute::gemm(mma, tCrA_inv, delta_op, tSrU);
           }
 
           store_C_frag_to_slm<T>(
@@ -1189,8 +1191,22 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           reorder(tSrO_c, tCrO_c);
           copy(copy_O_c, tCrO_c, tCgO_c);
         } else {
-          /* Without a previous state S_prev is zero, so Q*S contributes
-             nothing and the fused GEMM above is skipped: O is just O2 * U^T.
+          /* Without a previous state K.S is zero, so delta collapses to
+             beta*v and u = A_inv.(beta*v) is a single GEMM with beta back on
+             A_inv's contracted index -- no delta round trip needed. */
+          clear(tSrU);
+          gemm_STS_k_multi(
+              tCrA_inv, V_T, tSrU, 0, dv, mma, wu_beta_slm_ptr);
+          store_C_frag_to_slm<T>(
+              tSrU,
+              u_slm_tile,
+              u_nblocks,
+              sg_local_m_coord,
+              sg_local_n_coord,
+              sg_local_id);
+
+          /* Q*S contributes nothing either, so the fused GEMM is skipped and
+             O is just O2 * U^T.
              Same tail as the branch above, and it belongs here rather than
              after the state update -- it reads the O2 and u staging tiles,
              which the state update neither writes nor invalidates. */
@@ -1500,15 +1516,12 @@ void kernel_launcher(
     // wider 4x4 layout regresses here.
     // 3 * chunk_size for fwd_o (g / g_multi / g_exp) plus 2 * chunk_size for
     // the w/u prologue (beta and exp(a)*beta scaling), plus the
-    // lane-blocked staging tiles: O2 for the GRF-resident O2U A operand, W for
-    // the fused W*S A operand, and u -- staged once and read back both as the
-    // O2U B operand and transposed as the state update's A operand -- so that
-    // u never reaches HBM.
+    // three lane-blocked staging tiles: O2 for the O2U A operand, delta for
+    // the u GEMM's B operand, and u itself -- read back both as the O2U B
+    // operand and transposed as the state update's A operand.
     int slm_size_fwd_o =
         5 * chunk_size +
-        (slm_tile_bytes(chunk_size, chunk_size) +
-         slm_tile_bytes(chunk_size, head_k_dim) +
-         slm_tile_bytes(chunk_size, chunk_size)) /
+        3 * slm_tile_bytes(chunk_size, chunk_size) /
             static_cast<int>(sizeof(float));
     int threads_fwd_o = size(MMAFwdOSmall{});
     sycl::range<3> local_fwd_o(1, 1, threads_fwd_o);
