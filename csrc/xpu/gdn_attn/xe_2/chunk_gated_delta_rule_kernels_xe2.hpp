@@ -800,6 +800,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
 
   TiledMMA mma{};
   auto wg_tile = mma.tile_mnk();
+  auto thr_mma = mma.get_slice(local_id);
 
   static constexpr auto tile_m = get<0>(wg_tile);
   static constexpr auto tile_n = get<1>(wg_tile);
@@ -858,63 +859,80 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
             v_head_id * total_virtual_seqlen];
       float g_last_value_exp = sycl::native::exp(g_last_value);
 
-      // O2 = mask(Q*K^T) is dv-independent, so it is computed once at dv==0 and
-      // then kept in GRF as this sub-group's O2U A operand for the whole dv
-      // loop. On the 4x2 sub-group layout a QK accumulator only owns part of
-      // the O2U contracted dimension, so the full-K A operand is assembled once
-      // through the lane-blocked SLM tile instead of a register reorder.
-      Tensor cO2A = make_identity_tensor(
-          make_shape(Int<chunk_size>{}, Int<chunk_size>{}));
-      Tensor gO2A = local_tile(cO2A, select<0, 2>(wg_tile), make_coord(0, _));
-      auto tCrO2_A = mma.get_slice(local_id).partition_sg_fragment_A(
-          gO2A(_, _, 0));
+      /* Q tensor */
+      auto q_ptr =
+          q + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
+      auto Q_tensor_shape = make_shape(current_chunk_size, head_k_dim);
+      auto Q_tensor = make_tensor(
+          make_gmem_ptr(q_ptr),
+          make_layout(
+              Q_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
 
-      /* K^T feeds the w GEMM and every state update as the same B operand --
-         two tiles, read three times each per chunk. Hold both for the chunk
-         and load them once at dv == 0. Named fragments, not an array: an
-         aggregate indexed by a runtime dk would be pushed out to private
-         memory. */
-      auto k_ptr_c =
+      /* K tensor */
+      auto k_ptr =
           k + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
-      auto K_tensor_T_c = make_tensor(
-          make_gmem_ptr(k_ptr_c),
+      auto K_tensor_T = make_tensor(
+          make_gmem_ptr(k_ptr),
           make_layout(
               make_shape(head_k_dim, chunk_size),
               make_stride(_1{}, head_k_dim * num_k_heads)));
-      auto tCrKT0 = make_B_frag(mma);
-      auto tCrKT1 = make_B_frag(mma);
-      prefetch_B(K_tensor_T_c, 0, mma, 1);
-      prefetch_B(K_tensor_T_c, 1, mma, 1);
+      auto K_tensor_shape = make_shape(chunk_size, head_k_dim);
+      auto K_tensor = make_tensor(
+          make_gmem_ptr(k_ptr),
+          make_layout(
+              K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
+      auto tCrK_T0 = make_B_frag(mma);
+      auto tCrK_T1 = make_B_frag(mma);
+
+      /* V tensor */
+      auto v_ptr = v +
+                   static_cast<int64_t>(chunk_offset) * num_v_heads *
+                          head_v_dim +
+                   v_head_id * head_v_dim;
+      auto V_T_shape = make_shape(head_v_dim, chunk_size);
+      auto V_T = make_tensor(
+          make_gmem_ptr(v_ptr),
+          make_layout(
+              V_T_shape, make_stride(_1{}, head_v_dim * num_v_heads)));
+
+      /* O2 tensor */
+      Tensor cO2_A = make_identity_tensor(
+          make_shape(Int<chunk_size>{}, Int<chunk_size>{}));
+      Tensor gO2_A = local_tile(cO2_A, select<0, 2>(wg_tile), make_coord(0, _));
+      auto tCrO2_A = mma.get_slice(local_id).partition_sg_fragment_A(
+          gO2_A(_, _, 0));
+
+      /* A inv tensor */
+      auto A_inv_ptr = A +
+                      static_cast<int64_t>(v_head_id) *
+                          total_virtual_seqlen * chunk_size +
+                      chunk_offset * chunk_size;
+      auto A_inv_shape = make_shape(chunk_size, chunk_size);
+      auto A_inv_tensor = make_tensor(
+          make_gmem_ptr(A_inv_ptr),
+          make_layout(A_inv_shape, make_stride(chunk_size, _1{})));
+
+      /* W tensor */
+      auto W_tensor_shape = make_shape(chunk_size, head_k_dim);
+      Tensor cW = make_identity_tensor(W_tensor_shape);
+
+      /* U tensor */
+      auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
+      Tensor cU = make_identity_tensor(U_tensor_shape);
+
+      /* SSM state tensor */
+      StateT* S_ptr = ssm_state_ptr;
+      auto S_tensor_shape = make_shape(head_v_dim, head_k_dim);
+      auto S_tensor = make_tensor(
+          make_gmem_ptr(S_ptr),
+          make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
+
+      /*************************************************************/
+      prefetch_B(K_tensor_T, 0, mma, 1);
+      prefetch_B(K_tensor_T, 1, mma, 1);
 
       for (int dv = 0; dv < dv_split; ++dv) {
-        /* w and u are produced and consumed entirely on chip now, so only
-           their tile shapes survive -- the gmem workspaces are gone. */
-        auto W_tensor_shape = make_shape(chunk_size, head_k_dim);
-        auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
 
-        /* A inv tensor */
-        auto A_inv_ptr = A +
-                        static_cast<int64_t>(v_head_id) *
-                            total_virtual_seqlen * chunk_size +
-                        chunk_offset * chunk_size;
-        auto A_inv_shape = make_shape(chunk_size, chunk_size);
-        auto A_inv_tensor = make_tensor(
-            make_gmem_ptr(A_inv_ptr),
-            make_layout(A_inv_shape, make_stride(chunk_size, _1{})));
-
-        /* K transposed tensor. */
-        auto k_ptr =
-            k + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
-        auto K_tensor_T_shape = make_shape(head_k_dim, chunk_size);
-        auto K_tensor_T = make_tensor(
-            make_gmem_ptr(k_ptr),
-            make_layout(
-                K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
-
-        /* Both the u and w GEMMs take A_inv as the same A operand, so it is
-           loaded once below and held for the two of them. Warm it here, as
-           early as the tensor exists: everything between this and the load is
-           distance the prefetch gets to hide. */
         prefetch_A(A_inv_tensor, 0, mma);
 
         /* a/b/g and exp(a) are loaded and calculated once and shared later.
@@ -946,19 +964,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
         }
 
         /* compute w/u for this chunk */
-        auto v_ptr = v +
-                        static_cast<int64_t>(chunk_offset) * num_v_heads *
-                            head_v_dim +
-                        v_head_id * head_v_dim;
-        auto V_T_shape = make_shape(head_v_dim, chunk_size);
-        auto V_T = make_tensor(
-            make_gmem_ptr(v_ptr),
-            make_layout(
-                V_T_shape, make_stride(_1{}, head_v_dim * num_v_heads)));
-
-        Tensor cU = make_identity_tensor(U_tensor_shape);
-        auto thr_mma = mma.get_slice(local_id);
-
         /* u[dv] = A_inv @ (beta * v) */
         Tensor gU = local_tile(
             cU, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
@@ -973,13 +978,14 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
         auto tCrA_inv = make_A_frag(mma);
         load_A(A_inv_tensor, 0, mma, tCrA_inv);
         if (dv == 0) {
-          load_B(K_tensor_T_c, 0, mma, tCrKT0);
-          load_B(K_tensor_T_c, 1, mma, tCrKT1);
+          load_B(K_tensor_T, 0, mma, tCrK_T0);
+          load_B(K_tensor_T, 1, mma, tCrK_T1);
         }
 
         clear(tSrU);
         gemm_STS_k_multi(
             tCrA_inv, V_T, tSrU, 0, dv, mma, wu_beta_slm_ptr);
+
         /* With a previous state u is still corrected by -W*S further down, so
            keep the accumulator live and stage it once after the correction. */
         if (!has_prev_state) {
@@ -992,12 +998,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
               sg_local_id);
         }
 
-        /* w = A_inv@(g*k). It's dv-independent, so compute it only once
-           (dv==0) and stage it in SLM for the fused W*S GEMM below; it never
-           reaches HBM. */
+        /* w = A_inv@(g*k). It's dv-independent, compute it only once. */
         if (has_prev_state && dv == 0) {
-          Tensor cW = make_identity_tensor(W_tensor_shape);
-
           for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
             Tensor gW = local_tile(
                 cW, wg_tile, make_coord(0, dk, 0), Step<_1, _1, X>{});
@@ -1006,10 +1008,10 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
             clear(tSrW);
             if (dk == 0) {
               gemm_SSS_k_multi(
-                  tCrA_inv, tCrKT0, tSrW, mma, sg_local_id, wu_g_slm_ptr);
+                  tCrA_inv, tCrK_T0, tSrW, mma, sg_local_id, wu_g_slm_ptr);
             } else {
               gemm_SSS_k_multi(
-                  tCrA_inv, tCrKT1, tSrW, mma, sg_local_id, wu_g_slm_ptr);
+                  tCrA_inv, tCrK_T1, tSrW, mma, sg_local_id, wu_g_slm_ptr);
             }
             store_C_frag_slm<T>(
                 tSrW,
@@ -1025,25 +1027,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
         /* Ensure w/u are globally visible before the fwd_o body reads them. */
         item.barrier(sycl::access::fence_space::global_and_local);
 
-        StateT* S_ptr = ssm_state_ptr;
-        auto S_tensor_shape = make_shape(head_v_dim, head_k_dim);
-        auto S_tensor = make_tensor(
-            make_gmem_ptr(S_ptr),
-            make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
-
-        auto q_ptr =
-            q + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
-        auto Q_tensor_shape = make_shape(current_chunk_size, head_k_dim);
-        auto Q_tensor = make_tensor(
-            make_gmem_ptr(q_ptr),
-            make_layout(
-                Q_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
-
-        auto K_tensor_shape = make_shape(chunk_size, head_k_dim);
-        auto K_tensor = make_tensor(
-            make_gmem_ptr(k_ptr),
-            make_layout(
-                K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
 
         auto O2_tensor_shape = make_shape(current_chunk_size, chunk_size);
         Tensor cO2 = make_identity_tensor(O2_tensor_shape);
@@ -1242,9 +1225,9 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           }
 
             if (dk == 0) {
-              cute::gemm(mma, tCrU_A, tCrKT0, tSrS_d);
+              cute::gemm(mma, tCrU_A, tCrK_T0, tSrS_d);
             } else {
-              cute::gemm(mma, tCrU_A, tCrKT1, tSrS_d);
+              cute::gemm(mma, tCrU_A, tCrK_T1, tSrS_d);
             }
           reorder(tSrS_d, tCrS_d);
           copy(copy_S_d, tCrS_d, tCgS_d);
