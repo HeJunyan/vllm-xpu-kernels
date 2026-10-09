@@ -1088,21 +1088,57 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
           clear(tSrO_c);
 
-          // Fused gemm: W×S[dv] -> tSrU_d, Q×S[dv] -> tSrO_c
-          // S is loaded once and reused in registers for both; W is gathered
-          // from its SLM staging tile straight into the MMA A fragment.
-          gemm_QTS_fused_2A<T>(
-            w_slm_tile,
-            w_nblocks,
-            Q_tensor,
-            S_tensor,
-            tSrU_d,
-            tSrO_c,
-            0,
-            dv,
-            mma,
-            sg_local_m_coord,
-            sg_local_id);
+          /* Fused W*S -> tSrU_d and Q*S -> tSrO_c. The two share the S
+             operand, the n tile and the k extent, so one S load per k-tile
+             serves both dpas, and W and Q take turns in one A fragment.
+
+             Written out here so every operand is declared in this scope and
+             dies in it -- S most of all, being the fp32 state and so the
+             widest thing in flight.
+
+             This costs 5.7% against the pipelined gemm_* it replaces, and the
+             reason is worth recording. A block-2D load does not block; its
+             wait lands on the first read of the destination. gemm_QTS_fused_2A
+             issued both copies, slipped a prefetch in, and only then reordered
+             -- that gap is what hid the latency. load_A/load_B cannot express
+             it: the staging fragment is local to them, so their reorder is
+             welded to their copy and nothing fits between. Reordering the
+             calls here does not help, because it only moves whole loads around
+             and each one's own gap stays zero. Fixing this needs the copy and
+             the reorder to be separable, which is a change to the helpers. */
+          {
+            constexpr int kNBlkPerTile = chunk_size / sub_group_size;
+            constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
+            const int k_tiles = head_k_dim / chunk_size;
+
+            auto tCrA = make_A_frag(mma);
+            auto tCrS = make_B_frag(mma);
+
+            prefetch_A(Q_tensor, 0, mma);
+            prefetch_B(S_tensor, dv, mma);
+
+            for (int kt = 0; kt < k_tiles; ++kt) {
+              barrier_arrive(barrier_scope);
+
+              load_B(S_tensor, dv, mma, tCrS, kt);
+
+              /* W gathers straight into the MMA fragment -- no reorder. */
+              load_A_frag_from_slm<T>(
+                  tCrA,
+                  w_slm_tile,
+                  w_nblocks,
+                  sg_local_m_coord,
+                  sg_local_id,
+                  kt * kNBlkPerTile);
+              cute::gemm(mma, tCrA, tCrS, tSrU_d);
+
+              /* Q takes the same fragment; S stays put for both. */
+              load_A(Q_tensor, 0, mma, tCrA, kt);
+              cute::gemm(mma, tCrA, tCrS, tSrO_c);
+
+              barrier_wait(barrier_scope);
+            }
+          }
 
           // --- WS epilogue: U_new[dv] = u[dv] - W×S[dv] ---
           // Both accumulators are MMA C fragments of the same tile held by the
@@ -1150,6 +1186,34 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           cute::gemm(mma, tCrO2_A, u_op, tSrO_c);
           auto tCrO_c = thr_copy_O_c.partition_sg_fragment_S(gO_C);
           auto tCgO_c = thr_copy_O_c.partition_D(gO_C);
+          reorder(tSrO_c, tCrO_c);
+          copy(copy_O_c, tCrO_c, tCgO_c);
+        } else {
+          /* Without a previous state S_prev is zero, so Q*S contributes
+             nothing and the fused GEMM above is skipped: O is just O2 * U^T.
+             Same tail as the branch above, and it belongs here rather than
+             after the state update -- it reads the O2 and u staging tiles,
+             which the state update neither writes nor invalidates. */
+          Tensor gO_C =
+              local_tile(cO, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
+          auto tCrO_c = thr_copy_O_c.partition_sg_fragment_S(gO_C);
+          auto tCgO_c = thr_copy_O_c.partition_D(gO_C);
+          auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
+          clear(tSrO_c);
+
+          auto tCrO2_A = mma.get_slice(local_id).partition_sg_fragment_A(
+              gO2_A(_, _, 0));
+          load_A_frag_from_slm<T>(
+              tCrO2_A,
+              o2_slm_tile,
+              chunk_size / sub_group_size,
+              sg_local_m_coord,
+              sg_local_id);
+
+          PackedBFrag u_op;
+          load_B_raw_from_slm<T>(
+              u_op, u_slm_tile, u_nblocks, sg_local_n_coord, sg_local_id);
+          cute::gemm(mma, tCrO2_A, u_op, tSrO_c);
           reorder(tSrO_c, tCrO_c);
           copy(copy_O_c, tCrO_c, tCgO_c);
         }
@@ -1217,32 +1281,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
             }
           reorder(tSrS_d, tCrS_d);
           copy(copy_S_d, tCrS_d, tCgS_d);
-        }
-
-        if (!has_prev_state) {
-          Tensor gO_C =
-              local_tile(cO, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
-          auto tCrO_c = thr_copy_O_c.partition_sg_fragment_S(gO_C);
-          auto tCgO_c = thr_copy_O_c.partition_D(gO_C);
-          auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
-          clear(tSrO_c);
-
-          PackedBFrag u_op;
-          load_B_raw_from_slm<T>(
-              u_op, u_slm_tile, u_nblocks, sg_local_n_coord, sg_local_id);
-
-          auto tCrO2_A = mma.get_slice(local_id).partition_sg_fragment_A(
-              gO2_A(_, _, 0));
-          load_A_frag_from_slm<T>(
-              tCrO2_A,
-              o2_slm_tile,
-              chunk_size / sub_group_size,
-              sg_local_m_coord,
-              sg_local_id);
-
-          cute::gemm(mma, tCrO2_A, u_op, tSrO_c);
-          reorder(tSrO_c, tCrO_c);
-          copy(copy_O_c, tCrO_c, tCgO_c);
         }
       }  // end for (int dv ...)
     }
