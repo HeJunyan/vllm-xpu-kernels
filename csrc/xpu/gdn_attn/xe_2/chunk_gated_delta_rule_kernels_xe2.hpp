@@ -779,7 +779,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
   float* wu_g_slm_ptr = wu_beta_slm_ptr + chunk_size;
   // Lane-blocked O2 staging tile, past the 5 * chunk_size float scalars. It
   // carries mask(Q*K^T) from the QK accumulators into every sub-group's O2U
-  // A operand once per chunk; see store_C_frag_slm / load_A_frag_slm.
+  // A operand once per chunk; see store_C_frag_to_slm / load_A_frag_from_slm.
   SlmPtr o2_slm_tile =
       reinterpret_cast<SlmPtr>(
           slm_mem_const.template get_multi_ptr<sycl::access::decorated::yes>()
@@ -899,8 +899,23 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       Tensor cO2_A = make_identity_tensor(
           make_shape(Int<chunk_size>{}, Int<chunk_size>{}));
       Tensor gO2_A = local_tile(cO2_A, select<0, 2>(wg_tile), make_coord(0, _));
-      auto tCrO2_A = mma.get_slice(local_id).partition_sg_fragment_A(
-          gO2_A(_, _, 0));
+      auto O2_tensor_shape = make_shape(current_chunk_size, chunk_size);
+      Tensor cO2 = make_identity_tensor(O2_tensor_shape);
+      Tensor gO2_C =
+          local_tile(cO2, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
+
+      /* O tensor */
+      auto O_ptr =
+          core_attn_out +
+          (token_indx ? token_indx[out_chunk_offset] : out_chunk_offset) *
+              num_v_heads * head_v_dim +
+          v_head_id * head_v_dim;
+      auto O_tensor_shape = make_shape(current_chunk_size, head_v_dim);
+      auto O_tensor = make_tensor(
+          make_gmem_ptr(O_ptr),
+          make_layout(
+              O_tensor_shape, make_stride(num_v_heads * head_v_dim, _1{})));
+      Tensor cO = make_identity_tensor(O_tensor.shape());
 
       /* A inv tensor */
       auto A_inv_ptr = A +
@@ -989,7 +1004,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
         /* With a previous state u is still corrected by -W*S further down, so
            keep the accumulator live and stage it once after the correction. */
         if (!has_prev_state) {
-          store_C_frag_slm<T>(
+          store_C_frag_to_slm<T>(
               tSrU,
               u_slm_tile,
               u_nblocks,
@@ -1013,7 +1028,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
               gemm_SSS_k_multi(
                   tCrA_inv, tCrK_T1, tSrW, mma, sg_local_id, wu_g_slm_ptr);
             }
-            store_C_frag_slm<T>(
+            store_C_frag_to_slm<T>(
                 tSrW,
                 w_slm_tile,
                 w_nblocks,
@@ -1024,63 +1039,38 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           }
         }
 
-        auto O2_tensor_shape = make_shape(current_chunk_size, chunk_size);
-        Tensor cO2 = make_identity_tensor(O2_tensor_shape);
-
-        Tensor gO2_C =
-            local_tile(cO2, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
-        auto tSrO2_c = thr_mma.partition_sg_fragment_C(gO2_C);
-
-        // QK MMA: compute O2 = mask(Q × K^T) once (dv==0), hand the masked
-        // accumulator to every sub-group through the lane-blocked SLM tile and
-        // keep the resulting A operand resident in GRF for every dv.
+        /* compute O2 = mask(Q × K^T) once (dv==0). */
         if (dv == 0) {
-        clear(tSrO2_c);
-        gemm_TTS(Q_tensor, K_tensor, tSrO2_c, 0, 0, mma);
+          auto tSrO2_c = thr_mma.partition_sg_fragment_C(gO2_C);
 
-        CUTE_UNROLL
-        for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
-          int n_idx =
-              n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
+          clear(tSrO2_c);
+          gemm_TTS(Q_tensor, K_tensor, tSrO2_c, 0, 0, mma);
+
           CUTE_UNROLL
-          for (int sm = 0; sm < SG_M; ++sm) {
-            int m_idx = m_tile_start + m_sg_start + sm;
-            tSrO2_c(sn * SG_M + sm) *=
-                sycl::native::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]);
-            if (m_idx < n_idx) {
-              tSrO2_c(sn * SG_M + sm) = 0.0f;
+          for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
+            int n_idx =
+                n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
+
+            CUTE_UNROLL
+            for (int sm = 0; sm < SG_M; ++sm) {
+              int m_idx = m_tile_start + m_sg_start + sm;
+              tSrO2_c(sn * SG_M + sm) *=
+                  sycl::native::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]);
+              if (m_idx < n_idx) {
+                tSrO2_c(sn * SG_M + sm) = 0.0f;
+              }
             }
           }
-        }
 
-        store_C_frag_slm<T>(
-            tSrO2_c,
-            o2_slm_tile,
-            chunk_size / sub_group_size,
-            sg_local_m_coord,
-            sg_local_n_coord,
-            sg_local_id);
-
-        load_A_frag_slm<T>(
-            tCrO2_A,
-            o2_slm_tile,
-            chunk_size / sub_group_size,
-            sg_local_m_coord,
-            sg_local_id);
+          store_C_frag_to_slm<T>(
+              tSrO2_c,
+              o2_slm_tile,
+              chunk_size / sub_group_size,
+              sg_local_m_coord,
+              sg_local_n_coord,
+              sg_local_id);
         }  // end if (dv == 0): compute O2 once
 
-        auto O_ptr =
-            core_attn_out +
-            (token_indx ? token_indx[out_chunk_offset] : out_chunk_offset) *
-                num_v_heads * head_v_dim +
-            v_head_id * head_v_dim;
-        auto O_tensor_shape = make_shape(current_chunk_size, head_v_dim);
-        auto O_tensor = make_tensor(
-            make_gmem_ptr(O_ptr),
-            make_layout(
-                O_tensor_shape, make_stride(num_v_heads * head_v_dim, _1{})));
-
-        Tensor cO = make_identity_tensor(O_tensor.shape());
         auto copy_O_c = get_block_2d_copy_D<void>(mma, O_tensor);
         auto thr_copy_O_c = copy_O_c.get_slice(local_id);
 
@@ -1101,18 +1091,18 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           // Fused gemm: W×S[dv] -> tSrU_d, Q×S[dv] -> tSrO_c
           // S is loaded once and reused in registers for both; W is gathered
           // from its SLM staging tile straight into the MMA A fragment.
-            gemm_QTS_fused_2A<T>(
-              w_slm_tile,
-              w_nblocks,
-              Q_tensor,
-              S_tensor,
-              tSrU_d,
-              tSrO_c,
-              0,
-              dv,
-              mma,
-              sg_local_m_coord,
-              sg_local_id);
+          gemm_QTS_fused_2A<T>(
+            w_slm_tile,
+            w_nblocks,
+            Q_tensor,
+            S_tensor,
+            tSrU_d,
+            tSrO_c,
+            0,
+            dv,
+            mma,
+            sg_local_m_coord,
+            sg_local_id);
 
           // --- WS epilogue: U_new[dv] = u[dv] - W×S[dv] ---
           // Both accumulators are MMA C fragments of the same tile held by the
@@ -1124,7 +1114,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
             tSrU(i) -= tSrU_d(i);
           }
 
-          store_C_frag_slm<T>(
+          store_C_frag_to_slm<T>(
               tSrU,
               u_slm_tile,
               u_nblocks,
@@ -1145,9 +1135,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           }
 
           // --- O2U MMA: O[dv] += O1[dv] + O2 × U_T[dv] ---
-          // O2 is GRF-resident as tCrO2_A, u comes from its SLM B tile.
+          auto tCrO2_A = mma.get_slice(local_id).partition_sg_fragment_A(
+              gO2_A(_, _, 0));
+          load_A_frag_from_slm<T>(
+              tCrO2_A,
+              o2_slm_tile,
+              chunk_size / sub_group_size,
+              sg_local_m_coord,
+              sg_local_id);
+
           PackedBFrag u_op;
-          load_B_raw_slm<T>(
+          load_B_raw_from_slm<T>(
               u_op, u_slm_tile, u_nblocks, sg_local_n_coord, sg_local_id);
           cute::gemm(mma, tCrO2_A, u_op, tSrO_c);
           auto tCrO_c = thr_copy_O_c.partition_sg_fragment_S(gO_C);
@@ -1169,7 +1167,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
            the fragment. */
         Tensor cU_A = make_identity_tensor(select<0, 2>(wg_tile));
         auto tCrU_A = thr_mma.partition_sg_fragment_A(cU_A);
-        load_A_frag_slm_T<T>(
+        load_A_frag_T_from_slm<T>(
             tCrU_A, u_slm_tile, u_nblocks, sg_local_m_coord, sg_local_id);
         {
           using TU = typename decltype(tCrU_A)::value_type;
@@ -1227,17 +1225,28 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           auto tCrO_c = thr_copy_O_c.partition_sg_fragment_S(gO_C);
           auto tCgO_c = thr_copy_O_c.partition_D(gO_C);
           auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
-
           clear(tSrO_c);
+
           PackedBFrag u_op;
-          load_B_raw_slm<T>(
+          load_B_raw_from_slm<T>(
               u_op, u_slm_tile, u_nblocks, sg_local_n_coord, sg_local_id);
+
+          auto tCrO2_A = mma.get_slice(local_id).partition_sg_fragment_A(
+              gO2_A(_, _, 0));
+          load_A_frag_from_slm<T>(
+              tCrO2_A,
+              o2_slm_tile,
+              chunk_size / sub_group_size,
+              sg_local_m_coord,
+              sg_local_id);
+
           cute::gemm(mma, tCrO2_A, u_op, tSrO_c);
           reorder(tSrO_c, tCrO_c);
           copy(copy_O_c, tCrO_c, tCgO_c);
         }
       }  // end for (int dv ...)
     }
+
     pre_chunks += current_chunks;
   }
 }

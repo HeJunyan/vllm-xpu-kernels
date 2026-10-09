@@ -208,9 +208,9 @@ CUTE_DEVICE void load_B(
  *
  * The readings differ only in which producer axis the consumer contracts over:
  *
- *   load_A_frag_slm    A(m, k=n)    contracts over N   32 B runs
- *   load_B_raw_slm     B(n, k=m)    contracts over M   32 B runs
- *   load_A_frag_slm_T  A(m=n, k=m)  contracts over M   16-bit, coalesced
+ *   load_A_frag_from_slm     A(m, k=n)    contracts over N   32 B runs
+ *   load_B_raw_from_slm      B(n, k=m)    contracts over M   32 B runs
+ *   load_A_frag_T_from_slm   A(m=n, k=m)  contracts over M   16-bit, coalesced
  *
  * Only the transposed A reading is strided, and unavoidably so: the tile keeps
  * sixteen contiguous m per lane while that operand wants sixteen contiguous n.
@@ -254,7 +254,7 @@ using PackedBFrag = decltype(make_tensor<uint32_t>(Layout<Shape<_8, _2, _4>>{}))
  * accumulator's n tile starts in it, so one tile can hold a result wider than a
  * single accumulator. */
 template <class T, class CFrag>
-CUTE_DEVICE void store_C_frag_slm(
+CUTE_DEVICE void store_C_frag_to_slm(
     CFrag const& tSrC,
     SlmPtr tile,
     int nblocks,
@@ -291,7 +291,7 @@ CUTE_DEVICE void store_C_frag_slm(
  * by one BLK_K straight into the MMA fragment. nblk_base selects the k-tile
  * when the staged result spans several. */
 template <class T, class AFrag>
-CUTE_DEVICE void load_A_frag_slm(
+CUTE_DEVICE void load_A_frag_from_slm(
     AFrag& tCrA,
     SlmCPtr tile,
     int nblocks,
@@ -316,7 +316,7 @@ CUTE_DEVICE void load_A_frag_slm(
 
 /* B(n, k = m): the consumer contracts over the producer's M. */
 template <class T>
-CUTE_DEVICE void load_B_raw_slm(
+CUTE_DEVICE void load_B_raw_from_slm(
     PackedBFrag& B,
     SlmCPtr tile,
     int nblocks,
@@ -342,7 +342,7 @@ CUTE_DEVICE void load_B_raw_slm(
  * the reading the layout does not favour, so values arrive 16 bits at a time;
  * see the note above. */
 template <class T, class AFrag>
-CUTE_DEVICE void load_A_frag_slm_T(
+CUTE_DEVICE void load_A_frag_T_from_slm(
     AFrag& tCrA,
     SlmCPtr tile,
     int nblocks,
@@ -1033,7 +1033,7 @@ CUTE_DEVICE void gemm_QTS_fused_2A(
     reorder(tBrB, tCrB);
 
     // A1 gathers straight into the MMA fragment -- no reorder.
-    load_A_frag_slm<T>(
+    load_A_frag_from_slm<T>(
         tCrA, sA1, a1_nblocks, sg_m, lane, k_tile * kKBlkPerTile);
     cute::gemm(mma, tCrA, tCrB, tCrC1);
 
