@@ -800,6 +800,13 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
   SlmPtr u_slm_tile =
       delta_slm_tile + slm_tile_bytes(chunk_size, chunk_size);
   const int u_nblocks = chunk_size / sub_group_size;
+  /* The state lives in registers across the chunk chain, but K.S and Q.S want
+     it as a B operand, which registers of one sub-group cannot supply. So each
+     chunk narrows it into this shadow -- a derived, read-only copy. The
+     recurrence never reads it back, so no precision is lost: the B operand is
+     T-typed anyway, and the fp32 original is what carries forward. */
+  SlmPtr s_slm_tile = u_slm_tile + slm_tile_bytes(chunk_size, chunk_size);
+  const int s_nblocks = head_k_dim / sub_group_size;
 
   TiledMMA mma{};
   auto wg_tile = mma.tile_mnk();
@@ -845,6 +852,21 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
         ssm_state +
         static_cast<int64_t>(cache_indices[batch_id]) * ssm_state_stride_0 +
         v_head_id * head_v_dim * head_k_dim;
+
+    /* dv outside, chunks inside: a dv tile's whole chunk chain runs before the
+       next tile starts, so only that tile's slice of the state has to live
+       across chunks -- half of it, which is what makes GRF residency fit. The
+       grid stays as it was; putting dv there instead costs 691 us in work-group
+       overhead alone, measured. */
+    for (int dv = 0; dv < dv_split; ++dv) {
+    /* This dv tile's slice of the state, fp32, carried in registers for the
+       whole chain. Named, not an array: an aggregate indexed by a runtime dk
+       would be addressed at runtime and pushed to private memory. */
+    Tensor cS_r = make_identity_tensor(make_shape(head_v_dim, head_k_dim));
+    Tensor gS_r = local_tile(
+        cS_r, wg_tile, make_coord(dv, 0, 0), Step<_1, _1, X>{});
+    auto tSrS0 = thr_mma.partition_sg_fragment_C(gS_r);
+    auto tSrS1 = thr_mma.partition_sg_fragment_C(gS_r);
 
     for (int chunk_id = 0; chunk_id < current_chunks; ++chunk_id) {
       const bool has_prev_state = (chunk_id != 0) || initial_state;
@@ -955,8 +977,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       prefetch_B(K_tensor_T, 0, mma, 1);
       prefetch_B(K_tensor_T, 1, mma, 1);
 
-      for (int dv = 0; dv < dv_split; ++dv) {
-
+      {
         prefetch_A(A_inv_tensor, 0, mma);
 
         /* a/b/g and exp(a) are loaded and calculated once and shared later.
@@ -1081,15 +1102,18 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
             const int k_tiles = head_k_dim / chunk_size;
 
             auto tCrA = make_A_frag(mma);
-            auto tCrS = make_B_frag(mma);
+            PackedBFrag tCrS;
 
             prefetch_A(Q_tensor, 0, mma);
-            prefetch_B(S_tensor, dv, mma);
 
             for (int kt = 0; kt < k_tiles; ++kt) {
               barrier_arrive(barrier_scope);
 
-              load_B(S_tensor, dv, mma, tCrS, kt);
+              /* S comes from its shadow: the fp32 original is in registers,
+                 and a sub-group cannot hand registers to its peers. */
+              load_B_raw_from_slm<T>(
+                  tCrS, s_slm_tile, s_nblocks, sg_local_n_coord, sg_local_id,
+                  kt * (chunk_size / sub_group_size));
 
               /* K, unscaled: the gates ride on delta below, not on this. */
               load_A(K_tensor, 0, mma, tCrA, kt);
@@ -1270,36 +1294,63 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
         for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
           Tensor gS_C =
               local_tile(cS, wg_tile, make_coord(dv, dk, 0), Step<_1, _1, X>{});
-          auto tCrS_d = thr_copy_S_d.partition_sg_fragment_S(gS_C);
-          auto tCgS_d = thr_copy_S_d.partition_D(gS_C);
-          auto tSrS_d = thr_mma.partition_sg_fragment_C(gS_C);
+          auto& tSrS_d = (dk == 0) ? tSrS0 : tSrS1;
 
-          // Seed accumulator with exp(g_last) * S_prev when previous state
-          // exists; otherwise start from zeros.
-          if (has_prev_state) {
-            auto tCgS_c = thr_copy_S_c.partition_S(gS_C);
-            auto tCrS_c = thr_copy_S_c.partition_sg_fragment_D(gS_C);
-            copy(copy_S_c, tCgS_c, tCrS_c);
-
-            reorder(tCrS_c, tSrS_d);
-            CUTE_UNROLL
-            for (int i = 0; i < tCrS_c.size(); ++i) {
-              tSrS_d(i) *= g_last_value_exp;
+          /* The carry is already held from the previous chunk; only the
+             first chunk of a chain fetches it, only the last writes it back.
+             The two dk tiles are named fragments and the body is a lambda:
+             a reference selected at runtime would be addressed at runtime and
+             pushed to private memory. */
+          auto run_dk = [&](auto& tSrS_d) {
+            if (chunk_id == 0) {
+              if (has_prev_state) {
+                auto tCgS_c = thr_copy_S_c.partition_S(gS_C);
+                auto tCrS_c = thr_copy_S_c.partition_sg_fragment_D(gS_C);
+                copy(copy_S_c, tCgS_c, tCrS_c);
+                reorder(tCrS_c, tSrS_d);
+              } else {
+                clear(tSrS_d);
+              }
             }
-          } else {
-            clear(tSrS_d);
-          }
+            if (has_prev_state) {
+              CUTE_UNROLL
+              for (int i = 0; i < tSrS_d.size(); ++i) {
+                tSrS_d(i) *= g_last_value_exp;
+              }
+            }
 
             if (dk == 0) {
               cute::gemm(mma, tCrU_A, tCrK_T0, tSrS_d);
             } else {
               cute::gemm(mma, tCrU_A, tCrK_T1, tSrS_d);
             }
-          reorder(tSrS_d, tCrS_d);
-          copy(copy_S_d, tCrS_d, tCgS_d);
+
+            /* Publish the shadow the next chunk's K.S and Q.S will read. */
+            store_C_frag_to_slm<T>(
+                tSrS_d,
+                s_slm_tile,
+                s_nblocks,
+                sg_local_m_coord,
+                sg_local_n_coord,
+                sg_local_id,
+                dk * (chunk_size / sub_group_size));
+
+            if (chunk_id == current_chunks - 1) {
+              auto tCrS_d = thr_copy_S_d.partition_sg_fragment_S(gS_C);
+              auto tCgS_d = thr_copy_S_d.partition_D(gS_C);
+              reorder(tSrS_d, tCrS_d);
+              copy(copy_S_d, tCrS_d, tCgS_d);
+            }
+          };
+          if (dk == 0) {
+            run_dk(tSrS0);
+          } else {
+            run_dk(tSrS1);
+          }
         }
-      }  // end for (int dv ...)
-    }
+      }  // end dv tile body
+    }  // end for (int chunk_id ...)
+    }  // end for (int dv ...)
 
     pre_chunks += current_chunks;
   }
@@ -1521,7 +1572,8 @@ void kernel_launcher(
     // operand and transposed as the state update's A operand.
     int slm_size_fwd_o =
         5 * chunk_size +
-        3 * slm_tile_bytes(chunk_size, chunk_size) /
+        (3 * slm_tile_bytes(chunk_size, chunk_size) +
+         slm_tile_bytes(chunk_size, head_k_dim)) /
             static_cast<int>(sizeof(float));
     int threads_fwd_o = size(MMAFwdOSmall{});
     sycl::range<3> local_fwd_o(1, 1, threads_fwd_o);

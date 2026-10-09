@@ -314,14 +314,16 @@ CUTE_DEVICE void load_A_frag_from_slm(
   }
 }
 
-/* B(n, k = m): the consumer contracts over the producer's M. */
+/* B(n, k = m): the consumer contracts over the producer's M. nblk_base
+ * picks the n tile when the staged result is wider than one BLK_N. */
 template <class T>
 CUTE_DEVICE void load_B_raw_from_slm(
     PackedBFrag& B,
     SlmCPtr tile,
     int nblocks,
     int sg_n,
-    int lane) {
+    int lane,
+    int nblk_base = 0) {
   static_assert(sizeof(T) == 2, "lane-blocked SLM tiles are 16-bit");
   static_assert(sizeof(RawBVec) == sizeof(SlmLaneRun));
   auto rB = recast<RawBVec>(B);  // (k-atom ka, n-block h) at rB(2 * ka + h)
@@ -330,7 +332,7 @@ CUTE_DEVICE void load_B_raw_from_slm(
     CUTE_UNROLL
     for (int h = 0; h < 2; ++h) {
       auto src = reinterpret_cast<SlmLaneRunCPtr>(
-          tile + (ka * nblocks + 2 * sg_n + h) * kSlmBlockBytes +
+          tile + (ka * nblocks + nblk_base + 2 * sg_n + h) * kSlmBlockBytes +
           lane * kSlmLaneBytes);
       rB(2 * ka + h) = sycl::bit_cast<RawBVec>(*src);
     }
