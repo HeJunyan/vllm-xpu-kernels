@@ -720,20 +720,6 @@ CUTE_DEVICE void chunk_inverse_opt_kernel(
   }
 }
 
-
-
-// The fwd_o kernel. w and u are computed in its own prologue.
-//
-// w and u used to be a producer/consumer intermediate between two kernels,
-// written to HBM by the first and read back by the second. They are now
-// produced and consumed inside this one kernel and never leave the sub-slice,
-// so there is nothing left for a separate pass to hand over and no gmem
-// workspace to allocate. The grid is (batch, num_v_heads), sequential over the
-// chunks of a batch, with the dv tiles looped internally.
-//
-// u is separable along head_v_dim and is computed per dv tile. w spans the full
-// head_k_dim, so it is computed once per chunk at dv == 0 and staged in SLM for
-// every dv tile to read back.
 template <typename T, typename StateT, class TiledMMA>
 CUTE_DEVICE void chunk_fwd_o_kernel(
     const sycl::local_accessor<float, 1>& slm_mem_const,  // [5 * chunk_size]
@@ -884,8 +870,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           make_gmem_ptr(k_ptr),
           make_layout(
               K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
-      auto tCrK_T0 = make_B_frag(mma);
-      auto tCrK_T1 = make_B_frag(mma);
 
       /* V tensor */
       auto v_ptr = v +
@@ -938,8 +922,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           make_gmem_ptr(A_inv_ptr),
           make_layout(A_inv_shape, make_stride(chunk_size, _1{})));
 
-      /* W tensor */
-
       /* U tensor */
       auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
       Tensor cU = make_identity_tensor(U_tensor_shape);
@@ -952,101 +934,84 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
 
       /*************************************************************/
-      prefetch_B(K_tensor_T, 0, mma, 1);
-      prefetch_B(K_tensor_T, 1, mma, 1);
+      item.barrier(sycl::access::fence_space::local_space);
+
+      /* compute O2 = mask(Q x K^T) once (dv==0). */
+      auto tCrA_inv = make_A_frag(mma);
+      load_A(A_inv_tensor, 0, mma, tCrA_inv);
+
+      auto tCrK_T0 = make_B_frag(mma);
+      auto tCrK_T1 = make_B_frag(mma);
+      load_B(K_tensor_T, 0, mma, tCrK_T0);
+      load_B(K_tensor_T, 1, mma, tCrK_T1);
+
+      /* a/b/g and exp(a) are loaded and calculated once and shared later.
+         The per-chunk scaling SLM buffers are dv-independent. */
+      CUTE_UNROLL
+      for (int e = local_id; e < chunk_size; e += local_range) {
+        float beta_value =
+            b[(chunk_offset + e) + v_head_id * total_virtual_seqlen];
+        float a_value =
+            a[(chunk_offset + e) + v_head_id * total_virtual_seqlen];
+        float exp_a = sycl::native::exp(a_value);
+
+        wu_beta_slm_ptr[e] = beta_value;
+        wu_g_slm_ptr[e] = exp_a * beta_value;
+
+        if (e < current_chunk_size) {
+          g_slm_ptr[e] = a_value;
+          g_multi_slm_ptr[e] = sycl::native::exp(g_last_value - a_value);
+          g_exp_slm_ptr[e] = exp_a;
+        } else {
+          g_slm_ptr[e] = 0.0f;
+          g_multi_slm_ptr[e] = 0.0f;
+          g_exp_slm_ptr[e] = 0.0f;
+        }
+      }
+
+      auto tSrO2_c = thr_mma.partition_sg_fragment_C(gO2_C);
+
+      clear(tSrO2_c);
+      gemm_TTS(Q_tensor, K_tensor, tSrO2_c, 0, 0, mma);
+
+      CUTE_UNROLL
+      for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
+        int n_idx =
+            n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
+
+        CUTE_UNROLL
+        for (int sm = 0; sm < SG_M; ++sm) {
+          int m_idx = m_tile_start + m_sg_start + sm;
+          tSrO2_c(sn * SG_M + sm) *=
+              sycl::native::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]);
+
+          if (m_idx < n_idx) {
+            tSrO2_c(sn * SG_M + sm) = 0.0f;
+          }
+        }
+      }
+
+      store_C_frag_to_slm<T>(
+          tSrO2_c,
+          o2_slm_tile,
+          chunk_size / sub_group_size,
+          sg_local_m_coord,
+          sg_local_n_coord,
+          sg_local_id);
+
+      item.barrier(sycl::access::fence_space::local_space);
 
       for (int dv = 0; dv < dv_split; ++dv) {
-
-        prefetch_A(A_inv_tensor, 0, mma);
-
-        /* a/b/g and exp(a) are loaded and calculated once and shared later.
-           The per-chunk scaling SLM buffers are dv-independent. */
-        if (dv == 0) {
-          item.barrier(sycl::access::fence_space::local_space);
-
-          CUTE_UNROLL
-          for (int e = local_id; e < chunk_size; e += local_range) {
-            float beta_value =
-                b[(chunk_offset + e) + v_head_id * total_virtual_seqlen];
-            float a_value =
-                a[(chunk_offset + e) + v_head_id * total_virtual_seqlen];
-            float exp_a = sycl::native::exp(a_value);
-            wu_beta_slm_ptr[e] = beta_value;
-            wu_g_slm_ptr[e] = exp_a * beta_value;
-            if (e < current_chunk_size) {
-              g_slm_ptr[e] = a_value;
-              g_multi_slm_ptr[e] = sycl::native::exp(g_last_value - a_value);
-              g_exp_slm_ptr[e] = exp_a;
-            } else {
-              g_slm_ptr[e] = 0.0f;
-              g_multi_slm_ptr[e] = 0.0f;
-              g_exp_slm_ptr[e] = 0.0f;
-            }
-          }
-
-          item.barrier(sycl::access::fence_space::local_space);
-        }
-
-        /* compute w/u for this chunk */
-        /* u[dv] = A_inv @ (beta * v) */
+        /* u is built differently for different has_prev_state later. */
         Tensor gU = local_tile(
             cU, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
         auto tSrU = thr_mma.partition_sg_fragment_C(gU);
-
-        /* A_inv is read-only, so holding it needs no staging. It is loaded per
-           dv rather than per chunk on purpose: its two consumers sit next to
-           each other here, so the fragment dies before the fused Q*S / W*S
-           GEMM below and adds no pressure where that GEMM needs registers. The
-           two scale it by different per-k vectors, so the held copy is
-           unscaled. */
-        auto tCrA_inv = make_A_frag(mma);
-        load_A(A_inv_tensor, 0, mma, tCrA_inv);
-        if (dv == 0) {
-          load_B(K_tensor_T, 0, mma, tCrK_T0);
-          load_B(K_tensor_T, 1, mma, tCrK_T1);
-        }
-
-        /* u is built further down, after delta. W is gone: see below. */
-
-        /* compute O2 = mask(Q × K^T) once (dv==0). */
-        if (dv == 0) {
-          auto tSrO2_c = thr_mma.partition_sg_fragment_C(gO2_C);
-
-          clear(tSrO2_c);
-          gemm_TTS(Q_tensor, K_tensor, tSrO2_c, 0, 0, mma);
-
-          CUTE_UNROLL
-          for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
-            int n_idx =
-                n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
-
-            CUTE_UNROLL
-            for (int sm = 0; sm < SG_M; ++sm) {
-              int m_idx = m_tile_start + m_sg_start + sm;
-              tSrO2_c(sn * SG_M + sm) *=
-                  sycl::native::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]);
-              if (m_idx < n_idx) {
-                tSrO2_c(sn * SG_M + sm) = 0.0f;
-              }
-            }
-          }
-
-          store_C_frag_to_slm<T>(
-              tSrO2_c,
-              o2_slm_tile,
-              chunk_size / sub_group_size,
-              sg_local_m_coord,
-              sg_local_n_coord,
-              sg_local_id);
-        }  // end if (dv == 0): compute O2 once
 
         auto copy_O_c = get_block_2d_copy_D<void>(mma, O_tensor);
         auto thr_copy_O_c = copy_O_c.get_slice(local_id);
 
         if (has_prev_state) {
-          // Fused WS+QS dv loop: S[dv] is loaded once per k_tile and reused
-          // in registers for both WS (W×S) and QS (Q×S) DPAS operations.
-          // --- Fused WS+QS MMA: share S[dv] load in registers ---
+          /* Calculate QxS for O1 and KxS */
           Tensor gU_C =
               local_tile(cU, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
           auto tSrKS = thr_mma.partition_sg_fragment_C(gU_C);
@@ -1057,71 +1022,45 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
           clear(tSrO_c);
 
-          /* Fused W*S -> tSrU_d and Q*S -> tSrO_c. The two share the S
-             operand, the n tile and the k extent, so one S load per k-tile
-             serves both dpas, and W and Q take turns in one A fragment.
+          const int k_tiles = head_k_dim / chunk_size;
+          auto tCrA = make_A_frag(mma);
+          auto tCrS = make_B_frag(mma);
 
-             Written out here so every operand is declared in this scope and
-             dies in it -- S most of all, being the fp32 state and so the
-             widest thing in flight.
+          prefetch_A(K_tensor, 0, mma);
+          prefetch_B(S_tensor, dv, mma);
+          prefetch_A(Q_tensor, 0, mma);
 
-             This costs 5.7% against the pipelined gemm_* it replaces, and the
-             reason is worth recording. A block-2D load does not block; its
-             wait lands on the first read of the destination. gemm_QTS_fused_2A
-             issued both copies, slipped a prefetch in, and only then reordered
-             -- that gap is what hid the latency. load_A/load_B cannot express
-             it: the staging fragment is local to them, so their reorder is
-             welded to their copy and nothing fits between. Reordering the
-             calls here does not help, because it only moves whole loads around
-             and each one's own gap stays zero. Fixing this needs the copy and
-             the reorder to be separable, which is a change to the helpers. */
-          {
-            constexpr int kNBlkPerTile = chunk_size / sub_group_size;
-            constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
-            const int k_tiles = head_k_dim / chunk_size;
-
-            auto tCrA = make_A_frag(mma);
-            auto tCrS = make_B_frag(mma);
-
-            prefetch_A(Q_tensor, 0, mma);
-            prefetch_B(S_tensor, dv, mma);
-
-            for (int kt = 0; kt < k_tiles; ++kt) {
-              barrier_arrive(barrier_scope);
-
-              load_B(S_tensor, dv, mma, tCrS, kt);
-
-              /* K, unscaled: the gates ride on delta below, not on this. */
-              load_A(K_tensor, 0, mma, tCrA, kt);
-              cute::gemm(mma, tCrA, tCrS, tSrKS);
-
-              /* Q takes the same fragment; S stays put for both. */
-              load_A(Q_tensor, 0, mma, tCrA, kt);
-              cute::gemm(mma, tCrA, tCrS, tSrO_c);
-
-              barrier_wait(barrier_scope);
-            }
+          for (int kt = 0; kt < k_tiles; ++kt) {
+            barrier_arrive(ScopeWorkgroup);
+            load_B(S_tensor, dv, mma, tCrS, kt);
+            /* K, unscaled: the gates ride on delta below, not on this. */
+            load_A(K_tensor, 0, mma, tCrA, kt);
+            cute::gemm(mma, tCrA, tCrS, tSrKS);
+            /* Q takes the same fragment; S stays put for both. */
+            load_A(Q_tensor, 0, mma, tCrA, kt);
+            cute::gemm(mma, tCrA, tCrS, tSrO_c);
+            barrier_wait(ScopeWorkgroup);
           }
 
-          /* delta[t,n] = beta[t] * (v[t,n] - exp(a[t]) * (K.S)[t,n]), then
-             u = A_inv . delta. This is the old
-                 u = A_inv.(beta*v) - [A_inv.(g*K)].S,  g = exp(a)*beta
-             reassociated as
-                 u = A_inv.[ beta * (v - exp(a)*(K.S)) ],
-             which is why there is no W above: A_inv factors out, so the GEMM
-             that used to build W is folded into this one. beta rides A_inv's
-             contracted index, so folding it into delta also leaves that GEMM
-             with no per-k scale. */
+          /* Calculate U:
+             W = A_inv·(g⊙K),    g=exp(a)⊙β
+             U = A_inv·(β⊙v) − W·S
+             So we get:
+             U = A_inv·[β⊙v − (g⊙K)·S]
+               = A_inv·[β⊙(v − exp(a)⊙(K·S))]
+                        |------ delta -------|
+
+             delta[t,n] = beta[t] * (v[t,n] - exp(a[t]) * (K.S)[t,n]), then
+             U = A_inv.[ beta * (v - exp(a)*(K.S)) ]. */
           auto tSrDelta = thr_mma.partition_sg_fragment_C(gU_C);
-          {
-            auto copy_V_c = get_block_2d_copy_C<void>(mma, V_tensor);
-            auto thr_copy_V_c = copy_V_c.get_slice(local_id);
-            Tensor gV_C = local_tile(
-                cV, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
-            auto tCrV_c = thr_copy_V_c.partition_sg_fragment_D(gV_C);
-            copy(copy_V_c, thr_copy_V_c.partition_S(gV_C), tCrV_c);
-            reorder(tCrV_c, tSrDelta);
-          }
+          /* load tSrDelta with V tensor */
+          auto copy_V_c = get_block_2d_copy_C<void>(mma, V_tensor);
+          auto thr_copy_V_c = copy_V_c.get_slice(local_id);
+          Tensor gV_C = local_tile(
+              cV, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
+          auto tCrV_c = thr_copy_V_c.partition_sg_fragment_D(gV_C);
+          copy(copy_V_c, thr_copy_V_c.partition_S(gV_C), tCrV_c);
+          reorder(tCrV_c, tSrDelta);
 
           CUTE_UNROLL
           for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
@@ -1135,6 +1074,9 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
             }
           }
 
+          /* Store back delta to SLM and load it back correctly
+             for each subgroup. */
+          PackedBFrag delta_op;
           store_C_frag_to_slm<T>(
               tSrDelta,
               delta_slm_tile,
@@ -1142,16 +1084,13 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
               sg_local_m_coord,
               sg_local_n_coord,
               sg_local_id);
+          load_B_raw_from_slm<T>(
+              delta_op, delta_slm_tile, delta_nblocks, sg_local_n_coord,
+              sg_local_id);
 
+          /* Calculate the final U and store it to SLM for later usage. */
           clear(tSrU);
-          {
-            PackedBFrag delta_op;
-            load_B_raw_from_slm<T>(
-                delta_op, delta_slm_tile, delta_nblocks, sg_local_n_coord,
-                sg_local_id);
-            cute::gemm(mma, tCrA_inv, delta_op, tSrU);
-          }
-
+          cute::gemm(mma, tCrA_inv, delta_op, tSrU);
           store_C_frag_to_slm<T>(
               tSrU,
               u_slm_tile,
@@ -1160,7 +1099,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
               sg_local_n_coord,
               sg_local_id);
 
-          // --- QS epilogue: apply exp(g) scaling ---
+          /* Calculate the right O1. */
           CUTE_UNROLL
           for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
             int n_idx =
@@ -1172,7 +1111,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
             }
           }
 
-          // --- O2U MMA: O[dv] += O1[dv] + O2 × U_T[dv] ---
+          /* Load O2 back from SLM as A tensor. */
           auto tCrO2_A = mma.get_slice(local_id).partition_sg_fragment_A(
               gO2_A(_, _, 0));
           load_A_frag_from_slm<T>(
@@ -1182,6 +1121,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
               sg_local_m_coord,
               sg_local_id);
 
+          /* --- O2U MMA: O[dv] = O1[dv] + O2 × U_T[dv] --- */
           PackedBFrag u_op;
           load_B_raw_from_slm<T>(
               u_op, u_slm_tile, u_nblocks, sg_local_n_coord, sg_local_id);
@@ -1191,9 +1131,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           reorder(tSrO_c, tCrO_c);
           copy(copy_O_c, tCrO_c, tCgO_c);
         } else {
-          /* Without a previous state K.S is zero, so delta collapses to
-             beta*v and u = A_inv.(beta*v) is a single GEMM with beta back on
-             A_inv's contracted index -- no delta round trip needed. */
+          /* Simple when no previous state: u = A_inv @ (beta * v) */
           clear(tSrU);
           gemm_STS_k_multi(
               tCrA_inv, V_T, tSrU, 0, dv, mma, wu_beta_slm_ptr);
