@@ -261,7 +261,8 @@ CUTE_DEVICE void store_C_frag_to_slm(
     int sg_m,
     int sg_n,
     int lane,
-    int nblk_base = 0) {
+    int nblk_base = 0,
+    int mblk_base = 0) {
   static_assert(sizeof(T) == 2, "lane-blocked SLM tiles are 16-bit");
   using CLayout = cute::remove_cvref_t<decltype(tSrC.layout())>;
   constexpr int kNBlk = cute::size<2>(CLayout{});
@@ -279,7 +280,8 @@ CUTE_DEVICE void store_C_frag_to_slm(
     }
     *reinterpret_cast<SlmLaneRunPtr>(
         tile +
-        (sg_m * nblocks + nblk_base + sg_n * kNBlk + nb) * kSlmBlockBytes +
+        ((sg_m + mblk_base) * nblocks + nblk_base + sg_n * kNBlk + nb) *
+            kSlmBlockBytes +
         lane * kSlmLaneBytes) = *reinterpret_cast<const SlmLaneRun*>(run);
   }
 
@@ -314,14 +316,17 @@ CUTE_DEVICE void load_A_frag_from_slm(
   }
 }
 
-/* B(n, k = m): the consumer contracts over the producer's M. */
+/* B(n, k = m): the consumer contracts over the producer's M. kblk_base picks
+ * the k window, in k-atoms, when the staged result is taller than one BLK_K --
+ * k runs along the producer's m, so this is an m-block offset. */
 template <class T>
 CUTE_DEVICE void load_B_raw_from_slm(
     PackedBFrag& B,
     SlmCPtr tile,
     int nblocks,
     int sg_n,
-    int lane) {
+    int lane,
+    int kblk_base = 0) {
   static_assert(sizeof(T) == 2, "lane-blocked SLM tiles are 16-bit");
   static_assert(sizeof(RawBVec) == sizeof(SlmLaneRun));
   auto rB = recast<RawBVec>(B);  // (k-atom ka, n-block h) at rB(2 * ka + h)
@@ -330,7 +335,7 @@ CUTE_DEVICE void load_B_raw_from_slm(
     CUTE_UNROLL
     for (int h = 0; h < 2; ++h) {
       auto src = reinterpret_cast<SlmLaneRunCPtr>(
-          tile + (ka * nblocks + 2 * sg_n + h) * kSlmBlockBytes +
+          tile + ((ka + kblk_base) * nblocks + 2 * sg_n + h) * kSlmBlockBytes +
           lane * kSlmLaneBytes);
       rB(2 * ka + h) = sycl::bit_cast<RawBVec>(*src);
     }

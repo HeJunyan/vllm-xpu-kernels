@@ -786,6 +786,20 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
   SlmPtr u_slm_tile =
       delta_slm_tile + slm_tile_bytes(chunk_size, chunk_size);
   const int u_nblocks = chunk_size / sub_group_size;
+  /* The S shadow: the dv tile being walked, transposed and narrowed to T --
+     S^T(head_k_dim, chunk_size). The authoritative state is fp32 in registers
+     and a sub-group cannot hand registers to its peers, so the fused K.S / Q.S
+     pair contracts against this copy, built exactly the way u is: a C
+     accumulator stored lane-blocked and read back as a B operand. Transposed
+     on purpose -- with the producer laid out (m = head_k, n = head_v) the
+     plain lane-blocked B reading already yields B(n = head_v, k = head_k).
+
+     It shares the 16 KB that delta and u occupy. Inside one dv pass the
+     shadow is published at the top, read by the fused pair, and dead from
+     there; delta and u live in the middle. The two never overlap, so the
+     kernel keeps the 24 KB it had before the state moved into registers. */
+  SlmPtr s_slm_tile = delta_slm_tile;
+  const int s_nblocks = chunk_size / sub_group_size;
 
   TiledMMA mma{};
   auto wg_tile = mma.tile_mnk();
@@ -831,6 +845,29 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
         ssm_state +
         static_cast<int64_t>(cache_indices[batch_id]) * ssm_state_stride_0 +
         v_head_id * head_v_dim * head_k_dim;
+
+    /* The state, transposed and carried in registers for the whole sequence:
+       S^T(head_k, head_v), one fp32 C fragment per (dv, dk) tile. Named rather
+       than an array -- an aggregate indexed at runtime would be addressed at
+       runtime and pushed to private memory. */
+    Tensor cST = make_identity_tensor(make_shape(head_k_dim, head_v_dim));
+    auto make_ST = [&](int dk, int dv) {
+      return thr_mma.partition_sg_fragment_C(
+          local_tile(cST, wg_tile, make_coord(dk, dv, 0), Step<_1, _1, X>{}));
+    };
+    auto tSrST00 = make_ST(0, 0);
+    auto tSrST01 = make_ST(1, 0);
+    auto tSrST10 = make_ST(0, 1);
+    auto tSrST11 = make_ST(1, 1);
+
+    /* HBM keeps the state as (head_v, head_k) and the chain works in S^T. A
+       block-2D load handles the swapped strides, so the seed reads through
+       this view; the write-back cannot and is done by hand below. */
+    auto ST_tensor = make_tensor(
+        make_gmem_ptr(ssm_state_ptr),
+        make_layout(
+            make_shape(head_k_dim, head_v_dim),
+            make_stride(_1{}, head_k_dim)));
 
     for (int chunk_id = 0; chunk_id < current_chunks; ++chunk_id) {
       const bool has_prev_state = (chunk_id != 0) || initial_state;
@@ -940,11 +977,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       auto tCrA_inv = make_A_frag(mma);
       load_A(A_inv_tensor, 0, mma, tCrA_inv);
 
-      auto tCrK_T0 = make_B_frag(mma);
-      auto tCrK_T1 = make_B_frag(mma);
-      load_B(K_tensor_T, 0, mma, tCrK_T0);
-      load_B(K_tensor_T, 1, mma, tCrK_T1);
-
       /* a/b/g and exp(a) are loaded and calculated once and shared later.
          The per-chunk scaling SLM buffers are dv-independent. */
       CUTE_UNROLL
@@ -1001,7 +1033,23 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
 
       item.barrier(sycl::access::fence_space::local_space);
 
-      for (int dv = 0; dv < dv_split; ++dv) {
+      auto run_dv = [&](int dv, auto& tSrST_k0, auto& tSrST_k1) {
+        /* Publish this dv tile's shadow before anything reads it. The fused
+           pair below takes S from here, and the state update at the bottom
+           rewrites it from the registers it just updated. Both tenants of this
+           16 KB -- delta and u -- are written after the read and read before
+           the rewrite, so a barrier on each side is all the aliasing needs. */
+        if (has_prev_state) {
+          item.barrier(sycl::access::fence_space::local_space);
+          store_C_frag_to_slm<T>(
+              tSrST_k0, s_slm_tile, s_nblocks, sg_local_m_coord,
+              sg_local_n_coord, sg_local_id, 0, 0);
+          store_C_frag_to_slm<T>(
+              tSrST_k1, s_slm_tile, s_nblocks, sg_local_m_coord,
+              sg_local_n_coord, sg_local_id, 0,
+              chunk_size / sub_group_size);
+        }
+
         /* u is built differently for different has_prev_state later. */
         Tensor gU = local_tile(
             cU, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
@@ -1024,15 +1072,19 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
 
           const int k_tiles = head_k_dim / chunk_size;
           auto tCrA = make_A_frag(mma);
-          auto tCrS = make_B_frag(mma);
+          PackedBFrag tCrS;
 
           prefetch_A(K_tensor, 0, mma);
-          prefetch_B(S_tensor, dv, mma);
           prefetch_A(Q_tensor, 0, mma);
 
           for (int kt = 0; kt < k_tiles; ++kt) {
             barrier_arrive(ScopeWorkgroup);
-            load_B(S_tensor, dv, mma, tCrS, kt);
+            /* S from its shadow. The staged tile is S^T, so the plain
+               lane-blocked B reading already gives B(n = head_v, k = head_k);
+               kt picks the k window. */
+            load_B_raw_from_slm<T>(
+                tCrS, s_slm_tile, s_nblocks, sg_local_n_coord, sg_local_id,
+                kt * (chunk_size / sub_group_size));
             /* K, unscaled: the gates ride on delta below, not on this. */
             load_A(K_tensor, 0, mma, tCrA, kt);
             cute::gemm(mma, tCrA, tCrS, tSrKS);
@@ -1172,71 +1224,113 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           copy(copy_O_c, tCrO_c, tCgO_c);
         }
 
-        Tensor cS = make_identity_tensor(S_tensor.shape());
-        auto copy_S_c = get_block_2d_copy_C<void>(mma, S_tensor);
-        auto copy_S_d = get_block_2d_copy_D<void>(mma, S_tensor);
-        auto thr_copy_S_c = copy_S_c.get_slice(local_id);
-        auto thr_copy_S_d = copy_S_d.get_slice(local_id);
+        /* Handoff: the shadow is rewritten over delta and u below, so every
+           sub-group must have u in registers first. */
+        item.barrier(sycl::access::fence_space::local_space);
 
-        /* The state update contracts U^T over the token axis, i.e. over the
-           axis u was produced along, so it reads the staged tile transposed.
-           That reading is the strided one and every dk tile wants the same
-           operand, so gather and scale it once here and let both trips reuse
-           the fragment. */
-        Tensor cU_A = make_identity_tensor(select<0, 2>(wg_tile));
-        auto tCrU_A = thr_mma.partition_sg_fragment_A(cU_A);
-        load_A_frag_T_from_slm<T>(
-            tCrU_A, u_slm_tile, u_nblocks, sg_local_m_coord, sg_local_id);
+        /* The state update is written transposed:
+               S^T[head_k, head_v] += K^T[head_k, chunk] . u[chunk, head_v]
+           Both operands are already in that orientation -- K^T as the A
+           operand straight from gmem, and the staged u tile (produced as
+           (chunk, head_v)) read through the plain lane-blocked B helper is
+           B(n = head_v, k = chunk). Keeping the state transposed is what lets
+           the shadow be read back by that same helper instead of a strided
+           transpose, and it retires u's strided A reading with it. */
+        PackedBFrag tCrU_B;
+        load_B_raw_from_slm<T>(
+            tCrU_B, u_slm_tile, u_nblocks, sg_local_n_coord, sg_local_id);
         {
-          using TU = typename decltype(tCrU_A)::value_type;
-          Tensor u_probe = make_tensor<TU>(tCrU_A.layout());
-          static constexpr auto UI = decltype(size<0>(u_probe))::value;
-          static constexpr auto UJ = decltype(size<1>(u_probe))::value;
-          static constexpr auto UK = decltype(size<2>(u_probe))::value;
+          /* The decay rides on u's contracted index, the token axis. In this
+             packed fragment element (2 * ka + h) * 16 + i carries token
+             ka * 16 + i, the same for every lane. */
+          auto rU = recast<T>(tCrU_B);
           CUTE_UNROLL
-          for (int k = 0; k < UK; ++k) {
-            float scale =
-                g_multi_slm_ptr[k * sub_group_size + sg_local_id];
+          for (int ka = 0; ka < 4; ++ka) {
             CUTE_UNROLL
-            for (int e = 0; e < UI * UJ; ++e) {
-              tCrU_A[k * UI * UJ + e] = static_cast<TU>(
-                  static_cast<float>(tCrU_A[k * UI * UJ + e]) * scale);
+            for (int i = 0; i < sub_group_size; ++i) {
+              float scale = g_multi_slm_ptr[ka * sub_group_size + i];
+              CUTE_UNROLL
+              for (int h = 0; h < 2; ++h) {
+                int e = (2 * ka + h) * sub_group_size + i;
+                rU(e) = static_cast<T>(static_cast<float>(rU(e)) * scale);
+              }
             }
           }
         }
 
         for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
-          Tensor gS_C =
-              local_tile(cS, wg_tile, make_coord(dv, dk, 0), Step<_1, _1, X>{});
-          auto tCrS_d = thr_copy_S_d.partition_sg_fragment_S(gS_C);
-          auto tCgS_d = thr_copy_S_d.partition_D(gS_C);
-          auto tSrS_d = thr_mma.partition_sg_fragment_C(gS_C);
-
-          // Seed accumulator with exp(g_last) * S_prev when previous state
-          // exists; otherwise start from zeros.
-          if (has_prev_state) {
-            auto tCgS_c = thr_copy_S_c.partition_S(gS_C);
-            auto tCrS_c = thr_copy_S_c.partition_sg_fragment_D(gS_C);
-            copy(copy_S_c, tCgS_c, tCrS_c);
-
-            reorder(tCrS_c, tSrS_d);
-            CUTE_UNROLL
-            for (int i = 0; i < tCrS_c.size(); ++i) {
-              tSrS_d(i) *= g_last_value_exp;
+          /* The carry is held from the previous chunk and seeded at the head
+             of the chain, so this only has to decay it. */
+          auto run_dk = [&](auto& tSrST_d) {
+            if (has_prev_state) {
+              CUTE_UNROLL
+              for (int i = 0; i < tSrST_d.size(); ++i) {
+                tSrST_d(i) *= g_last_value_exp;
+              }
             }
+
+            auto tCrK_A = make_A_frag(mma);
+            load_A(K_tensor_T, dk, mma, tCrK_A);
+            cute::gemm(mma, tCrK_A, tCrU_B, tSrST_d);
+
+            /* Only the tail of the chain reaches HBM, and it has to land
+               untransposed because that is how everyone else reads it. A
+               block-2D store will not transpose, so this walks the
+               accumulator by its own (m, n) mapping -- the same one the O2
+               mask uses -- and writes fp32 directly. Each lane's sixteen m
+               are contiguous in head_k, so every run is one 64 B line, and it
+               happens once per sequence rather than once per chunk. */
+            if (chunk_id == current_chunks - 1) {
+              CUTE_UNROLL
+              for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
+                const int v_idx =
+                    dv * tile_n + n_sg_start + sn * sub_group_size +
+                    sg_local_id;
+                StateT* dst = ssm_state_ptr +
+                              static_cast<int64_t>(v_idx) * head_k_dim +
+                              dk * tile_m + m_sg_start;
+                CUTE_UNROLL
+                for (int sm = 0; sm < SG_M; ++sm) {
+                  dst[sm] = static_cast<StateT>(tSrST_d(sn * SG_M + sm));
+                }
+              }
+            }
+          };
+          if (dk == 0) {
+            run_dk(tSrST_k0);
           } else {
-            clear(tSrS_d);
+            run_dk(tSrST_k1);
           }
-
-            if (dk == 0) {
-              cute::gemm(mma, tCrU_A, tCrK_T0, tSrS_d);
-            } else {
-              cute::gemm(mma, tCrU_A, tCrK_T1, tSrS_d);
-            }
-          reorder(tSrS_d, tCrS_d);
-          copy(copy_S_d, tCrS_d, tCgS_d);
         }
-      }  // end for (int dv ...)
+      };  // end run_dv
+
+      /* Seed the chain before anything reads the shadow. */
+      if (chunk_id == 0) {
+        auto copy_ST_c = get_block_2d_copy_C<void>(mma, ST_tensor);
+        auto thr_copy_ST_c = copy_ST_c.get_slice(local_id);
+        auto seed = [&](auto& tSrST_d, int dk, int dv) {
+          if (initial_state) {
+            Tensor gST_s = local_tile(
+                cST, wg_tile, make_coord(dk, dv, 0), Step<_1, _1, X>{});
+            auto tCrST_s = thr_copy_ST_c.partition_sg_fragment_D(gST_s);
+            copy(copy_ST_c, thr_copy_ST_c.partition_S(gST_s), tCrST_s);
+            reorder(tCrST_s, tSrST_d);
+          } else {
+            clear(tSrST_d);
+          }
+        };
+        seed(tSrST00, 0, 0);
+        seed(tSrST01, 1, 0);
+        seed(tSrST10, 0, 1);
+        seed(tSrST11, 1, 1);
+      }
+
+      /* Unrolled by hand: a runtime-selected reference to one of the four
+         fragments would take their addresses and push them to scratch. */
+      run_dv(0, tSrST00, tSrST01);
+      if (dv_split > 1) {
+        run_dv(1, tSrST10, tSrST11);
+      }
     }
 
     pre_chunks += current_chunks;
