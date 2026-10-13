@@ -847,9 +847,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
         v_head_id * head_v_dim * head_k_dim;
 
     /* The state, transposed and carried in registers for the whole sequence:
-       S^T(head_k, head_v), one fp32 C fragment per (dv, dk) tile. Named rather
-       than an array -- an aggregate indexed at runtime would be addressed at
-       runtime and pushed to private memory. */
+       S^T(head_k, head_v), one fp32 C fragment per (dv, dk) tile. */
     Tensor cST = make_identity_tensor(make_shape(head_k_dim, head_v_dim));
     auto make_ST = [&](int dk, int dv) {
       return thr_mma.partition_sg_fragment_C(
@@ -860,9 +858,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
     auto tSrST10 = make_ST(0, 1);
     auto tSrST11 = make_ST(1, 1);
 
-    /* HBM keeps the state as (head_v, head_k) and the chain works in S^T. A
-       block-2D load handles the swapped strides, so the seed reads through
-       this view; the write-back cannot and is done by hand below. */
+    /* Keeps the state as (head_v, head_k) and the chain works in S^T. */
     auto ST_tensor = make_tensor(
         make_gmem_ptr(ssm_state_ptr),
         make_layout(
@@ -963,19 +959,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
       Tensor cU = make_identity_tensor(U_tensor_shape);
 
-      /* SSM state tensor */
-      StateT* S_ptr = ssm_state_ptr;
-      auto S_tensor_shape = make_shape(head_v_dim, head_k_dim);
-      auto S_tensor = make_tensor(
-          make_gmem_ptr(S_ptr),
-          make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
-
       /*************************************************************/
       item.barrier(sycl::access::fence_space::local_space);
 
       /* compute O2 = mask(Q x K^T) once (dv==0). */
       auto tCrA_inv = make_A_frag(mma);
       load_A(A_inv_tensor, 0, mma, tCrA_inv);
+
+      /* Warm O2's operands while the scalar gate prologue below runs: the 2D
+         block loads of Q and K overlap the exp() work on the ALU pipe. */
+      prefetch_A(Q_tensor, 0, mma);
+      prefetch_B(K_tensor, 0, mma);
 
       /* a/b/g and exp(a) are loaded and calculated once and shared later.
          The per-chunk scaling SLM buffers are dv-independent. */
@@ -1076,6 +1070,9 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
 
           prefetch_A(K_tensor, 0, mma);
           prefetch_A(Q_tensor, 0, mma);
+          /* delta needs V right after this fused pair, so warm it now and let
+             its load overlap the K.S / Q.S DPAS. */
+          prefetch_A(V_tensor, 0, mma);
 
           for (int kt = 0; kt < k_tiles; ++kt) {
             barrier_arrive(ScopeWorkgroup);
@@ -1162,6 +1159,12 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
               tSrO_c(sn * SG_M + sm) *= g_exp_slm_ptr[(m_idx)];
             }
           }
+
+          /* The state update below consumes K^T straight from gmem; warm both
+             dk tiles now so their loads overlap the O2U DPAS, the writeback,
+             and the handoff barrier. */
+          prefetch_A(K_tensor_T, 0, mma);
+          prefetch_A(K_tensor_T, 1, mma);
 
           /* Load O2 back from SLM as A tensor. */
           auto tCrO2_A = mma.get_slice(local_id).partition_sg_fragment_A(
